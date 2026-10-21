@@ -24,9 +24,24 @@
 
 只需要 Python 3.9 以上與這個擴充套件：
 
-```bash
-code --install-extension agora-0.2.14.vsix     # 從 GitHub Release 下載
+第一次安裝：下載並安裝 [GitHub Releases](https://github.com/richardjheng/agora/releases) 最新的 `.vsix`（Antigravity 等 VSCode 分支把 `code` 換成它們自己的指令）。
+
+```powershell
+# Windows PowerShell
+$a = (irm https://api.github.com/repos/richardjheng/agora/releases/latest).assets | ? name -like '*.vsix' | select -First 1
+iwr $a.browser_download_url -OutFile "$env:TEMP\$($a.name)"; code --install-extension "$env:TEMP\$($a.name)"
 ```
+
+```bash
+# macOS / Linux / Git Bash
+url=$(curl -fsSL https://api.github.com/repos/richardjheng/agora/releases/latest | grep -o 'https://[^"]*\.vsix' | head -1)
+curl -fsSL "$url" -o /tmp/agora.vsix && code --install-extension /tmp/agora.vsix
+```
+
+之後由擴充套件自己更新：用 `.vsix` 安裝的擴充套件不在擴充套件商店上，VSCode 本身的自動更新不會更新它，
+所以 Agora 啟動後與每 6 小時查一次 GitHub 最新的 Release，有新版就下載安裝，重新載入視窗後生效。
+設定 `agora.autoUpdate` 可改成只通知（`notify`）或關閉（`off`）；隨時可以執行「Agora: 檢查擴充套件更新」。
+從原始碼載入（開發模式）時不檢查更新。發佈新版時，Release 的 tag 要是 `v<版本>`，並附上 `agora-<版本>.vsix`。
 
 設定 `agora.pythonPath` 保持預設的 `python` 時，擴充套件會自動尋找 Python：PATH 上的 Python（略過 Microsoft Store 的佔位程式）→ 常見安裝位置 → `py` 啟動器。
 都找不到時面板會說明找不到 Python；可以在設定中填入 `python.exe` 的完整路徑。
@@ -55,5 +70,6 @@ npm run package          # 先把核心複製進 core/，再產生 agora-<版本
 | `agora.root` | （空白） | 含 `agora.py` 的資料夾；留空時使用 PATH 上的 `agora` 或內建核心 |
 | `agora.pythonPath` | `python` | 執行 agora.py 的 Python |
 | `agora.quotaRefreshMinutes` | 10 | 狀態列額度更新間隔，0 表示不自動更新 |
+| `agora.autoUpdate` | `auto` | 從 GitHub Releases 更新擴充套件：`auto` 自動安裝、`notify` 只通知、`off` 不自動檢查 |
 
 多資料夾工作區只會使用第一個資料夾。

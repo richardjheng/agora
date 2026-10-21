@@ -8,6 +8,7 @@ const path = require("path");
 const editorCtx = require("./context");
 const { syncCore } = require("./core");
 const { findPython, missingPythonMessage } = require("./python");
+const updates = require("./update");
 
 const PARTIES = ["claude", "antigravity", "codex"];
 const EXTENSION_VERSION = require("./package.json").version;
@@ -648,6 +649,100 @@ class PartiesView {
   }
 }
 
+// ───────────────────────── 擴充套件更新 ─────────────────────────
+
+const UPDATE_INTERVAL = 6 * 3600 * 1000;   // 自動檢查的間隔；多個視窗共用 globalState 的上次檢查時間
+const UPDATE_KEYS = { checkedAt: "agora.update.checkedAt", installed: "agora.update.installed", skipped: "agora.update.skipped" };
+
+/** 從 GitHub Releases 檢查並安裝新版（設定 agora.autoUpdate：auto 自動安裝、notify 只通知、off 不檢查） */
+class Updater {
+  constructor(context) {
+    this.state = context.globalState;
+    this.dev = context.extensionMode !== vscode.ExtensionMode.Production;
+    this.running = null;
+  }
+
+  mode() {
+    return vscode.workspace.getConfiguration("agora").get("autoUpdate") || "auto";
+  }
+
+  /** manual：從指令觸發，沒有新版或失敗時也要告知 */
+  check(manual = false) {
+    if (!this.running) this.running = this.run(manual).finally(() => { this.running = null; });
+    return this.running;
+  }
+
+  async run(manual) {
+    if (this.dev) {
+      if (manual) vscode.window.showInformationMessage("Agora：開發模式（從原始碼載入）不檢查擴充套件更新。");
+      return;
+    }
+    if (!manual) {
+      if (this.mode() === "off" || Date.now() - this.state.get(UPDATE_KEYS.checkedAt, 0) < UPDATE_INTERVAL) return;
+    }
+    let info;
+    try {
+      info = await updates.fetchLatest();
+      await this.state.update(UPDATE_KEYS.checkedAt, Date.now());
+    } catch (e) {
+      output.appendLine(`檢查擴充套件更新失敗：${e.message}`);
+      if (manual) this.failed(`檢查更新失敗：${e.message}`);
+      return;
+    }
+    if (!info || updates.compareVersions(info.version, EXTENSION_VERSION) <= 0) {
+      if (manual) vscode.window.showInformationMessage(`Agora：擴充套件已是最新版（${EXTENSION_VERSION}）。`);
+      return;
+    }
+    if (this.state.get(UPDATE_KEYS.installed) === info.version) {
+      // 已經安裝（可能是另一個視窗裝的），只差重新載入
+      if (manual) this.promptReload(info.version);
+      return;
+    }
+    if (!manual && this.state.get(UPDATE_KEYS.skipped) === info.version) return;
+    if (!manual && this.mode() === "auto") {
+      await this.install(info, false);
+      return;
+    }
+    const choice = await vscode.window.showInformationMessage(
+      `Agora：擴充套件有新版 ${info.version}（目前 ${EXTENSION_VERSION}）。`, "更新", "查看變更", ...(manual ? [] : ["略過此版本"]));
+    if (choice === "更新") await this.install(info, true);
+    else if (choice === "查看變更") vscode.env.openExternal(vscode.Uri.parse(info.page));
+    else if (choice === "略過此版本") await this.state.update(UPDATE_KEYS.skipped, info.version);
+  }
+
+  /** 下載 .vsix 並安裝；visible 時顯示下載進度 */
+  async install(info, visible) {
+    output.appendLine(`下載 Agora 擴充套件 ${info.version}：${info.url}`);
+    let file;
+    try {
+      file = visible
+        ? await vscode.window.withProgress(
+          { location: vscode.ProgressLocation.Notification, title: `Agora：下載擴充套件 ${info.version}` }, () => updates.download(info))
+        : await updates.download(info);
+      await vscode.commands.executeCommand("workbench.extensions.installExtension", vscode.Uri.file(file));
+    } catch (e) {
+      output.appendLine(`更新擴充套件失敗：${e.message}`);
+      this.failed(`更新到 ${info.version} 失敗：${e.message}`);
+      return;
+    } finally {
+      if (file) fs.rmSync(file, { force: true });
+    }
+    await this.state.update(UPDATE_KEYS.installed, info.version);
+    output.appendLine(`已安裝 Agora 擴充套件 ${info.version}，重新載入視窗後生效。`);
+    this.promptReload(info.version);
+  }
+
+  promptReload(version) {
+    vscode.window.showInformationMessage(`Agora：擴充套件已更新到 ${version}，重新載入視窗後生效。`, "重新載入")
+      .then((choice) => choice && vscode.commands.executeCommand("workbench.action.reloadWindow"));
+  }
+
+  failed(message) {
+    vscode.window.showWarningMessage(`Agora：${message}`, "開啟 Releases 頁面")
+      .then((choice) => choice && vscode.env.openExternal(vscode.Uri.parse(updates.RELEASES_PAGE)));
+  }
+}
+
 // ───────────────────────── 啟動 ─────────────────────────
 
 function activate(context) {
@@ -1020,6 +1115,12 @@ function activate(context) {
       output.show(true);
     }
   });
+
+  const updater = new Updater(context);
+  command("agora.checkUpdate", () => updater.check(true));
+  const updateDelay = setTimeout(() => updater.check(), 15 * 1000);   // 不和啟動時的其他查詢搶時間
+  const updateTimer = setInterval(() => updater.check(), 3600 * 1000);   // 是否真的查詢由 UPDATE_INTERVAL 決定
+  context.subscriptions.push({ dispose: () => { clearTimeout(updateDelay); clearInterval(updateTimer); } });
 
   context.subscriptions.push(
     output,
