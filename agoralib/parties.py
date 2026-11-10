@@ -345,6 +345,17 @@ def antigravity_event(live: Live, e: dict):
                                       (step.get("tool_info") or {}).get("parameters") or {}, live.workspace))
 
 
+# Antigravity 的連線中斷過一次後（CLI 會自己重試並完成回覆），同一個 conversation 之後每輪都回報
+# status ERROR＋"The stream was interrupted…"，回覆卻是完整的（實測 2026-11-10）。這種情況接受回覆並標示，
+# 其他 ERROR、空白回覆、有工具被拒的情況照舊判失敗（保留被拒的處理）。非空回覆不能證明完整，所以每輪都標示。
+STREAM_INTERRUPTED = "⚠️ CLI 回報串流中斷（連線中斷，原因待查），回覆可能不完整"
+
+
+def stream_interrupted(result: dict, reply: str) -> bool:
+    return (result.get("status") == "ERROR" and "stream was interrupted" in str(result.get("error") or "").lower()
+            and bool(reply) and not result.get("denied_actions"))
+
+
 def call_antigravity(prompt: str, session_id: Optional[str], opts: dict, work: bool, workspace: Path,
                      timeout: int, scratch: Path, live: Optional[Live] = None) -> Tuple[str, str, str]:
     overflow = None
@@ -378,12 +389,15 @@ def call_antigravity(prompt: str, session_id: Optional[str], opts: dict, work: b
         result = next((e["result"] for e in reversed(events) if e.get("event") == "result" and e.get("result")),
                       events[-1])
         reply = (result.get("response") or "").strip()
-        if result.get("status") != "SUCCESS" or not reply:
+        interrupted = stream_interrupted(result, reply)
+        if (result.get("status") != "SUCCESS" or not reply) and not interrupted:
             detail = json.dumps(result, ensure_ascii=False)[:1500] + stderr[-500:]
             raise call_error(f"Antigravity 未產生回覆：{detail}", result, stderr[-500:],
                              denials=agy_denials(result.get("denied_actions"), steps),
                              session_id=result.get("conversation_id"))
         meta = f"{result.get('duration_seconds', 0):.0f}s, {result.get('usage', {}).get('total_tokens', '?')} tokens"
+        if interrupted:
+            meta += f", {STREAM_INTERRUPTED}"
         return reply, result.get("conversation_id") or session_id, meta
     finally:
         if overflow:

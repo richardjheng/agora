@@ -698,6 +698,51 @@ class TestAntigravityMode(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("--mode") + 1], "accept-edits")
 
 
+class TestAntigravityStreamInterrupted(unittest.TestCase):
+    """連線中斷過的 conversation 之後每輪都回報 status ERROR＋stream was interrupted，回覆卻是完整的"""
+    INTERRUPTED = "The stream was interrupted. Please continue the task you were working on."
+
+    def call(self, result):
+        def fake_run(cmd, workspace, stdin_text, timeout, on_event=None, extra_env=None):
+            return [{"event": "result", "result": {"conversation_id": "c1", **result}}], ""
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(parties, "_run", fake_run):
+            return parties.call_antigravity("hi", "c1", {}, False, Path(tmp), 60, Path(tmp))
+
+    def test_success_has_no_warning(self):
+        reply, _, meta = self.call({"status": "SUCCESS", "response": "OK"})
+        self.assertEqual(reply, "OK")
+        self.assertNotIn(parties.STREAM_INTERRUPTED, meta)
+
+    def test_interrupted_with_reply_is_accepted_and_marked(self):
+        reply, session, meta = self.call({"status": "ERROR", "error": self.INTERRUPTED, "response": "完整回覆\n"})
+        self.assertEqual((reply, session), ("完整回覆", "c1"))
+        self.assertIn(parties.STREAM_INTERRUPTED, meta)
+
+    def test_interrupted_without_reply_fails(self):
+        with self.assertRaises(parties.CallError):
+            self.call({"status": "ERROR", "error": self.INTERRUPTED, "response": "  \n"})
+
+    def test_other_error_fails(self):
+        with self.assertRaises(parties.CallError):
+            self.call({"status": "ERROR", "error": "quota exceeded", "response": "部分內容"})
+
+    def test_interrupted_with_denials_keeps_denial_handling(self):
+        with self.assertRaises(parties.CallError) as ctx:
+            self.call({"status": "ERROR", "error": self.INTERRUPTED, "response": "內容",
+                       "denied_actions": [{"action": "run_command", "target": "rm -rf x"}]})
+        self.assertTrue(ctx.exception.denied)
+
+    def test_done_relay_warns_about_interrupted_rounds_and_denials(self):
+        self.assertIsNone(cli.unverified_warning({"status": "done"}))
+        self.assertIsNone(cli.unverified_warning({"status": "running", "interrupted_rounds": 2}))
+        text = cli.unverified_warning({"status": "done", "interrupted_rounds": 2})
+        self.assertIn("2 輪 CLI 回報串流中斷", text)
+        both = cli.unverified_warning({"status": "done", "interrupted_rounds": 1, "denied": [{"action": "read_url"}]})
+        self.assertIn("工具被拒", both)
+        self.assertIn("串流中斷", both)
+
+
 class TestCodexQuota(unittest.TestCase):
     def test_reads_latest_rate_limits_from_session_file(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1576,12 +1621,12 @@ class TestLock(unittest.TestCase):
 class TestVersion(unittest.TestCase):
     def test_version_defined_and_cli_flag(self):
         from agoralib import __version__
-        self.assertEqual(__version__, "0.2.16")
+        self.assertEqual(__version__, "0.2.17")
         out = io.StringIO()
         with patch("sys.stdout", out), self.assertRaises(SystemExit) as cm:
             cli.main(["--version"])
         self.assertEqual(cm.exception.code, 0)
-        self.assertIn("0.2.16", out.getvalue())
+        self.assertIn("0.2.17", out.getvalue())
 
 
 class TestQuotaWindows(unittest.TestCase):

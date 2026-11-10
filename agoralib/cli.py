@@ -30,7 +30,7 @@ from typing import List, Optional, Tuple
 from agoralib import __version__, config, jobs, models, prune, quota, routing, shares, snapshot
 from agoralib.parties import (AGORA_ROOT as AGORA_ROOT_DIR, AI_PARTIES, CALLERS, HUMAN, NAMES,
                               LOCKED_ENV, NESTED_ENV, CallError, Live, agora_cmd, canonical,
-                              no_space_path, quote_path, AGY_SUBAGENT_TOOLS)
+                              STREAM_INTERRUPTED, no_space_path, quote_path, AGY_SUBAGENT_TOOLS)
 
 TIMEOUT = int(os.getenv("AGORA_TIMEOUT", "600"))
 WORK_TIMEOUT = int(os.getenv("AGORA_WORK_TIMEOUT", "7200"))
@@ -933,11 +933,19 @@ def denial_summary(relay: dict) -> Optional[str]:
 
 
 def unverified_warning(relay: dict) -> Optional[str]:
-    """工具被拒過、之後卻宣告完成：結果可能沒有依據，提醒分派方查證"""
-    if relay.get("status") == "done" and relay.get("denied"):
-        return ("接手期間有工具被拒，之後卻宣告【工作完成】：被拒的來源可能沒有真的讀到，"
-                "請查證結果的依據（例如被拒的網址、指令輸出），不要直接採用。")
-    return None
+    """宣告完成、但有理由懷疑結果的依據或完整性時，提醒分派方查證（兩種情況都有時一併列出）：
+    工具被拒過（被拒的來源可能沒有真的讀到）；有幾輪 CLI 回報串流中斷（回覆可能不完整，完成標記也可能是截斷前的內容）"""
+    if relay.get("status") != "done":
+        return None
+    parts = []
+    if relay.get("denied"):
+        parts.append("接手期間有工具被拒，之後卻宣告【工作完成】：被拒的來源可能沒有真的讀到，"
+                     "請查證結果的依據（例如被拒的網址、指令輸出），不要直接採用。")
+    rounds = relay.get("interrupted_rounds") or 0
+    if rounds:
+        parts.append(f"接手期間有 {rounds} 輪 CLI 回報串流中斷（連線中斷，原因待查），回覆可能不完整："
+                     "【工作完成】不代表工作已驗證，請以 git diff 與進度檔確認。")
+    return "".join(parts) or None
 
 
 def sleep_until(thread: Path, ts: float) -> bool:
@@ -1190,6 +1198,8 @@ def cmd_work(ws: Workspace, args):
             state = load_state(thread)
             add_message(thread, state, worker, reply, via_cli=True, meta=f"接手第 {relay['rounds'] + 1} 輪, {meta}")
             state["relay"].update(session_id=session_id, rounds=relay["rounds"] + 1, updated=now_str())
+            if STREAM_INTERRUPTED in meta:
+                state["relay"]["interrupted_rounds"] = (state["relay"].get("interrupted_rounds") or 0) + 1
             remember_session(state, worker, session_id, session_id == relay.get("external_session"))
             save_state(thread, state)
         rounds += 1
@@ -1202,8 +1212,9 @@ def cmd_work(ws: Workspace, args):
             relay = update_relay(thread, status="done")
             warning = unverified_warning(relay)
             if warning:
-                add_system_note(thread, f"⚠️ {denial_summary(relay)}。{warning}")
-                append_progress(thread, "工作完成，但接手期間有工具被拒", f"{denial_summary(relay)}。{warning}")
+                detail = "。".join(x for x in (denial_summary(relay), warning) if x)
+                add_system_note(thread, f"⚠️ {detail}")
+                append_progress(thread, "工作完成，但結果需要查證", detail)
             return
         if has_marker(reply, "【已暫停】"):
             update_relay(thread, status="stopped")
