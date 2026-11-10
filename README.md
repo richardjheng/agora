@@ -35,14 +35,15 @@ cd <專案資料夾> && agora install    # 安裝 skills、hook、權限與 git 
 
 - 用 `pip install -e` 安裝後，skills、接手方的指令權限與工作提示都改用固定的 `agora` 指令，Agora 搬家或更新時不必替每個專案重新 install（額度 hook 仍記錄路徑，搬家後要重新 install）。
 - 沒有安裝時照樣可以用 `python <Agora 資料夾>/agora.py`；Antigravity 的權限會同時保留兩種寫法，已裝過的 skills 不受影響。
-- 寫進 skills 與 `AGENTS.md` 的指令：PATH 上有 `agora` 就固定寫 `agora`，不論這次是哪一份 Agora 執行 install；PATH 上沒有時才寫完整路徑，並在 `AGENTS.md` 的區段內註明原因。
+- 寫進 skills 的指令：PATH 上有 `agora` 就固定寫 `agora`，不論這次是哪一份 Agora 執行 install；PATH 上沒有時才寫完整路徑。
 - 給接手方的工作提示與 Claude 的指令白名單，只有當 PATH 上的 `agora` 屬於目前這個 Python、而且指向這份程式時才用它，否則用路徑寫法（確保執行的是同一份程式）。
 
 ### install 會改哪些檔案
 
 - 只有執行 install 時才會改寫工作區的檔案：終端機的 `agora install`、VSCode 面板的「安裝到此專案／更新」按鈕（Agora 升級後安裝狀態變成「舊版」，面板就會顯示「更新」），以及建立討論串時「此專案尚未安裝 Agora，要先安裝嗎？」選「安裝」。
   擴充套件啟動時同步 `~/.agora/core`、額度 hook、討論與分派都不會改寫工作區的檔案；被 Agora 呼叫的 AI（接手方）不能執行 install。
-- 只改 Agora 管理的部分：skills（`.claude/skills/agora|relay`、`.agents/skills/agora|relay`）、`AGENTS.md` 的 `<!-- agora:begin -->` 區段、`.claude/settings.local.json`、`.agents/hooks.json` 與 `.codex/hooks.json` 裡 Agora 的 hook，以及全域的 `~/.gemini/antigravity-cli/settings.json` 權限。
+- 只改 Agora 管理的部分：skills（`.claude/skills/agora|relay`、`.agents/skills/agora|relay`）、`.claude/settings.local.json`、`.agents/hooks.json` 與 `.codex/hooks.json` 裡 Agora 的 hook，以及全域的 `~/.gemini/antigravity-cli/settings.json` 權限。
+- **不寫 `AGENTS.md`**：它常由其他工具管理（例如整檔覆寫的模組），會互相覆寫。Codex 改讀 `.agents/skills`（與 Antigravity 共用、不寫死身分的 skill）與 `.codex/hooks.json`。0.2.17 以前寫入的 `<!-- agora:begin -->…<!-- agora:end -->` 區段，install 會只移除該區段（其他內容不動）；檔案只剩空白、而且內容就是 Agora 上次寫入的那一份才刪檔，並從 git 排除的 Agora 區段撤除 `AGENTS.md`。標記殘缺、重複或順序錯時不動，安裝狀態顯示「需手動處理」。
 - 三方的 skills 與 hook 都會裝，不論是否勾選：使用者可能在沒勾選的 AI 對話框下指令，由它轉達給被勾選的 AI（見[依勾選分工](#依勾選分工)）。
 - 內容沒有實質變化（只差換行字元或行尾空白）時不寫入；寫入時沿用檔案原本的換行字元，不會只因換行而產生 git 改動。
 - install 輸出的第一行列出這次實際改寫的檔案（VSCode 的通知顯示的也是這一行），同時記進 `.agora/install.log`（時間、Agora 版本與位置、改了哪些檔案）。
@@ -144,13 +145,13 @@ $A keep <id> [--off]                                # 標記保留，prune 不�
   用 `new --parties` 指定參與者的討論串固定為那幾個，不自動加入；已在背景進行的分派工作不會換接手方。
 - 模型優先順序：討論串建立時的 `--model` / `--effort` ＞ 專案設定 ＞ CLI 預設。
 - `install` 不論勾選與否都安裝三方的 skills、hook 與權限。`agora install --status` 檢查此專案缺少或過期的項目（只有 `.agora/config.json` 不算安裝；在面板調整設定就會建立它）。
-- 在 git 專案裡，`install` 會把 Agora 建立的資料夾與檔案（`.agora/`、skills、`.claude/settings.local.json`，以及由它新建的 `AGENTS.md`、`.agents/hooks.json`、`.codex/hooks.json`）寫進 `.git/info/exclude` 的 Agora 區段，不改 `.gitignore`，避免被 commit。已被 git 追蹤的檔案排除無效，install 會列出來，可用 `git rm -r --cached <路徑>` 取消追蹤。
+- 在 git 專案裡，`install` 會把 Agora 建立的資料夾與檔案（`.agora/`、skills、`.claude/settings.local.json`，以及由它新建的 `.agents/hooks.json`、`.codex/hooks.json`）寫進 `.git/info/exclude` 的 Agora 區段，不改 `.gitignore`，避免被 commit。已被 git 追蹤的檔案排除無效，install 會列出來，可用 `git rm -r --cached <路徑>` 取消追蹤。
 
 ### 依勾選分工
 
 勾選的 AI 就是處理使用者訊息的 AI，使用者不需要在對話框說「跟其他 AI 討論」之類的提示詞。
 每則使用者訊息由 hook 附上「【Agora 勾選】」指示（Claude 的 UserPromptSubmit、Antigravity 的 PreInvocation、Codex 的 UserPromptSubmit），
-對話框所在的 AI 依指示與 agora skill（Codex 是 `AGENTS.md` 的 Agora 區段）處理：
+指示開頭寫出身分（「你是 Codex，Agora 指令用 --from codex」；Antigravity 與 Codex 共用同一份 skill，身分不能從勾選了誰推定），對話框所在的 AI 依指示與 agora skill 處理：
 
 | 勾選 | 對話框所在的 AI 怎麼做 |
 |---|---|
@@ -161,7 +162,7 @@ $A keep <id> [--off]                                # 標記保留，prune 不�
 
 - 例外：使用者在訊息中明確指定由誰處理時照指定；延續進行中的討論串或分派（回覆、確認、查看結果、停止）時沿用該討論串。
 - 被 Agora 呼叫的回覆（`AGORA_INVOKED=1`）與斜線指令（例如 `/code-review`）不附指示；不是 Agora 專案（找不到 `.agora/`）時也不附。
-- Codex 的專案 hook（`.codex/hooks.json`）要先在 Codex 裡信任才會執行；信任前 `AGENTS.md` 要求它先執行 `agora route --me codex` 取得指示。
+- Codex 的專案 hook（`.codex/hooks.json`）要先在 Codex 裡信任才會執行；信任前共用 skill 要求它先執行 `agora route --me codex` 取得指示。
 - 勾選存在 `.agora/config.json`，也就是每個 VSCode 視窗（工作區）各自的設定。
 
 ### 獨立作答與互評
@@ -328,6 +329,6 @@ agoralib/quota.py      三方額度
 agoralib/quota_hook.py 額度提醒與依勾選分工的 hook
 agoralib/routing.py    依勾選分工：對話框所在的 AI 該怎麼處理使用者的訊息
 agoralib/statusline.py Claude Code status line（選用）
-skills/                各 AI 的使用說明（claude、antigravity 的 skill；codex 的 AGENTS.md 片段）
+skills/                各 AI 的使用說明（claude：.claude/skills；agents：Antigravity 與 Codex 共用的 .agents/skills）
 vscode/                VSCode 擴充套件（側邊欄：AI 與模型、討論串；狀態列額度）
 ```

@@ -1808,13 +1808,16 @@ def _merge_json(path: Path, update) -> bool:
 SKILL_ROOT = "D:/github/agora"   # skills 範本裡的 Agora 位置，install 時換成實際位置或 agora 指令
 
 
-SKILL_DIRS = (("claude", Path(".claude") / "skills"), ("antigravity", Path(".agents") / "skills"))
+# skills 範本資料夾 → 安裝位置。.agents/skills 由 Antigravity 與 Codex 共用（Codex 0.164 也會讀這個目錄），
+# 所以那份 skill 不寫死身分，身分由 hook 的【Agora 勾選】指示說明（routing.py）
+SKILL_DIRS = (("claude", Path(".claude") / "skills"), ("agents", Path(".agents") / "skills"))
+SKILL_LABELS = {"claude": "Claude Code", "agents": "Antigravity／Codex 共用"}
 
 
 def install_plan() -> dict:
     """install 要寫入的指令：hook、舊式路徑指令、給 AI 用的指令。
     給 AI 用的指令只要 PATH 上有 agora 就固定寫 agora：不論這次是擴充套件內建的核心還是 pip install -e 的那份執行 install，
-    寫進 skills 與 AGENTS.md 的內容都一樣，不會因為換了執行者而來回改動。PATH 上沒有 agora 時才寫完整路徑"""
+    寫進 skills 的內容都一樣，不會因為換了執行者而來回改動。PATH 上沒有 agora 時才寫完整路徑"""
     root = AGORA_ROOT_DIR
     legacy = f"python {quote_path(root.as_posix() + '/agora.py')}"
     hook_file = root / "agoralib" / "quota_hook.py"
@@ -1824,16 +1827,36 @@ def install_plan() -> dict:
             "cmd": "agora" if agora_cmd() == "agora" or shutil.which("agora") else legacy}
 
 
-LEGACY_NOTE = ("<!-- 這台電腦的 PATH 上沒有 agora 指令，所以寫 Agora 的完整路徑；"
-               "執行 pip install -e <Agora 資料夾> 後重新 agora install，就會改成固定的 agora 指令。 -->")
+AGENTS_BEGIN, AGENTS_END = "<!-- agora:begin -->", "<!-- agora:end -->"
 
 
-def agents_section(plan: dict) -> str:
-    """AGENTS.md 裡 Agora 管理的區段；寫完整路徑時在區段內註明原因"""
-    section = render_template(plan, "codex", "AGENTS.md").strip()
-    if plan["cmd"] != "agora":
-        section = section.replace("<!-- agora:begin -->", "<!-- agora:begin -->\n" + LEGACY_NOTE, 1)
-    return section
+def legacy_agents_section(root: Path, owned: bool = False) -> Tuple[str, Optional[str]]:
+    """0.2.17 以前 install 寫進 AGENTS.md 的 Agora 區段。AGENTS.md 常由其他工具管理（例如整檔覆寫的模組），
+    會互相覆寫，所以 Agora 不再寫它，Codex 改讀 .agents/skills 的共用 skill 與 .codex/hooks.json。
+    回傳 (狀態, 移除區段後的內容)：none 沒有區段；section 有一組完整的區段；
+    broken 標記殘缺、重複或順序錯（不動，要人工處理）。
+    區段外的位元組不動：只切除起訖標記與其中內容。唯一例外是 owned（install_writes 的雜湊證明整份檔案仍是舊版 Agora
+    寫入的那一份），而且是舊版 install 的檔尾格式（`內容.rstrip() + 兩個換行 + 區段 + 一個換行`，全檔同一種換行）：
+    這時分隔換行與結尾換行確定是 Agora 加的，一併移除，剩下「內容＋一個換行」。格式相符本身不算來源證明。
+    （舊版 install 對全文 rstrip 過，移除後不保證還原成寫入前的原始位元組。）"""
+    path = root / "AGENTS.md"
+    try:
+        text = path.read_bytes().decode("utf-8")
+    except (OSError, UnicodeDecodeError):
+        return "none", None
+    begins, ends = text.count(AGENTS_BEGIN), text.count(AGENTS_END)
+    if not begins and not ends:
+        return "none", None
+    start, end = text.find(AGENTS_BEGIN), text.find(AGENTS_END)
+    if begins != 1 or ends != 1 or end < start:
+        return "broken", None
+    before, after = text[:start], text[end + len(AGENTS_END):]
+    eol = "\r\n" if "\r\n" in text else "\n"
+    uniform = eol == "\n" or "\n" not in text.replace("\r\n", "")
+    content = before[:-2 * len(eol)] if before.endswith(eol * 2) else ""
+    if owned and uniform and after in ("", eol) and content and not content[-1].isspace():
+        return "section", content + eol
+    return "section", before + after
 
 
 def render_template(plan: dict, *parts: str) -> str:
@@ -1850,11 +1873,12 @@ def _hook_commands(path: Path, collect) -> List[str]:
 
 
 def install_status(ws: Workspace) -> dict:
-    """此工作區的安裝狀態：三方需要的 skills、hook、AGENTS.md 段落是否存在、是否為目前版本。
+    """此工作區的安裝狀態：三方需要的 skills、hook 是否存在、是否為目前版本；AGENTS.md 還有舊的 Agora 區段算需要更新，
+    標記殘缺時另列在 manual（install 不會動它，要人工處理）。
     不論是否勾選都要裝：使用者可能在沒被勾選的 AI 對話框下指令，由它轉達給被勾選的 AI（見 routing.py）。
     只有 .agora/config.json（例如在面板調整過設定）不算安裝。"""
     plan = install_plan()
-    missing, outdated, checked = [], [], []
+    missing, outdated, checked, manual = [], [], [], []
 
     def check(label: str, present: bool, current: bool):
         checked.append(label)
@@ -1866,13 +1890,16 @@ def install_status(ws: Workspace) -> dict:
     for agent, rel in SKILL_DIRS:
         for skill in ("agora", "relay"):
             path = ws.root / rel / skill / "SKILL.md"
-            check(f"{NAMES[agent]} skill「{skill}」", path.exists(),
+            check(f"{SKILL_LABELS[agent]} skill「{skill}」", path.exists(),
                   path.exists() and _normalized(path.read_text(encoding="utf-8"))
                   == _normalized(render_template(plan, agent, skill, "SKILL.md")))
-    agents_md = ws.root / "AGENTS.md"
-    text = agents_md.read_text(encoding="utf-8") if agents_md.exists() else ""
-    section = agents_section(plan)
-    check("Codex 的 AGENTS.md 段落", "<!-- agora:begin -->" in text, _normalized(section) in _normalized(text))
+    legacy, _ = legacy_agents_section(ws.root)
+    if legacy == "section":
+        outdated.append("AGENTS.md 裡舊的 Agora 段落（install 會移除）")
+    elif legacy == "broken":
+        outdated.append("AGENTS.md 的 Agora 標記不完整（需手動處理）")
+        manual.append("AGENTS.md 的 <!-- agora:begin --> / <!-- agora:end --> 標記殘缺、重複或順序錯，install 不會修改；"
+                      "請手動移除 Agora 的內容與標記")
     commands = _hook_commands(ws.root / ".codex" / "hooks.json", lambda d: [
         h.get("command", "") for g in ((d.get("hooks") or {}).get("UserPromptSubmit") or []) for h in g.get("hooks", [])])
     check("Codex hook", any("quota_hook.py" in c for c in commands), f"{plan['hook']} codex-prompt" in commands)
@@ -1895,7 +1922,7 @@ def install_status(ws: Workspace) -> dict:
     present = len(checked) - len(missing)
     state = ("installed" if not missing and not outdated else "outdated" if not missing
              else "partial" if present else "missing")
-    return {"state": state, "missing": missing, "outdated": outdated, "version": __version__}
+    return {"state": state, "missing": missing, "outdated": outdated, "manual": manual, "version": __version__}
 
 
 def cmd_install(ws: Workspace, args):
@@ -1932,20 +1959,25 @@ def cmd_install(ws: Workspace, args):
             path = dest / skill / "SKILL.md"
             if write_if_changed(path, render_template(plan, agent, skill, "SKILL.md")):
                 changed.append(path)
-        done.append(f"{agent} skills → {dest}")
+        done.append(f"{SKILL_LABELS[agent]} skills → {dest}")
 
-    # Codex（以及同樣會讀 AGENTS.md 的 Antigravity）：以標記區段寫入，重裝時整段替換
+    # 不再寫 AGENTS.md（常由其他工具管理，會互相覆寫）；移除舊版寫入的區段。只剩空白、而且內容就是 Agora 上次寫入的那一份
+    # （install_writes 有紀錄、沒被別人改過）才刪檔；標記殘缺時不動
     agents_md = ws.root / "AGENTS.md"
-    created_agents_md = not agents_md.exists()
-    section = agents_section(plan)
-    text = agents_md.read_text(encoding="utf-8") if agents_md.exists() else ""
-    text = re.sub(r"<!-- agora:begin -->.*?<!-- agora:end -->", lambda _: section, text, flags=re.S) \
-        if "<!-- agora:begin -->" in text else (text.rstrip() + "\n\n" + section if text.strip() else section)
-    if write_if_changed(agents_md, text.rstrip() + "\n"):
+    owned = agents_md.exists() and written_by_agora(ws.root, "AGENTS.md", agora_writes(ws.root, 0))
+    old_section, rest = legacy_agents_section(ws.root, owned)
+    if old_section == "section":
+        if not rest.strip() and owned:
+            agents_md.unlink()
+            done.append("移除 Agora 建立的 AGENTS.md（只有舊的 Agora 段落）")
+        else:
+            agents_md.write_bytes(rest.encode("utf-8"))
+            done.append("移除 AGENTS.md 裡舊的 Agora 段落（其他內容不動）")
         changed.append(agents_md)
-    done.append(f"Codex 說明 → {agents_md}")
+    elif old_section == "broken":
+        done.append("⚠️ AGENTS.md 的 Agora 標記不完整，沒有修改；請手動移除 Agora 的內容與標記")
 
-    # Codex 的專案 hook（額度與依勾選分工）：Codex 要先信任這個 hook 才會執行；沒執行時 AGENTS.md 要它改用 agora route
+    # Codex 的專案 hook（額度與依勾選分工）：Codex 要先信任這個 hook 才會執行；沒執行時共用 skill 要它改用 agora route
     def codex_hooks(data):
         hooks = data.setdefault("hooks", {})
         groups = [g for g in hooks.get("UserPromptSubmit", []) if "quota_hook.py" not in json.dumps(g)]
@@ -1998,12 +2030,13 @@ def cmd_install(ws: Workspace, args):
     done.append("Antigravity 權限 → ~/.gemini/antigravity-cli/settings.json")
 
     # Agora 建立的檔案寫進 .git/info/exclude（不改會被 commit 的 .gitignore）；
-    # AGENTS.md、.agents/hooks.json、.codex/hooks.json 可能是使用者自己的檔案，只有這次由 install 建立時才排除
+    # .agents/hooks.json、.codex/hooks.json 可能是使用者自己的檔案，只有這次由 install 建立時才排除；
+    # 舊版排除過的 AGENTS.md 從 Agora 區段撤除（Agora 不再管理它；其他工具的排除規則不動）
     owned = [".agora/", ".claude/skills/agora/", ".claude/skills/relay/", ".claude/settings.local.json",
              ".agents/skills/agora/", ".agents/skills/relay/"]
-    owned += [f for f, created in ((".agents/hooks.json", created_hooks), (".codex/hooks.json", created_codex_hooks),
-                                   ("AGENTS.md", created_agents_md)) if created]
-    excluded, tracked = git_exclude(ws.root, owned)
+    owned += [f for f, created in ((".agents/hooks.json", created_hooks), (".codex/hooks.json", created_codex_hooks))
+              if created]
+    excluded, tracked = git_exclude(ws.root, owned, remove=["AGENTS.md"])
     if excluded is None:
         done.append("不是 git repo，沒有設定 git 排除")
     else:
@@ -2023,7 +2056,7 @@ def cmd_install(ws: Workspace, args):
         for t in tracked:
             print(f"    {t}")
     print("Claude Code 需重新載入視窗（或開啟 /hooks）才會套用新的 hook。")
-    print("Codex 第一次要在 Codex 裡信任 .codex/hooks.json 的 hook；信任前 Codex 會依 AGENTS.md 改用 agora route 取得分工方式。")
+    print("Codex 第一次要在 Codex 裡信任 .codex/hooks.json 的 hook；信任前 Codex 會依共用 skill 改用 agora route 取得分工方式。")
     for line in check_advice(ws):
         print(line)
 
@@ -2118,8 +2151,9 @@ def written_by_agora(root: Path, rel: str, writes: dict) -> bool:
 EXCLUDE_BEGIN, EXCLUDE_END = "# agora:begin（由 agora install 管理）", "# agora:end"
 
 
-def git_exclude(root: Path, paths: List[str]):
-    """把 paths（相對於工作區）加進 git 的 info/exclude 的 Agora 區段，保留區段內之前加過的項目。
+def git_exclude(root: Path, paths: List[str], remove: List[str] = ()):
+    """把 paths（相對於工作區）加進 git 的 info/exclude 的 Agora 區段，保留區段內之前加過的項目；
+    remove 是要從 Agora 區段撤除的項目（Agora 不再管理的檔案）。區段外（使用者或其他工具）的規則不動。
     回傳 (exclude 檔路徑或 None（不是 git repo）, 已被 git 追蹤的路徑)"""
     def git(*args):
         proc = subprocess.run(["git", *args], cwd=root, capture_output=True, text=True, encoding="utf-8", timeout=30,
@@ -2143,7 +2177,8 @@ def git_exclude(root: Path, paths: List[str]):
         old, lines = lines[start + 1:end], lines[:start] + lines[end + 1:]
     else:
         start, old = len(lines), []
-    block = [EXCLUDE_BEGIN] + list(dict.fromkeys(old + patterns)) + [EXCLUDE_END]
+    dropped = {f"/{prefix}{p}" for p in remove} - set(patterns)
+    block = [EXCLUDE_BEGIN] + [x for x in dict.fromkeys(old + patterns) if x not in dropped] + [EXCLUDE_END]
     lines[start:start] = block
     exclude.parent.mkdir(parents=True, exist_ok=True)
     new = eol.join(lines) + eol

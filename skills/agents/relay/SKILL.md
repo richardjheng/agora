@@ -1,9 +1,11 @@
 ---
 name: relay
-description: 額度快用完時把工作交接給還有額度的 AI（Claude Code 或 Codex）、回來後收回並同步。當額度提醒（【額度】或 ⚠️ 額度低於 5%）出現、使用者要求「交接給其他 AI」「收回工作」時使用。
+description: 額度快用完時把工作交接給還有額度的 AI、回來後收回並同步（Antigravity 與 Codex 共用）。當額度提醒（【額度】或 ⚠️ 額度低於 5%）出現、使用者要求「交接給其他 AI」「收回工作」時使用。
 ---
 
 # Relay：額度交接
+
+這份 skill 由 Antigravity 與 Codex 共用，指令裡的 `<你>` 換成你自己：**Antigravity 用 `antigravity`，Codex 用 `codex`**（以 hook 附上的「你是 …」為準；沒有時依你實際是哪個 CLI 判斷）。
 
 每次對話開始時，hook 會注入一行【額度】（Claude、Antigravity、Codex 的剩餘量與重置時間）；
 額度低於 5% 時會加上 ⚠️ 指示。隨時可執行 `python D:/github/agora/agora.py quota` 查詢。
@@ -18,7 +20,7 @@ description: 額度快用完時把工作交接給還有額度的 AI（Claude Cod
    - 如何驗證（要跑的測試指令）
 3. 交接（若目前沒有相關討論串，先 `python D:/github/agora/agora.py new "主題"`）：
    ```powershell
-   python D:/github/agora/agora.py assign <thread> --from antigravity --to <AI> --file <交接單路徑>
+   python D:/github/agora/agora.py assign <thread> --from <你> --to <AI> --file <交接單路徑>
    ```
    `--to` 用 ⚠️ 提醒裡指名的接手方（已依此專案的工作分配比例與額度挑好）；沒有提醒時可省略 `--to`，
    Agora 會在啟用的 AI 中依分配比例挑選。
@@ -26,8 +28,8 @@ description: 額度快用完時把工作交接給還有額度的 AI（Claude Cod
 
 ## B. 所有 AI 都不足
 
-- 若有其他 AI 比你早重置：照 A 段交接（接手程序會等 Claude 重置後才開始）。
-- 否則：把目前進度寫進討論串（`python D:/github/agora/agora.py send <thread> --from antigravity --to none --file <進度檔>`），告訴 Richard 你的重置時間，然後停止。
+- 若有其他 AI 比你早重置：照 A 段交接（接手程序會等接手方重置後才開始）。
+- 否則：把目前進度寫進討論串（`python D:/github/agora/agora.py send <thread> --from <你> --to none --file <進度檔>`），告訴 Richard 你的重置時間，然後停止。
 
 ## C. 回來後收回
 

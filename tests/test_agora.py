@@ -797,7 +797,11 @@ class TestRouting(unittest.TestCase):
         self.assertIn("「多方」", text)
         text = routing.instruction("claude", ["antigravity", "codex"])
         self.assertIn("只負責主持", text)
-        self.assertIn("AGENTS.md", routing.instruction("codex", ["claude"]))
+        text = routing.instruction("codex", ["claude"])
+        self.assertTrue(text.startswith(f"{routing.TAG}你是 Codex，Agora 指令用 --from codex。"))
+        self.assertIn("agora skill", text)
+        self.assertNotIn("AGENTS.md", text)
+        self.assertIn("你是 Antigravity，Agora 指令用 --from antigravity。", routing.instruction("antigravity", ["antigravity"]))
 
     def test_hook_routing_line(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -850,20 +854,126 @@ class TestRouting(unittest.TestCase):
         self.assertIn("只負責主持", data["instruction"])
 
 
+SECTION = "<!-- agora:begin -->\n## Agora\n舊版寫入的說明\n<!-- agora:end -->"
+
+
+class TestAgentsMdMigration(unittest.TestCase):
+    """Agora 不再寫 AGENTS.md（其他工具會整檔覆寫，互相蓋掉）；install 移除舊版寫入的區段"""
+
+    def install(self, root, home):
+        with patch.object(Path, "home", return_value=Path(home)), patch("sys.stdout", io.StringIO()):
+            cli.cmd_install(cli.Workspace(root), None)
+
+    def test_removes_trailing_section_and_keeps_other_bytes(self):
+        for eol in ("\n", "\r\n"):
+            with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as home:
+                root = Path(tmp)
+                mine = f"# zhanlu{eol}{eol}- 規則{eol}sentinel{eol}"
+                (root / "AGENTS.md").write_bytes((mine + eol + SECTION.replace("\n", eol) + eol).encode("utf-8"))
+                cli.record_install(cli.Workspace(root), [root / "AGENTS.md"])   # 舊版 install 寫入的紀錄（之後沒人改過）
+                status = cli.install_status(cli.Workspace(root))
+                self.assertIn("AGENTS.md 裡舊的 Agora 段落（install 會移除）", status["outdated"])
+                self.install(root, home)
+                self.assertEqual((root / "AGENTS.md").read_bytes(), mine.encode("utf-8"), repr(eol))
+                with patch.object(Path, "home", return_value=Path(home)):
+                    self.assertEqual(cli.install_status(cli.Workspace(root))["state"], "installed")
+                before = (root / "AGENTS.md").read_bytes()
+                self.install(root, home)   # 重複安裝不再改動
+                self.assertEqual((root / "AGENTS.md").read_bytes(), before)
+
+    def test_removes_middle_section_only(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as home:
+            root = Path(tmp)
+            (root / "AGENTS.md").write_bytes(f"# 前\n\n{SECTION}\n## 後\n內容  \n".encode("utf-8"))
+            self.install(root, home)
+            self.assertEqual((root / "AGENTS.md").read_bytes(), "# 前\n\n\n## 後\n內容  \n".encode("utf-8"))
+
+    def test_only_owned_exact_legacy_layout_drops_surrounding_whitespace(self):
+        """區段外的位元組（行尾空白、空行、混合換行）都不動，只切除標記與其中內容；
+        只有寫入紀錄證明整份檔案是舊版 Agora 寫的（owned）、而且是舊版的檔尾格式時，才連同 Agora 加的換行一起移除。
+        格式相符本身不算證明（使用者可能自己排成同樣的格式）"""
+        crlf_section = SECTION.replace("\n", "\r\n")
+        cases = [   # (內容, owned, 預期)
+            (f"rule  \n\n\n{SECTION}\n", True, "rule  \n\n\n\n"),             # 前文有行尾空白與多個空行
+            (f"rule\n\n{SECTION}\n  \n", True, "rule\n\n\n  \n"),              # 區段後還有空白
+            (f"rule\r\n\r\n{SECTION}\r\n", True, "rule\r\n\r\n\r\n"),          # 外圍 CRLF、區段內 LF：不是同一種換行
+            (f"rule\n\n{SECTION}\n", False, "rule\n\n\n"),                     # 舊版格式但沒有寫入紀錄
+            (f"rule\n\n{SECTION}\n", True, "rule\n"),                          # 舊版格式＋紀錄
+            (f"rule\n\n{SECTION}", True, "rule\n"),                            # 同上、沒有結尾換行
+            (f"rule\r\n\r\n{crlf_section}\r\n", True, "rule\r\n"),             # 舊版格式（全檔 CRLF）＋紀錄
+        ]
+        for text, owned, expected in cases:
+            with tempfile.TemporaryDirectory() as tmp:
+                (Path(tmp) / "AGENTS.md").write_bytes(text.encode("utf-8"))
+                self.assertEqual(cli.legacy_agents_section(Path(tmp), owned), ("section", expected), repr((text, owned)))
+
+    def test_unrecorded_legacy_layout_only_cuts_section(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as home:
+            root = Path(tmp)
+            (root / "AGENTS.md").write_bytes(f"rule\n\n{SECTION}\n".encode("utf-8"))   # 沒有 install 寫入紀錄
+            self.install(root, home)
+            self.assertEqual((root / "AGENTS.md").read_bytes(), b"rule\n\n\n")
+
+    def test_broken_markers_are_left_alone_and_reported(self):
+        cases = ("<!-- agora:begin -->\n只有開頭\n", f"{SECTION}\n{SECTION}\n",
+                 "<!-- agora:end -->\n順序錯\n<!-- agora:begin -->\n")
+        for text in cases:
+            with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as home:
+                root = Path(tmp)
+                (root / "AGENTS.md").write_bytes(text.encode("utf-8"))
+                self.install(root, home)
+                self.assertEqual((root / "AGENTS.md").read_bytes(), text.encode("utf-8"))
+                with patch.object(Path, "home", return_value=Path(home)):
+                    status = cli.install_status(cli.Workspace(root))
+                self.assertEqual(status["state"], "outdated", text)
+                self.assertTrue(status["manual"], text)
+
+    def test_deletes_agora_created_file_and_drops_exclude(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as home:
+            root = make_repo(tmp)
+            exclude = root / ".git" / "info" / "exclude"
+            exclude.write_text(f"/zhanlu-owned\n{cli.EXCLUDE_BEGIN}\n/.agora/\n/AGENTS.md\n{cli.EXCLUDE_END}\n", encoding="utf-8")
+            (root / "AGENTS.md").write_text(SECTION + "\n", encoding="utf-8")
+            cli.record_install(cli.Workspace(root), [root / "AGENTS.md"])   # 舊版 install 寫入的紀錄
+            self.install(root, home)
+            self.assertFalse((root / "AGENTS.md").exists())
+            text = exclude.read_text(encoding="utf-8")
+            self.assertNotIn("/AGENTS.md", text)
+            self.assertTrue(text.startswith("/zhanlu-owned\n"))   # 其他工具的規則不動
+
+    def test_keeps_file_when_not_provably_agora_written(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as home:
+            root = Path(tmp)
+            (root / "AGENTS.md").write_text(SECTION + "\n", encoding="utf-8")
+            cli.record_install(cli.Workspace(root), [root / "AGENTS.md"])
+            (root / "AGENTS.md").write_text(SECTION + "\n\n", encoding="utf-8")   # 之後被別人改過
+            self.install(root, home)
+            self.assertTrue((root / "AGENTS.md").exists())
+            self.assertEqual((root / "AGENTS.md").read_text(encoding="utf-8").strip(), "")
+
+    def test_shared_skill_has_no_fixed_identity(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as home:
+            root = Path(tmp)
+            self.install(root, home)
+            for skill in ("agora", "relay"):
+                text = (root / ".agents" / "skills" / skill / "SKILL.md").read_text(encoding="utf-8")
+                self.assertNotIn("--from antigravity", text, skill)
+                self.assertNotIn("--from codex", text, skill)
+                self.assertIn("--from <你>", text, skill)
+
+
 class TestInstall(unittest.TestCase):
     def test_install_is_idempotent(self):
         with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as home:
             ws = cli.Workspace(Path(tmp))
-            (Path(tmp) / "AGENTS.md").write_text("# 既有說明\n", encoding="utf-8")
+            (Path(tmp) / "AGENTS.md").write_bytes("# 既有說明\n".encode("utf-8"))
             with patch.object(Path, "home", return_value=Path(home)):
                 for _ in range(2):
                     cli.cmd_install(ws, None)
             settings = json.loads((Path(tmp) / ".claude" / "settings.local.json").read_text(encoding="utf-8"))
             self.assertEqual(len(settings["hooks"]["UserPromptSubmit"]), 1)
             self.assertEqual(len(settings["hooks"]["PostToolUse"]), 1)
-            agents = (Path(tmp) / "AGENTS.md").read_text(encoding="utf-8")
-            self.assertEqual(agents.count("<!-- agora:begin -->"), 1)
-            self.assertIn("# 既有說明", agents)
+            self.assertEqual((Path(tmp) / "AGENTS.md").read_bytes(), "# 既有說明\n".encode("utf-8"))   # 不碰使用者的 AGENTS.md
             allow = json.loads((Path(home) / ".gemini" / "antigravity-cli" / "settings.json")
                                .read_text(encoding="utf-8"))["permissions"]["allow"]
             self.assertEqual(len(allow), len(set(allow)))
@@ -884,10 +994,10 @@ class TestInstall(unittest.TestCase):
             text = exclude.read_bytes().decode("utf-8")
             self.assertTrue(text.startswith("# mine\r\n*.log\r\n"))          # 保留原內容與行尾
             self.assertEqual(text.count(cli.EXCLUDE_BEGIN), 1)
-            for p in ("/.agora/", "/.claude/skills/agora/", "/.claude/settings.local.json", "/.agents/skills/relay/",
-                      "/AGENTS.md"):
+            for p in ("/.agora/", "/.claude/skills/agora/", "/.claude/settings.local.json", "/.agents/skills/relay/"):
                 self.assertIn(p + "\r\n", text)
             self.assertNotIn("/.agents/hooks.json", text)                  # 不是 install 建立的
+            self.assertNotIn("/AGENTS.md", text)                           # Agora 不再管理 AGENTS.md
             self.assertEqual((root / ".gitignore").read_bytes(), gitignore_before)
             self.assertEqual(git(root, "status", "--porcelain", "--untracked-files=all").strip(), "?? .agents/hooks.json")
 
@@ -950,7 +1060,7 @@ class TestInstall(unittest.TestCase):
                 self.assertEqual(cli.install_status(ws)["state"], "installed")
             self.assertTrue((Path(tmp) / ".claude" / "skills" / "agora" / "SKILL.md").exists())
             self.assertTrue((Path(tmp) / ".agents" / "skills" / "agora" / "SKILL.md").exists())
-            self.assertIn("<!-- agora:begin -->", (Path(tmp) / "AGENTS.md").read_text(encoding="utf-8"))
+            self.assertFalse((Path(tmp) / "AGENTS.md").exists())   # 不再寫 AGENTS.md（常由其他工具管理）
             settings = json.loads((Path(tmp) / ".claude" / "settings.local.json").read_text(encoding="utf-8"))
             self.assertIn("claude-prompt", json.dumps(settings))
 
@@ -982,8 +1092,8 @@ class TestInstall(unittest.TestCase):
                 cli.cmd_install(ws, None)
             skill = (Path(tmp) / ".claude" / "skills" / "agora" / "SKILL.md").read_text(encoding="utf-8")
             self.assertIn(custom_root.as_posix(), skill)
-            agents = (Path(tmp) / "AGENTS.md").read_text(encoding="utf-8")
-            self.assertIn(custom_root.as_posix(), agents)
+            shared = (Path(tmp) / ".agents" / "skills" / "agora" / "SKILL.md").read_text(encoding="utf-8")
+            self.assertIn(custom_root.as_posix(), shared)
 
     def test_install_status(self):
         with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as home,                 patch.object(Path, "home", return_value=Path(home)):
@@ -1089,18 +1199,17 @@ class TestInstall(unittest.TestCase):
             self.assertEqual(cli.guard_files(ws.root, before, thread, "codex", since), [".agents/hooks.json"])
             self.assertEqual(hooks.read_bytes(), upgraded)
 
-    def test_agents_md_command_is_stable(self):
-        """PATH 上有 agora 就固定寫 agora（不論由哪一份 Agora 執行 install）；沒有時寫完整路徑並在區段內註明"""
+    def test_skill_command_is_stable(self):
+        """PATH 上有 agora 就固定寫 agora（不論由哪一份 Agora 執行 install）；沒有時寫完整路徑"""
         with patch.object(parties, "_CMD", parties.LEGACY_CMD):
             with patch.object(cli.shutil, "which", return_value="C:/x/agora.exe"):
                 plan = cli.install_plan()
                 self.assertEqual(plan["cmd"], "agora")
-                self.assertNotIn(cli.LEGACY_NOTE, cli.agents_section(plan))
+                self.assertIn("agora new", cli.render_template(plan, "agents", "agora", "SKILL.md"))
             with patch.object(cli.shutil, "which", return_value=None):
                 plan = cli.install_plan()
                 self.assertEqual(plan["cmd"], plan["legacy"])
-                section = cli.agents_section(plan)
-                self.assertTrue(section.startswith("<!-- agora:begin -->\n" + cli.LEGACY_NOTE))
+                self.assertIn(f"{plan['legacy']} new", cli.render_template(plan, "agents", "agora", "SKILL.md"))
 
     def test_worker_cannot_run_install(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {parties.NESTED_ENV: "1"}):
@@ -1621,12 +1730,12 @@ class TestLock(unittest.TestCase):
 class TestVersion(unittest.TestCase):
     def test_version_defined_and_cli_flag(self):
         from agoralib import __version__
-        self.assertEqual(__version__, "0.2.17")
+        self.assertEqual(__version__, "0.2.18")
         out = io.StringIO()
         with patch("sys.stdout", out), self.assertRaises(SystemExit) as cm:
             cli.main(["--version"])
         self.assertEqual(cm.exception.code, 0)
-        self.assertIn("0.2.17", out.getvalue())
+        self.assertIn("0.2.18", out.getvalue())
 
 
 class TestQuotaWindows(unittest.TestCase):
