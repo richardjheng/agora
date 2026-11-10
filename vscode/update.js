@@ -7,6 +7,8 @@ const fs = require("fs");
 const https = require("https");
 const os = require("os");
 const path = require("path");
+const crypto = require("crypto");
+const { pipeline } = require("stream/promises");
 
 const REPO = "richardjheng/agora";
 const LATEST_URL = `https://api.github.com/repos/${REPO}/releases/latest`;
@@ -68,18 +70,13 @@ async function fetchLatest(opts) {
 
 /** 下載 .vsix 到暫存資料夾，回傳檔案路徑；先寫 .part 再改名，下載中斷不會留下不完整的 .vsix */
 async function download(info, dir = os.tmpdir(), opts) {
-  const file = path.join(dir, path.basename(info.name));
+  const name = path.parse(path.basename(info.name));
+  const file = path.join(dir, `${name.name}-${crypto.randomUUID()}${name.ext}`);
   const part = `${file}.part`;
   const res = await request(info.url, { accept: "application/octet-stream", timeout: 120000, ...opts });
   try {
-    await new Promise((resolve, reject) => {
-      const out = fs.createWriteStream(part);
-      res.on("error", reject);
-      res.on("aborted", () => reject(new Error("下載中斷")));
-      out.on("error", reject);
-      out.on("finish", resolve);
-      res.pipe(out);
-    });
+    // pipeline 等待串流關閉，Windows 上也能在失敗後刪除殘檔。
+    await pipeline(res, fs.createWriteStream(part, { flags: "wx" }));
     fs.renameSync(part, file);
   } catch (e) {
     fs.rmSync(part, { force: true });

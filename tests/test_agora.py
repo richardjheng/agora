@@ -22,6 +22,8 @@ from agoralib.parties import HUMAN, canonical  # noqa: E402
 _TEST_HOME = Path(tempfile.mkdtemp())
 quota.BLOCKED_FILE = _TEST_HOME / "blocked.json"
 cli.INSTALL_WRITES = _TEST_HOME / "install_writes.jsonl"
+os.environ.pop(parties.NESTED_ENV, None)
+os.environ.pop(parties.LOCKED_ENV, None)
 
 
 def state_with(parties, messages=()):
@@ -166,6 +168,8 @@ SUMMARY = """## 共識
 無
 ## 保留的異議
 無
+## 互評發現的盲點
+沒人想到要處理舊資料。
 ## 工作單
 ### 範圍
 修改 `a.txt` 與 src/new_module.py；不要碰 .env。版本 0.1.1。
@@ -182,6 +186,8 @@ class TestSummary(unittest.TestCase):
         self.assertTrue(order.startswith("### 範圍"))
         self.assertIn("### 驗收條件", order)
         self.assertNotIn("## 共識", order)
+        self.assertNotIn("互評發現的盲點", order)
+        self.assertIn("## 互評發現的盲點", cli.SUMMARY_PROMPT)
         with self.assertRaises(ValueError):
             cli.work_order("## 共識\n沒有工作單")
         with self.assertRaises(ValueError):
@@ -505,6 +511,49 @@ class TestDiscussionFailures(unittest.TestCase):
             self.assertEqual(state["parties"]["antigravity"]["session_id"], "conv-1")
             self.assertIn("重試一次", (thread / "transcript.md").read_text(encoding="utf-8"))
 
+    def test_blind_send_hides_same_round_answers_until_next_message(self):
+        prompts = {}
+
+        def caller(name):
+            def call(prompt, session_id, opts, work, workspace, timeout, scratch, live=None):
+                prompts.setdefault(name, []).append(prompt)
+                return f"{name} 的獨立答案", f"s-{name}", "1s"
+            return call
+
+        callers = {p: caller(p) for p in ("claude", "antigravity", "codex")}
+        with tempfile.TemporaryDirectory() as tmp:
+            ws, thread = self.setup_thread(tmp)
+            args = type("Args", (), {"thread": "t1", "sender": "human", "to": "all", "message": "要選 A 還是 B？",
+                                     "file": None, "blind": True})()
+            with patch.dict(os.environ, {jobs.JOB_ENV: str(thread)}), patch.dict(cli.CALLERS, callers), \
+                    patch.object(cli, "git_status", return_value=""), patch("sys.stdout", io.StringIO()), \
+                    patch("sys.stderr", io.StringIO()):
+                os.environ.pop(cli.NESTED_ENV, None)
+                cli.cmd_send(ws, args)
+                for p in ("antigravity", "codex"):   # 後回覆的看不到先回覆者的答案
+                    self.assertNotIn("claude 的獨立答案", prompts[p][0])
+                    self.assertIn("【獨立作答】", prompts[p][0])
+                self.assertNotIn("antigravity 的獨立答案", prompts["codex"][0])
+                self.assertEqual({p: i["seen"] for p, i in cli.load_state(thread)["parties"].items()},
+                                 {"claude": 1, "antigravity": 1, "codex": 1})
+                args.message, args.blind, args.to = "請互評", False, "codex"
+                cli.cmd_send(ws, args)
+            # 下一則訊息時看到其他人的答案（不含自己的），不再有獨立作答說明
+            second = prompts["codex"][1]
+            self.assertIn("claude 的獨立答案", second)
+            self.assertIn("antigravity 的獨立答案", second)
+            self.assertNotIn("codex 的獨立答案", second)
+            self.assertNotIn("【獨立作答】", second)
+
+    def test_preamble_names_moderator_who_is_not_a_party(self):
+        """沒被勾選的 AI 主持討論時，參與者的說明也要列出它"""
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = cli.Workspace(Path(tmp))
+            state = state_with(["antigravity", "codex"], [("claude", "開場", False)])
+            state["parties_fixed"] = True
+            prompt = cli.build_prompt(ws, state, "codex")
+            self.assertIn("與 Antigravity、Claude Code 進行", prompt)
+
     def test_send_continues_after_a_party_fails(self):
         def broken(*a, **k):
             raise parties.CallError("timeout-ish failure")
@@ -686,6 +735,76 @@ class TestHookAdvice(unittest.TestCase):
         self.assertEqual(quota_hook.advice("claude", {"claude": self.usage(50), "codex": self.usage(1)}), (None, None))
 
 
+def routing_tag():
+    from agoralib import routing
+    return routing.TAG
+
+
+class TestRouting(unittest.TestCase):
+    def test_instruction_by_checked_parties(self):
+        from agoralib import routing
+        self.assertIn("直接自己處理", routing.instruction("claude", ["claude"]))
+        text = routing.instruction("claude", ["antigravity"])
+        self.assertIn("你沒有被勾選", text)
+        self.assertIn("「轉交一方」", text)
+        text = routing.instruction("claude", ["claude", "codex"])
+        self.assertIn("由你和 Codex", text)
+        self.assertIn("「多方」", text)
+        text = routing.instruction("claude", ["antigravity", "codex"])
+        self.assertIn("只負責主持", text)
+        self.assertIn("AGENTS.md", routing.instruction("codex", ["claude"]))
+
+    def test_hook_routing_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config.update_parties(Path(tmp), disable=["claude", "codex"])
+            env = {k: v for k, v in os.environ.items() if k != cli.NESTED_ENV}
+            with patch.dict(os.environ, {**env, "CLAUDE_PROJECT_DIR": tmp}, clear=True):
+                self.assertIn("交給 Antigravity", quota_hook.routing_line("claude", "幫我修 bug"))
+                self.assertIsNone(quota_hook.routing_line("claude", "/code-review"))
+                with patch.dict(os.environ, {cli.NESTED_ENV: "1"}):
+                    self.assertIsNone(quota_hook.routing_line("claude", "幫我修 bug"))
+        with tempfile.TemporaryDirectory() as tmp:   # 不是 Agora 專案（找不到 .agora）時不附
+            with patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": tmp}), patch.object(config, "find_root", return_value=None):
+                self.assertIsNone(quota_hook.routing_line("claude", "hi"))
+
+    def run_hook(self, mode, payload, root):
+        buf = io.BytesIO()
+        out = io.TextIOWrapper(buf, encoding="utf-8")
+        env = {k: v for k, v in os.environ.items() if k not in (cli.NESTED_ENV, quota.PROBE_ENV)}
+        with patch.dict(os.environ, {**env, "CLAUDE_PROJECT_DIR": root}, clear=True), \
+                patch.object(sys, "argv", ["quota_hook.py", mode]), patch.object(quota, "AGORA_HOME", Path(root)), \
+                patch.object(quota_hook, "STATE_FILE", Path(root) / "hook_state.json"), \
+                patch.object(quota, "all_usage", return_value={}), \
+                patch("sys.stdin", io.TextIOWrapper(io.BytesIO(json.dumps(payload).encode("utf-8")))), \
+                patch("sys.stdout", out):
+            quota_hook.main()
+            out.flush()
+        return json.loads(buf.getvalue().decode("utf-8"))
+
+    def test_prompt_hooks_inject_routing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config.update_parties(Path(tmp), disable=["claude"])
+            for mode in ("claude-prompt", "codex-prompt"):
+                ctx = self.run_hook(mode, {"prompt": "修這個 bug"}, tmp)["hookSpecificOutput"]["additionalContext"]
+                self.assertIn(routing_tag(), ctx, mode)
+            ctx = self.run_hook("codex-prompt", {"prompt": "修這個 bug"}, tmp)["hookSpecificOutput"]["additionalContext"]
+            self.assertIn("由你和 Antigravity", ctx)
+            ctx = self.run_hook("claude-prompt", {"prompt": "/code-review"}, tmp)["hookSpecificOutput"]["additionalContext"]
+            self.assertNotIn(routing_tag(), ctx)
+            msg = self.run_hook("agy-pre", {"invocationNum": 1}, tmp)["injectSteps"][0]["ephemeralMessage"]
+            self.assertIn("由你和 Codex", msg)
+
+    def test_route_command(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config.update_parties(Path(tmp), disable=["antigravity"])
+            out = io.StringIO()
+            with patch("sys.stdout", out):
+                cli.cmd_route(cli.Workspace(Path(tmp)), type("Args", (), {"me": "antigravity", "json": True})())
+            data = json.loads(out.getvalue())
+        self.assertEqual(data["enabled"], ["claude", "codex"])
+        self.assertIn("只負責主持", data["instruction"])
+
+
 class TestInstall(unittest.TestCase):
     def test_install_is_idempotent(self):
         with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as home:
@@ -776,15 +895,36 @@ class TestInstall(unittest.TestCase):
             self.assertFalse(any(r.startswith("write_file(") and r != keep for r in allow))
             self.assertIn(keep, allow)
 
-    def test_install_skips_disabled_parties(self):
+    def test_install_covers_unchecked_parties(self):
+        """沒勾選的 AI 也要裝：使用者可能在它的對話框下指令，由它轉達給被勾選的 AI"""
         with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as home:
-            config.update_parties(Path(tmp), disable=["antigravity", "codex"])
+            config.update_parties(Path(tmp), disable=["claude", "codex"])
+            ws = cli.Workspace(Path(tmp))
             with patch.object(Path, "home", return_value=Path(home)):
-                cli.cmd_install(cli.Workspace(Path(tmp)), None)
+                cli.cmd_install(ws, None)
+                self.assertEqual(cli.install_status(ws)["state"], "installed")
             self.assertTrue((Path(tmp) / ".claude" / "skills" / "agora" / "SKILL.md").exists())
-            self.assertFalse((Path(tmp) / ".agents").exists())
-            self.assertFalse((Path(tmp) / "AGENTS.md").exists())
-            self.assertFalse((Path(home) / ".gemini").exists())
+            self.assertTrue((Path(tmp) / ".agents" / "skills" / "agora" / "SKILL.md").exists())
+            self.assertIn("<!-- agora:begin -->", (Path(tmp) / "AGENTS.md").read_text(encoding="utf-8"))
+            settings = json.loads((Path(tmp) / ".claude" / "settings.local.json").read_text(encoding="utf-8"))
+            self.assertIn("claude-prompt", json.dumps(settings))
+
+    def test_install_adds_codex_hook_once_and_keeps_user_hooks(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as home:
+            path = Path(tmp) / ".codex" / "hooks.json"
+            path.parent.mkdir()
+            mine = {"hooks": [{"type": "command", "command": "echo mine"}]}
+            path.write_text(json.dumps({"hooks": {"UserPromptSubmit": [mine]}}), encoding="utf-8")
+            ws = cli.Workspace(Path(tmp))
+            with patch.object(Path, "home", return_value=Path(home)):
+                for _ in range(2):
+                    cli.cmd_install(ws, None)
+                self.assertEqual(cli.install_status(ws)["state"], "installed")
+            groups = json.loads(path.read_text(encoding="utf-8"))["hooks"]["UserPromptSubmit"]
+            self.assertEqual(groups[0], mine)
+            self.assertEqual([h["command"] for g in groups[1:] for h in g["hooks"]],
+                             [f"{cli.install_plan()['hook']} codex-prompt"])
+            self.assertIn(".codex/hooks.json", cli.PROTECTED_FILES)
 
     def test_install_substitutes_custom_agora_root(self):
         with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as custom_agora:
@@ -1436,12 +1576,12 @@ class TestLock(unittest.TestCase):
 class TestVersion(unittest.TestCase):
     def test_version_defined_and_cli_flag(self):
         from agoralib import __version__
-        self.assertEqual(__version__, "0.2.15")
+        self.assertEqual(__version__, "0.2.16")
         out = io.StringIO()
         with patch("sys.stdout", out), self.assertRaises(SystemExit) as cm:
             cli.main(["--version"])
         self.assertEqual(cm.exception.code, 0)
-        self.assertIn("0.2.15", out.getvalue())
+        self.assertIn("0.2.16", out.getvalue())
 
 
 class TestQuotaWindows(unittest.TestCase):
@@ -2063,6 +2203,75 @@ class TestBuildAndSandbox(unittest.TestCase):
                    threshold=5, agora="agora")
         text = cli.WORK_PREAMBLE.format(**fmt, build_cmd="", finish_cmds="`agora check`")
         self.assertNotIn("agora build", text)
+
+
+class TestCoreInfo(unittest.TestCase):
+    def test_core_info_bundled(self):
+        with tempfile.TemporaryDirectory() as home:
+            home_path = Path(home)
+            core_dir = home_path / ".agora" / "core"
+            core_dir.mkdir(parents=True)
+            with patch.object(Path, "home", return_value=home_path), \
+                 patch.object(cli, "AGORA_ROOT_DIR", core_dir):
+                info = cli.core_info()
+                self.assertEqual(info["kind"], "bundled")
+                self.assertEqual(info["version"], cli.__version__)
+                self.assertEqual(info["root"], core_dir.as_posix())
+                self.assertIsNone(info["build"])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ext_core = Path(tmp) / "extensions" / "richard-jheng.agora-0.2.16" / "core"
+            ext_core.mkdir(parents=True)
+            build_data = {"version": "0.2.16", "hash": "abc1234567890def"}
+            (ext_core / "BUILD.json").write_text(json.dumps(build_data), encoding="utf-8")
+            with patch.object(cli, "AGORA_ROOT_DIR", ext_core):
+                info = cli.core_info()
+                self.assertEqual(info["kind"], "bundled")
+                self.assertEqual(info["build"], "abc1234567890def")
+
+    def test_core_info_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src_dir = Path(tmp) / "agora_repo"
+            src_dir.mkdir(parents=True)
+            (src_dir / "pyproject.toml").write_text("[project]\nname='agora'\n", encoding="utf-8")
+            with patch.object(cli, "AGORA_ROOT_DIR", src_dir):
+                info = cli.core_info()
+                self.assertEqual(info["kind"], "source")
+                self.assertIsNone(info["build"])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            git_dir = Path(tmp) / "agora_git"
+            git_dir.mkdir(parents=True)
+            (git_dir / ".git").mkdir()
+            with patch.object(cli, "AGORA_ROOT_DIR", git_dir):
+                info = cli.core_info()
+                self.assertEqual(info["kind"], "source")
+
+    def test_core_info_unknown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            other_dir = Path(tmp) / "other_dir"
+            other_dir.mkdir(parents=True)
+            (other_dir / "BUILD.json").write_text(json.dumps({"hash": "dummyhash"}), encoding="utf-8")
+            with patch.object(cli, "AGORA_ROOT_DIR", other_dir):
+                info = cli.core_info()
+                self.assertEqual(info["kind"], "unknown")
+                self.assertEqual(info["build"], "dummyhash")
+
+    def test_parties_json_includes_core(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = cli.Workspace(Path(tmp))
+            out = io.StringIO()
+            with patch("sys.stdout", out):
+                cli.cmd_parties(ws, argparse.Namespace(
+                    enable=None, disable=None, model=None, effort=None, share=None,
+                    subagents=None, sandbox=None, json=True
+                ))
+            data = json.loads(out.getvalue())
+            self.assertIn("core", data)
+            self.assertEqual(data["core"]["version"], cli.__version__)
+            self.assertIn(data["core"]["kind"], ("bundled", "source", "unknown"))
+            self.assertIn("root", data["core"])
+            self.assertIn("build", data["core"])
 
 
 if __name__ == "__main__":

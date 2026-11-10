@@ -27,7 +27,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from agoralib import __version__, config, jobs, models, prune, quota, shares, snapshot
+from agoralib import __version__, config, jobs, models, prune, quota, routing, shares, snapshot
 from agoralib.parties import (AGORA_ROOT as AGORA_ROOT_DIR, AI_PARTIES, CALLERS, HUMAN, NAMES,
                               LOCKED_ENV, NESTED_ENV, CallError, Live, agora_cmd, canonical,
                               no_space_path, quote_path, AGY_SUBAGENT_TOOLS)
@@ -95,6 +95,8 @@ SUMMARY_PROMPT = """\
 （誰提出、為什麼放棄）
 ## 保留的異議
 （尚未解決的分歧與各方理由）
+## 互評發現的盲點
+（某一方原本沒想到、經其他方指出才浮現的風險或遺漏；以及各方都沒處理、仍待確認的問題）
 ## 工作單
 ### 範圍
 （要修改的檔案，用工作區相對路徑，例如 `src/app.py`；以及不能碰的檔案）
@@ -102,6 +104,7 @@ SUMMARY_PROMPT = """\
 ### 驗收條件
 （可以執行的驗證方式，例如要通過的測試）
 
+依論點與證據的品質取捨，不是依人數：少數意見的理由較充分時就採納它，並在「採納的意見」說明為什麼。
 工作單要能直接交給另一個 AI 執行；討論沒有結論、不適合分派時，「## 工作單」底下只寫「無」。
 
 以下是完整逐字稿：
@@ -300,19 +303,29 @@ def call_opts(ws: Workspace, state: dict, party: str) -> dict:
 
 # ───────────────────────── 討論 ─────────────────────────
 
-def build_prompt(ws: Workspace, state: dict, party: str) -> str:
+BLIND_NOTE = ("【獨立作答】這一輪其他 AI 也在回答同一則訊息，你看不到它們的答案、它們也看不到你的。"
+              "請完整寫出你自己的判斷，不要預設別人會補充；下一輪會互相評論。")
+
+
+def build_prompt(ws: Workspace, state: dict, party: str, upto: Optional[int] = None) -> str:
+    """party 未讀的訊息；upto 是獨立作答（send --blind）的截止點：之後的訊息（別人這一輪的答案）先不給"""
     info = state["parties"][party]
-    unseen = [m for m in state["messages"][info["seen"]:]
+    unseen = [m for m in state["messages"][info["seen"]:upto]
               if not (m["speaker"] == party and m["via_cli"])]
     parts = []
     if not info["session_id"]:
-        others = "、".join(NAMES[p] for p in thread_parties(state, ws.enabled()) if p != party)
+        # 對話框所在的 AI 沒被勾選時只主持、不在參與者名單，但也是討論對象
+        speakers = [m["speaker"] for m in state["messages"] if m["speaker"] in AI_PARTIES]
+        others = "、".join(NAMES[p] for p in dict.fromkeys(thread_parties(state, ws.enabled()) + speakers)
+                          if p != party)
         parts.append(PREAMBLE.format(me=NAMES[party], others=others, human=NAMES[HUMAN], workspace=ws.root,
                                      topic=state["topic"]))
         if unseen:
             parts.append("以下是目前為止的討論內容：")
     for m in unseen:
         parts.append(f"【{NAMES.get(m['speaker'], m['speaker'])} · {m['time']}】\n{m['text']}")
+    if upto is not None:
+        parts.append(BLIND_NOTE)
     parts.append(f"請以 {NAMES[party]} 的身分回覆。")
     return "\n\n".join(parts)
 
@@ -342,16 +355,16 @@ class CallFailed(SystemExit):
     """某一方沒有回覆（已寫進逐字稿）；send 會繼續請其他人回覆，其他指令照常結束"""
 
 
-def invoke(ws: Workspace, thread: Path, party: str) -> str:
-    """請 party 讀取未讀訊息並回覆。
+def invoke(ws: Workspace, thread: Path, party: str, upto: Optional[int] = None) -> str:
+    """請 party 讀取未讀訊息並回覆；upto 見 build_prompt（獨立作答時只讀到這一則，之後的下次再轉給它）。
     呼叫 CLI 期間不持有 thread_lock，讓同一串的接手程序照常寫入：回覆回來後重新讀取 state 再寫入，
     期間別人加進來的訊息仍算 party 未讀。
     因為用了不被允許的工具而整輪中斷時（部分 CLI 在非互動模式會這樣），提醒它改用讀檔工具，接續同一段對話重試一次。"""
     with thread_lock(thread):
         state = load_state(thread)
         info = state["parties"].setdefault(party, new_party())   # 討論串建立後才啟用的 AI 也能加入
-        prompt, session = build_prompt(ws, state, party), info["session_id"]
-        seen = len(state["messages"])
+        prompt, session = build_prompt(ws, state, party, upto), info["session_id"]
+        seen = len(state["messages"]) if upto is None else max(info["seen"], upto)
         opts = call_opts(ws, state, party)
     model = "、".join(opts[f] for f in config.FIELDS if opts.get(f))
     print(f"…等待 {NAMES[party]}{f'（{model}）' if model else ''} 回覆", file=sys.stderr, flush=True)
@@ -472,20 +485,24 @@ def cmd_send(ws: Workspace, args):
     thread = ws.resolve_thread(args.thread)
     sender = canonical(args.sender)
     text = read_message(args)
-    in_background(ws, thread, "send", ["send", thread.name, "--from", sender] + (["--to", args.to] if args.to else []),
-                  text)
+    blind = getattr(args, "blind", False)
+    in_background(ws, thread, "send", ["send", thread.name, "--from", sender] + (["--to", args.to] if args.to else [])
+                  + (["--blind"] if blind else []), text)
     with thread_lock(thread):
         state = load_state(thread)
         add_message(thread, state, sender, text)
         save_state(thread, state)
+        cutoff = len(state["messages"])
     targets = targets_for(state, sender, args.to, ws.enabled())
     if not targets:
         print("已記錄，尚未請任何一方回覆。")
         return
+    # 獨立作答：每一方只讀到這則訊息為止，看不到同一輪先回覆者的答案（避免被先發言的人帶著走）；下一則訊息時才互相看到
+    upto = cutoff if blind and len(targets) > 1 else None
     failed = []
     for party in targets:
         try:   # 某一方失敗時繼續請其他人回覆
-            reply = invoke(ws, thread, party)
+            reply = invoke(ws, thread, party, upto)
         except CallFailed as e:
             failed.append(party)
             print(e.code, file=sys.stderr, flush=True)
@@ -993,7 +1010,7 @@ def guard_config(root: Path, original: Optional[str], thread: Path, worker: str)
 # 接手方不能改的檔案：hook 與會自動執行指令的設定，改了等於繞過終端指令的白名單
 # （下一次 Agora 呼叫 AI、使用者 commit 或開啟資料夾時就會執行）。Claude 直接禁止編輯，其他 CLI 只能事後還原。
 PROTECTED_FILES = (".claude/settings.json", ".claude/settings.local.json", ".agents/hooks.json",
-                   ".codex/config.toml", ".vscode/tasks.json")
+                   ".codex/config.toml", ".codex/hooks.json", ".vscode/tasks.json")
 
 
 def git_hooks_dir(root: Path) -> Optional[Path]:
@@ -1486,6 +1503,41 @@ def cmd_quota(ws: Workspace, args):
     quota.main([f for f, on in (("--refresh", args.refresh), ("--json", args.json)) if on])
 
 
+def core_info() -> dict:
+    """回報目前執行的 Agora 核心來源資訊（供擴充套件判斷是否與更新版本相符）"""
+    root_path = Path(AGORA_ROOT_DIR)
+    posix_root = root_path.as_posix()
+    resolved = root_path.resolve()
+    home_core = (Path.home() / ".agora" / "core").resolve()
+
+    if resolved == home_core or resolved.as_posix().lower() == home_core.as_posix().lower() or (
+        ("/extensions/" in posix_root.lower() or "/extensions/" in resolved.as_posix().lower())
+        and (root_path.name == "core" or resolved.name == "core")
+    ):
+        kind = "bundled"
+    elif (root_path / ".git").exists() or (root_path / "pyproject.toml").exists():
+        kind = "source"
+    else:
+        kind = "unknown"
+
+    build_file = root_path / "BUILD.json"
+    build_hash = None
+    if build_file.is_file():
+        try:
+            data = json.loads(build_file.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                build_hash = data.get("hash")
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    return {
+        "version": __version__,
+        "root": posix_root,
+        "kind": kind,
+        "build": build_hash,
+    }
+
+
 def cmd_parties(ws: Workspace, args):
     """查看或修改此專案啟用的 AI、模型與工作分配比例"""
     split = lambda v: [canonical(p) for p in v.split(",") if p.strip()] if v else []  # noqa: E731
@@ -1508,7 +1560,7 @@ def cmd_parties(ws: Workspace, args):
     if args.json:
         print(json.dumps({"workspace": str(ws.root), "parties": settings, "work": work,
                           "share_days": shares.SHARE_DAYS, "summarizer": ws.config().get("summarizer"),
-                          "install": install_status(ws)},
+                          "install": install_status(ws), "core": core_info()},
                          ensure_ascii=False, indent=2))
         return
     total = sum(s["share"] for s in settings.values() if s["enabled"])
@@ -1596,6 +1648,17 @@ def blocked_relays(ws: Workspace) -> List[dict]:
                 out.append({"thread": thread.name, "topic": state["topic"], "worker": relay["worker"],
                             "reason": relay.get("blocked_reason"), "updated": relay.get("updated")})
     return out
+
+
+def cmd_route(ws: Workspace, args):
+    """對話框所在的 AI 該怎麼處理使用者這則訊息（依此專案勾選的 AI，見 routing.py）；
+    給 hook 沒有執行時（例如 Codex 還沒信任專案 hook）用"""
+    me, enabled = canonical(args.me), ws.enabled()
+    text = routing.instruction(me, enabled)
+    if args.json:
+        print(json.dumps({"me": me, "enabled": enabled, "instruction": text}, ensure_ascii=False))
+    else:
+        print(text)
 
 
 def cmd_activity(ws: Workspace, args):
@@ -1776,10 +1839,10 @@ def _hook_commands(path: Path, collect) -> List[str]:
 
 
 def install_status(ws: Workspace) -> dict:
-    """此工作區的安裝狀態：參與中各 AI 需要的 skills、hook、AGENTS.md 段落是否存在、是否為目前版本。
+    """此工作區的安裝狀態：三方需要的 skills、hook、AGENTS.md 段落是否存在、是否為目前版本。
+    不論是否勾選都要裝：使用者可能在沒被勾選的 AI 對話框下指令，由它轉達給被勾選的 AI（見 routing.py）。
     只有 .agora/config.json（例如在面板調整過設定）不算安裝。"""
     plan = install_plan()
-    enabled = ws.enabled()
     missing, outdated, checked = [], [], []
 
     def check(label: str, present: bool, current: bool):
@@ -1790,35 +1853,34 @@ def install_status(ws: Workspace) -> dict:
             outdated.append(label)
 
     for agent, rel in SKILL_DIRS:
-        if agent in enabled:
-            for skill in ("agora", "relay"):
-                path = ws.root / rel / skill / "SKILL.md"
-                check(f"{NAMES[agent]} skill「{skill}」", path.exists(),
-                      path.exists() and _normalized(path.read_text(encoding="utf-8"))
-                      == _normalized(render_template(plan, agent, skill, "SKILL.md")))
-    if "codex" in enabled:
-        agents_md = ws.root / "AGENTS.md"
-        text = agents_md.read_text(encoding="utf-8") if agents_md.exists() else ""
-        section = agents_section(plan)
-        check("Codex 的 AGENTS.md 段落", "<!-- agora:begin -->" in text, _normalized(section) in _normalized(text))
-    if "claude" in enabled:
-        commands = _hook_commands(ws.root / ".claude" / "settings.local.json", lambda d: [
-            h.get("command", "") for groups in (d.get("hooks") or {}).values() for g in groups for h in g.get("hooks", [])])
-        check("Claude 額度 hook", any("quota_hook.py" in c for c in commands),
-              f"{plan['hook']} claude-prompt" in commands and f"{plan['hook']} claude-tool" in commands)
-    if "antigravity" in enabled:
-        commands = _hook_commands(ws.root / ".agents" / "hooks.json", lambda d: [
-            h.get("command", "") for h in ((d.get("agora-quota") or {}).get("PreInvocation") or [])])
-        check("Antigravity 額度 hook", bool(commands), f"{plan['agy_hook']} agy-pre" in commands)
-        matchers = _hook_commands(ws.root / ".agents" / "hooks.json", lambda d: [
-            (g.get("matcher"), h.get("command", "")) for g in ((d.get("agora-subagents") or {}).get("PreToolUse") or [])
-            for h in g.get("hooks", [])])
-        check("Antigravity 子代理開關 hook", bool(matchers),
-              sorted(matchers) == sorted((t, f"{plan['agy_hook']} agy-tool") for t in AGY_SUBAGENT_TOOLS))
-        if commands:   # 指令權限是全域設定，不能用來判斷這個專案有沒有裝；裝過才比對是否缺了新的指令
-            allow = _hook_commands(Path.home() / ".gemini" / "antigravity-cli" / "settings.json",
-                                   lambda d: (d.get("permissions") or {}).get("allow") or [])
-            check("Antigravity 指令權限", True, all(f"command({plan['cmd']} {sub})" in allow for sub in AGENT_COMMANDS))
+        for skill in ("agora", "relay"):
+            path = ws.root / rel / skill / "SKILL.md"
+            check(f"{NAMES[agent]} skill「{skill}」", path.exists(),
+                  path.exists() and _normalized(path.read_text(encoding="utf-8"))
+                  == _normalized(render_template(plan, agent, skill, "SKILL.md")))
+    agents_md = ws.root / "AGENTS.md"
+    text = agents_md.read_text(encoding="utf-8") if agents_md.exists() else ""
+    section = agents_section(plan)
+    check("Codex 的 AGENTS.md 段落", "<!-- agora:begin -->" in text, _normalized(section) in _normalized(text))
+    commands = _hook_commands(ws.root / ".codex" / "hooks.json", lambda d: [
+        h.get("command", "") for g in ((d.get("hooks") or {}).get("UserPromptSubmit") or []) for h in g.get("hooks", [])])
+    check("Codex hook", any("quota_hook.py" in c for c in commands), f"{plan['hook']} codex-prompt" in commands)
+    commands = _hook_commands(ws.root / ".claude" / "settings.local.json", lambda d: [
+        h.get("command", "") for groups in (d.get("hooks") or {}).values() for g in groups for h in g.get("hooks", [])])
+    check("Claude 額度 hook", any("quota_hook.py" in c for c in commands),
+          f"{plan['hook']} claude-prompt" in commands and f"{plan['hook']} claude-tool" in commands)
+    commands = _hook_commands(ws.root / ".agents" / "hooks.json", lambda d: [
+        h.get("command", "") for h in ((d.get("agora-quota") or {}).get("PreInvocation") or [])])
+    check("Antigravity 額度 hook", bool(commands), f"{plan['agy_hook']} agy-pre" in commands)
+    matchers = _hook_commands(ws.root / ".agents" / "hooks.json", lambda d: [
+        (g.get("matcher"), h.get("command", "")) for g in ((d.get("agora-subagents") or {}).get("PreToolUse") or [])
+        for h in g.get("hooks", [])])
+    check("Antigravity 子代理開關 hook", bool(matchers),
+          sorted(matchers) == sorted((t, f"{plan['agy_hook']} agy-tool") for t in AGY_SUBAGENT_TOOLS))
+    if commands:   # 指令權限是全域設定，不能用來判斷這個專案有沒有裝；裝過才比對是否缺了新的指令
+        allow = _hook_commands(Path.home() / ".gemini" / "antigravity-cli" / "settings.json",
+                               lambda d: (d.get("permissions") or {}).get("allow") or [])
+        check("Antigravity 指令權限", True, all(f"command({plan['cmd']} {sub})" in allow for sub in AGENT_COMMANDS))
     present = len(checked) - len(missing)
     state = ("installed" if not missing and not outdated else "outdated" if not missing
              else "partial" if present else "missing")
@@ -1852,11 +1914,8 @@ def cmd_install(ws: Workspace, args):
         changed.append(config_file)
         config.save(ws.root, {"parties": {p: {"enabled": True} for p in AI_PARTIES}})
         done.append(f"預設設定 → {config_file}（用 agora parties 或 VSCode 擴充套件選擇參與的 AI）")
-    enabled = ws.enabled()
-
+    # 三方都裝，不論是否勾選：使用者可能在沒被勾選的 AI 對話框下指令，由它轉達給被勾選的 AI（見 routing.py）
     for agent, rel in SKILL_DIRS:
-        if agent not in enabled:
-            continue
         dest = ws.root / rel
         for skill in ("agora", "relay"):
             path = dest / skill / "SKILL.md"
@@ -1865,17 +1924,27 @@ def cmd_install(ws: Workspace, args):
         done.append(f"{agent} skills → {dest}")
 
     # Codex（以及同樣會讀 AGENTS.md 的 Antigravity）：以標記區段寫入，重裝時整段替換
-    created_agents_md = created_hooks = False
-    if "codex" in enabled:
-        agents_md = ws.root / "AGENTS.md"
-        created_agents_md = not agents_md.exists()
-        section = agents_section(plan)
-        text = agents_md.read_text(encoding="utf-8") if agents_md.exists() else ""
-        text = re.sub(r"<!-- agora:begin -->.*?<!-- agora:end -->", lambda _: section, text, flags=re.S) \
-            if "<!-- agora:begin -->" in text else (text.rstrip() + "\n\n" + section if text.strip() else section)
-        if write_if_changed(agents_md, text.rstrip() + "\n"):
-            changed.append(agents_md)
-        done.append(f"Codex 說明 → {agents_md}")
+    agents_md = ws.root / "AGENTS.md"
+    created_agents_md = not agents_md.exists()
+    section = agents_section(plan)
+    text = agents_md.read_text(encoding="utf-8") if agents_md.exists() else ""
+    text = re.sub(r"<!-- agora:begin -->.*?<!-- agora:end -->", lambda _: section, text, flags=re.S) \
+        if "<!-- agora:begin -->" in text else (text.rstrip() + "\n\n" + section if text.strip() else section)
+    if write_if_changed(agents_md, text.rstrip() + "\n"):
+        changed.append(agents_md)
+    done.append(f"Codex 說明 → {agents_md}")
+
+    # Codex 的專案 hook（額度與依勾選分工）：Codex 要先信任這個 hook 才會執行；沒執行時 AGENTS.md 要它改用 agora route
+    def codex_hooks(data):
+        hooks = data.setdefault("hooks", {})
+        groups = [g for g in hooks.get("UserPromptSubmit", []) if "quota_hook.py" not in json.dumps(g)]
+        hooks["UserPromptSubmit"] = groups + [
+            {"hooks": [{"type": "command", "command": f"{hook} codex-prompt", "timeout": 15}]}]
+    codex_hooks_file = ws.root / ".codex" / "hooks.json"
+    created_codex_hooks = not codex_hooks_file.exists()
+    if _merge_json(codex_hooks_file, codex_hooks):
+        changed.append(codex_hooks_file)
+    done.append("Codex hook（額度、依勾選分工）→ .codex/hooks.json（第一次要在 Codex 裡信任這個 hook）")
 
     def claude_hooks(data):
         hooks = data.setdefault("hooks", {})
@@ -1885,10 +1954,9 @@ def cmd_install(ws: Workspace, args):
             if matcher:
                 group["matcher"] = matcher
             hooks[event] = groups + [group]
-    if "claude" in enabled:
-        if _merge_json(ws.root / ".claude" / "settings.local.json", claude_hooks):
-            changed.append(ws.root / ".claude" / "settings.local.json")
-        done.append("Claude hooks → .claude/settings.local.json（個人設定，不進 git）")
+    if _merge_json(ws.root / ".claude" / "settings.local.json", claude_hooks):
+        changed.append(ws.root / ".claude" / "settings.local.json")
+    done.append("Claude hooks → .claude/settings.local.json（個人設定，不進 git）")
 
     def agy_hooks(data):
         agy_hook = plan["agy_hook"]
@@ -1910,24 +1978,20 @@ def cmd_install(ws: Workspace, args):
                      f"read_file({AGORA_ROOT_DIR})", f"read_file({AGORA_ROOT_DIR.as_posix()})"):
             if rule not in allow:
                 allow.append(rule)
-    if "antigravity" in enabled:
-        created_hooks = not (ws.root / ".agents" / "hooks.json").exists()
-        if _merge_json(ws.root / ".agents" / "hooks.json", agy_hooks):
-            changed.append(ws.root / ".agents" / "hooks.json")
-        done.append("Antigravity hook（額度、子代理開關）→ .agents/hooks.json")
-        if _merge_json(Path.home() / ".gemini" / "antigravity-cli" / "settings.json", agy_permissions):
-            changed.append(Path.home() / ".gemini" / "antigravity-cli" / "settings.json")
-        done.append("Antigravity 權限 → ~/.gemini/antigravity-cli/settings.json")
+    created_hooks = not (ws.root / ".agents" / "hooks.json").exists()
+    if _merge_json(ws.root / ".agents" / "hooks.json", agy_hooks):
+        changed.append(ws.root / ".agents" / "hooks.json")
+    done.append("Antigravity hook（額度、子代理開關、依勾選分工）→ .agents/hooks.json")
+    if _merge_json(Path.home() / ".gemini" / "antigravity-cli" / "settings.json", agy_permissions):
+        changed.append(Path.home() / ".gemini" / "antigravity-cli" / "settings.json")
+    done.append("Antigravity 權限 → ~/.gemini/antigravity-cli/settings.json")
 
     # Agora 建立的檔案寫進 .git/info/exclude（不改會被 commit 的 .gitignore）；
-    # AGENTS.md、.agents/hooks.json 可能是使用者自己的檔案，只有這次由 install 建立時才排除
-    owned = [".agora/"]
-    if "claude" in enabled:
-        owned += [".claude/skills/agora/", ".claude/skills/relay/", ".claude/settings.local.json"]
-    if "antigravity" in enabled:
-        owned += [".agents/skills/agora/", ".agents/skills/relay/"] + ([".agents/hooks.json"] if created_hooks else [])
-    if "codex" in enabled and created_agents_md:
-        owned.append("AGENTS.md")
+    # AGENTS.md、.agents/hooks.json、.codex/hooks.json 可能是使用者自己的檔案，只有這次由 install 建立時才排除
+    owned = [".agora/", ".claude/skills/agora/", ".claude/skills/relay/", ".claude/settings.local.json",
+             ".agents/skills/agora/", ".agents/skills/relay/"]
+    owned += [f for f, created in ((".agents/hooks.json", created_hooks), (".codex/hooks.json", created_codex_hooks),
+                                   ("AGENTS.md", created_agents_md)) if created]
     excluded, tracked = git_exclude(ws.root, owned)
     if excluded is None:
         done.append("不是 git repo，沒有設定 git 排除")
@@ -1938,7 +2002,8 @@ def cmd_install(ws: Workspace, args):
     # 第一行說明這次改了哪些檔案（VSCode 面板的通知只顯示第一行）
     print(f"Agora {__version__} 更新了 {len(shown)} 個檔案：{'、'.join(shown)}" if shown
           else f"Agora {__version__}：此專案的 Agora 檔案都是最新，沒有改動任何檔案。")
-    print(f"已將 Agora 安裝到 {ws.root}（參與的 AI：{'、'.join(NAMES[p] for p in enabled)}）：")
+    print(f"已將 Agora 安裝到 {ws.root}（目前勾選：{'、'.join(NAMES[p] for p in ws.enabled())}；"
+          f"三方都裝，在沒勾選的 AI 對話框下指令時由它轉達）：")
     for d in done:
         print(f"  • {d}")
     if tracked:
@@ -1946,8 +2011,8 @@ def cmd_install(ws: Workspace, args):
               "git rm -r --cached <路徑>（只取消追蹤，檔案留在磁碟）：")
         for t in tracked:
             print(f"    {t}")
-    if "claude" in enabled:
-        print("Claude Code 需重新載入視窗（或開啟 /hooks）才會套用新的 hook。")
+    print("Claude Code 需重新載入視窗（或開啟 /hooks）才會套用新的 hook。")
+    print("Codex 第一次要在 Codex 裡信任 .codex/hooks.json 的 hook；信任前 Codex 會依 AGENTS.md 改用 agora route 取得分工方式。")
     for line in check_advice(ws):
         print(line)
 
@@ -2107,6 +2172,8 @@ def main(argv=None):
     p.add_argument("thread")
     p.add_argument("--from", dest="sender", required=True, choices=who)
     p.add_argument("--to", help="claude / antigravity / codex / all / none")
+    p.add_argument("--blind", action="store_true",
+                   help="獨立作答：各方看不到同一輪其他人的答案（下一則訊息時才互相看到，適合接著互評）")
     add_message_args(p)
     p.set_defaults(func=cmd_send)
 
@@ -2195,6 +2262,11 @@ def main(argv=None):
     p = sub.add_parser("stop", help="停止背景進行中的討論")
     p.add_argument("thread")
     p.set_defaults(func=cmd_stop)
+
+    p = sub.add_parser("route", help="依勾選分工：對話框所在的 AI 該怎麼處理使用者的訊息")
+    p.add_argument("--me", required=True, choices=AI_PARTIES, help="對話框所在的 AI")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_route)
 
     p = sub.add_parser("activity", help="列出進行中的討論與分派")
     p.add_argument("--json", action="store_true")

@@ -41,12 +41,29 @@ cd <專案資料夾> && agora install    # 安裝 skills、hook、權限與 git 
 
 - 只有執行 install 時才會改寫工作區的檔案：終端機的 `agora install`、VSCode 面板的「安裝到此專案／更新」按鈕（Agora 升級後安裝狀態變成「舊版」，面板就會顯示「更新」），以及建立討論串時「此專案尚未安裝 Agora，要先安裝嗎？」選「安裝」。
   擴充套件啟動時同步 `~/.agora/core`、額度 hook、討論與分派都不會改寫工作區的檔案；被 Agora 呼叫的 AI（接手方）不能執行 install。
-- 只改 Agora 管理的部分：skills（`.claude/skills/agora|relay`、`.agents/skills/agora|relay`）、`AGENTS.md` 的 `<!-- agora:begin -->` 區段、`.claude/settings.local.json` 與 `.agents/hooks.json` 裡 Agora 的 hook，以及全域的 `~/.gemini/antigravity-cli/settings.json` 權限。
+- 只改 Agora 管理的部分：skills（`.claude/skills/agora|relay`、`.agents/skills/agora|relay`）、`AGENTS.md` 的 `<!-- agora:begin -->` 區段、`.claude/settings.local.json`、`.agents/hooks.json` 與 `.codex/hooks.json` 裡 Agora 的 hook，以及全域的 `~/.gemini/antigravity-cli/settings.json` 權限。
+- 三方的 skills 與 hook 都會裝，不論是否勾選：使用者可能在沒勾選的 AI 對話框下指令，由它轉達給被勾選的 AI（見[依勾選分工](#依勾選分工)）。
 - 內容沒有實質變化（只差換行字元或行尾空白）時不寫入；寫入時沿用檔案原本的換行字元，不會只因換行而產生 git 改動。
 - install 輸出的第一行列出這次實際改寫的檔案（VSCode 的通知顯示的也是這一行），同時記進 `.agora/install.log`（時間、Agora 版本與位置、改了哪些檔案）。
 - 額度 hook 記的是**執行 install 的那份 Agora** 的路徑（擴充套件內建的 `~/.agora/core`，或 `pip install -e` 的資料夾）。從不同地方執行 install 會改寫 hook 路徑，建議固定用同一種方式。
 - 接手期間若有人執行 install，被改寫的 hook 在越界檢查中標成「Agora 自動更新」並保留，`changes` 也會標示，不算接手方的改動；接手方自己改的照樣還原。
   辨認依據是 install 記在 `~/.agora/install_writes.jsonl` 的內容雜湊，接手方寫不到這個位置。
+
+### 一鍵更新
+
+VSCode 面板提供「更新 Agora」按鈕，可一次完成擴充套件與工作區檔案的升級：
+
+- **更新流程**：
+  1. **查 Release**：向 GitHub Releases 查詢是否有比目前擴充套件更新的版本（含 `.vsix`）。
+  2. **下載安裝**：下載新版 `.vsix` 並由 VSCode 安裝。
+  3. **自動重新載入**：重新載入 VSCode 視窗使新版擴充套件生效。
+  4. **同步 `~/.agora/core`**：擴充套件啟動時將內建的最新核心同步至固定位置 `~/.agora/core`。
+  5. **補齊此專案的 Agora 檔案**：自動執行 `agora install`，更新工作區內的 skills、hook 與權限。
+  6. **驗收**：以 `agora install --status` 驗收，確認所有項目皆為最新版才清除待辦。
+- **重新下載修復**：面板的「重新下載修復」按鈕（或指令面板的「Agora: 重新下載修復」），即使遠端版本與目前相同也會重新下載安裝並補齊專案檔案，方便修復損毀的核心或檔案。
+- **進行中的討論或分派**：若工作區有進行中的背景討論或分派，更新前會先詢問是要「等它們結束後再更新」還是「現在更新」，避免在中途置換正在執行的核心檔案。
+- **核心來源不是更新版本時**：若實際執行的核心不是這次更新的版本（例如 PATH 上有 `pip install -e` 的開發中原始碼核心），補齊檔案前會提示改用內建核心或繼續使用目前核心，由使用者決定是否切換設定。
+- **遠端沒有新版時**：若 GitHub 上沒有比目前更新的 Release，不會重複下載，直接跳至補齊此專案的 Agora 檔案並完成驗收。
 
 ## 指令
 
@@ -62,6 +79,7 @@ $A models [--refresh]                               # 各 AI 可選的模型與�
 $A new "主題" [--parties claude,codex] [--model codex=gpt-5] [--effort codex=high]
 $A send <id> --from claude --message "..."          # 預設依序請其他所有 AI 回覆
 $A send <id> --from claude --to codex --file msg.md # 只請 Codex
+$A send <id> --from claude --blind --file q.md      # 獨立作答：各方看不到同一輪其他人的答案（下一則訊息才互相看到）
 $A send <id> --from human --message "..."           # 使用者插話（只記錄，下次轉給 AI）
 $A reply <id> --party antigravity                   # 不發言，直接請某方回覆
 $A auto <id> --rounds 6 [--order codex,claude]      # AI 依序自動發言（各方都表示【已達成共識】時提前結束）
@@ -76,6 +94,7 @@ $A build                                            # 專案建置（.agora/conf
 $A quota [--refresh] [--json]                       # 三方剩餘額度
 $A quota --unblock codex                            # 清除「無法使用」標記（帳務或權限問題處理好之後）
 $A activity                                         # 所有進行中的討論與分派（誰正在回覆）
+$A route --me claude [--json]                       # 依勾選分工：對話框所在的 AI 該怎麼處理使用者的訊息
 $A wait <id>                                        # 接上背景進行中的討論，顯示回覆直到結束
 $A stop <id>                                        # 停止進行中的討論
 $A list / show <id> --last 3
@@ -109,7 +128,8 @@ $A keep <id> [--off]                                # 標記保留，prune 不�
 
 ## 總結與依總結分派
 
-- `summarize` 請指定的一方開**新的對話**、讀**完整逐字稿**（不只未讀訊息），依固定格式輸出：共識、採納與放棄的意見、保留的異議、`## 工作單`（範圍、步驟、驗收條件）。
+- `summarize` 請指定的一方開**新的對話**、讀**完整逐字稿**（不只未讀訊息），依固定格式輸出：共識、採納與放棄的意見、保留的異議、互評發現的盲點、`## 工作單`（範圍、步驟、驗收條件）。
+  取捨依論點與證據的品質，不是依人數：少數意見理由較充分時會被採納並說明原因。
   結果存成討論串的 `summary.md`，也記進逐字稿。總結方由使用者指定；它額度不足時會提示改用誰，不自動換人。
 - `assign --from-summary` 只取 `## 工作單` 段落當工作單；找不到或是空的就拒絕分派。
 - 總結時記下訊息數與工作單提到的檔案雜湊；之後又有新訊息或檔案變了，會提示總結可能已過期，要加 `--yes` 才分派。這只用來偵測變動，不代表誰改了什麼。
@@ -122,8 +142,33 @@ $A keep <id> [--off]                                # 標記保留，prune 不�
 - 設定改了，既有討論串下一次呼叫就生效：取消勾選的 AI 不再被請求回覆；之後才勾選的 AI 在下一次輪到時加入（`auto` 進行中也會在下一輪加入），第一次發言前會收到說明與完整討論內容。
   用 `new --parties` 指定參與者的討論串固定為那幾個，不自動加入；已在背景進行的分派工作不會換接手方。
 - 模型優先順序：討論串建立時的 `--model` / `--effort` ＞ 專案設定 ＞ CLI 預設。
-- `install` 只安裝參與中 AI 的 skills、hook 與權限。`agora install --status` 檢查此專案缺少或過期的項目（只有 `.agora/config.json` 不算安裝；在面板調整設定就會建立它）。
-- 在 git 專案裡，`install` 會把 Agora 建立的資料夾與檔案（`.agora/`、skills、`.claude/settings.local.json`，以及由它新建的 `AGENTS.md`、`.agents/hooks.json`）寫進 `.git/info/exclude` 的 Agora 區段，不改 `.gitignore`，避免被 commit。已被 git 追蹤的檔案排除無效，install 會列出來，可用 `git rm -r --cached <路徑>` 取消追蹤。
+- `install` 不論勾選與否都安裝三方的 skills、hook 與權限。`agora install --status` 檢查此專案缺少或過期的項目（只有 `.agora/config.json` 不算安裝；在面板調整設定就會建立它）。
+- 在 git 專案裡，`install` 會把 Agora 建立的資料夾與檔案（`.agora/`、skills、`.claude/settings.local.json`，以及由它新建的 `AGENTS.md`、`.agents/hooks.json`、`.codex/hooks.json`）寫進 `.git/info/exclude` 的 Agora 區段，不改 `.gitignore`，避免被 commit。已被 git 追蹤的檔案排除無效，install 會列出來，可用 `git rm -r --cached <路徑>` 取消追蹤。
+
+### 依勾選分工
+
+勾選的 AI 就是處理使用者訊息的 AI，使用者不需要在對話框說「跟其他 AI 討論」之類的提示詞。
+每則使用者訊息由 hook 附上「【Agora 勾選】」指示（Claude 的 UserPromptSubmit、Antigravity 的 PreInvocation、Codex 的 UserPromptSubmit），
+對話框所在的 AI 依指示與 agora skill（Codex 是 `AGENTS.md` 的 Agora 區段）處理：
+
+| 勾選 | 對話框所在的 AI 怎麼做 |
+|---|---|
+| 只有自己 | 直接自己處理，不用 Agora |
+| 只有另一個 AI | 只轉達：要改檔的工作用 `assign` 交給它，問題用 `send --to` 問它；完成後審查並呈現結果，不自己做 |
+| 兩個以上，包含自己 | 透過 Agora 一起討論並完成（決策題用中立開場、`send --blind` 獨立作答，再互評） |
+| 兩個以上，不含自己 | 只當主持人：中立開場、`send --blind`、互評、`auto` 讓它們討論，`summarize` 後 `assign --from-summary` 給它們；不提意見、不改程式碼 |
+
+- 例外：使用者在訊息中明確指定由誰處理時照指定；延續進行中的討論串或分派（回覆、確認、查看結果、停止）時沿用該討論串。
+- 被 Agora 呼叫的回覆（`AGORA_INVOKED=1`）與斜線指令（例如 `/code-review`）不附指示；不是 Agora 專案（找不到 `.agora/`）時也不附。
+- Codex 的專案 hook（`.codex/hooks.json`）要先在 Codex 裡信任才會執行；信任前 `AGENTS.md` 要求它先執行 `agora route --me codex` 取得指示。
+- 勾選存在 `.agora/config.json`，也就是每個 VSCode 視窗（工作區）各自的設定。
+
+### 獨立作答與互評
+
+`send --blind` 讓每一方只讀到這則訊息為止：同一輪先回覆者的答案不會轉給後回覆的人，避免被先發言的人帶著走（或被開場的立場錨定）；
+它們的 `seen` 停在這則訊息，所以下一則訊息（通常是互評）時會一次看到其他人的答案。只請一方回覆時沒有作用。
+skills 建議的流程：決策、設計、取捨類問題用中立開場（不寫自己的立場）→ `--blind` 各自作答 → 互評（最強的方案、最大的盲點、大家都漏了什麼）→ 討論 → `summarize`。
+查 bug、驗證事實類問題照舊：開場附上查證結果與立場，一般 `send`。VSCode 的「發言」也可以選「所有 AI 各自獨立作答」。
 
 ### 內建子代理
 
@@ -196,7 +241,7 @@ $A keep <id> [--off]                                # 標記保留，prune 不�
 
 - 分派時用暫時的 git index 替工作區拍快照，存在 `refs/agora/<討論串>`（不動使用者的 index 與工作區；被忽略的檔案與 `.env`、金鑰不進快照），`changes` 與 VSCode 的「檢視分派期間的變更」以它為基準；清理討論串時一併刪除。期間任何人的修改都會列出。
 - 接手方的書面界線：只改工作單範圍、不 commit/push、不碰 `.env`、不做影響外部系統的動作；每輪前後比對 `git status` 並記在逐字稿。
-- hook 與會自動執行指令的設定（`.claude/settings*.json`、`.agents/hooks.json`、`.codex/config.toml`、`.vscode/tasks.json`、git hooks）改了等於繞過指令白名單：Claude 接手時直接禁止編輯 `.claude/`、`.agents/`、`.codex/`、`.git/` 與 `.vscode/tasks.json`；每輪結束時這些檔案被新增、修改或刪除都會還原，並記在逐字稿。
+- hook 與會自動執行指令的設定（`.claude/settings*.json`、`.agents/hooks.json`、`.codex/config.toml`、`.codex/hooks.json`、`.vscode/tasks.json`、git hooks）改了等於繞過指令白名單：Claude 接手時直接禁止編輯 `.claude/`、`.agents/`、`.codex/`、`.git/` 與 `.vscode/tasks.json`；每輪結束時這些檔案被新增、修改或刪除都會還原，並記在逐字稿。
 - `.agora/config.json` 的 `build`、`check`、`add_dirs` 與沙箱設定決定接手方能執行的指令與能寫的範圍：接手方執行的 `agora build`／`check` 用該輪開始時的指令（以環境變數 `AGORA_LOCKED_COMMANDS` 帶入），中途改設定檔也不會被執行；被改動的設定在該輪結束時還原，並記在逐字稿。
 - 被 Agora 呼叫的 CLI 帶 `AGORA_INVOKED=1`，無法再呼叫 Agora，避免互相無限呼叫。
 - Antigravity 的指令權限是**完整比對**，所以接手方只被允許執行固定、不帶參數的指令：`agora.py quota`、`agora.py check`、`agora.py build`、`git status/diff/log`。權限是全域設定，升級後新增的指令要重新 `install` 才會加入（安裝狀態會顯示為需要更新）。
@@ -279,7 +324,8 @@ agoralib/jobs.py       背景執行（關閉視窗不中斷）、進度轉送
 agoralib/models.py     各 AI 可選的模型
 agoralib/parties.py    三方 CLI 呼叫
 agoralib/quota.py      三方額度
-agoralib/quota_hook.py 額度提醒 hook
+agoralib/quota_hook.py 額度提醒與依勾選分工的 hook
+agoralib/routing.py    依勾選分工：對話框所在的 AI 該怎麼處理使用者的訊息
 agoralib/statusline.py Claude Code status line（選用）
 skills/                各 AI 的使用說明（claude、antigravity 的 skill；codex 的 AGENTS.md 片段）
 vscode/                VSCode 擴充套件（側邊欄：AI 與模型、討論串；狀態列額度）

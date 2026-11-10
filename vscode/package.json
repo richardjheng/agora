@@ -2,7 +2,7 @@
   "name": "agora",
   "displayName": "Agora",
   "description": "讓 Claude Code、Antigravity、Codex 在同一個專案裡討論與分工：選擇參與的 AI 與模型、管理討論串、查看額度。",
-  "version": "0.2.15",
+  "version": "0.2.16",
   "publisher": "richard-jheng",
   "license": "UNLICENSED",
   "private": true,
@@ -155,6 +155,16 @@
       {
         "command": "agora.checkUpdate",
         "title": "檢查擴充套件更新",
+        "category": "Agora"
+      },
+      {
+        "command": "agora.update",
+        "title": "一鍵更新（下載新版並補齊此專案的檔案）",
+        "category": "Agora"
+      },
+      {
+        "command": "agora.repair",
+        "title": "重新下載修復（同版也重新安裝並補齊此專案的檔案）",
         "category": "Agora"
       }
     ],

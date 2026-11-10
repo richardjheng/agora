@@ -182,14 +182,25 @@
       cat.error ? el("div", { class: "error" }, `⚠ ${cat.error}`) : null);
   }
 
-  // 版本：Agora 核心（agora --version）與擴充套件；核心以 pip install -e 安裝時會隨程式更新，擴充套件要重新打包安裝
+  // 版本：Agora 核心（agora --version）與擴充套件；核心以 pip install -e 安裝時會隨程式更新，擴充套件要重新打包安裝。
+  // 「更新 Agora」：有新版 Release 就下載安裝、重新載入，再補齊此專案的檔案；「重新下載修復」同版也重新安裝
   function versionLine(v) {
     const ext = `擴充套件 v${v.extension}`;
     if (!state.workspace || !state.agoraFound) return el("p", { class: "muted small version" }, ext);
     if (!v.core) return el("p", { class: "muted small version" }, `Agora 核心版本：查詢中… · ${ext}`);
-    const text = v.core === v.extension ? `Agora v${v.core}` : `Agora 核心 v${v.core} · ${ext}`;
-    return el("p", { class: `muted small version${v.core === v.extension ? "" : " mismatch"}` }, text,
-      v.core === v.extension ? null : el("span", { class: "hint" }, "（版本不一致，請重新打包並安裝擴充套件）"));
+    const same = v.core === v.extension;
+    const text = same ? `Agora v${v.core}` : `Agora 核心 v${v.core} · ${ext}`;
+    const src = v.source;
+    const hint = same ? null : src && src.kind === "source"
+      ? `（核心來自原始碼 ${src.root}；按「更新 Agora」可選擇改用內建核心）`
+      : "（版本不一致，按「更新 Agora」）";
+    return el("div", { class: "version-row" },
+      el("p", { class: `muted small version${same ? "" : " mismatch"}` }, text, hint ? el("span", { class: "hint" }, hint) : null),
+      el("div", { class: "actions version-actions" },
+        el("button", { class: "secondary", title: "查 GitHub Releases：有新版就下載安裝並重新載入，再補齊此專案的 Agora 檔案；沒有新版時只補齊",
+          onclick: () => vscode.postMessage({ type: "update" }) }, "更新 Agora"),
+        el("button", { class: "secondary", title: "同版也重新下載安裝，再補齊此專案的 Agora 檔案（檔案遺失或損壞時用）",
+          onclick: () => vscode.postMessage({ type: "update", repair: true }) }, "重新下載修復")));
   }
 
   const SUBAGENT_HINTS = {
@@ -213,11 +224,11 @@
         const text = {
           outdated: `此專案的 Agora 項目是舊版（${install.outdated.join("、")}），更新後 AI 才會使用目前版本的指令。`,
           partial: `此專案的 Agora 只裝了一部分（缺少：${install.missing.join("、")}），AI 可能不知道可以透過 Agora 找其他 AI。`,
-          missing: "此專案尚未安裝 Agora：AI 不知道可以透過 Agora 找其他 AI 討論，也沒有額度提醒。先選好參與的 AI，再安裝（只會安裝所選 AI 的 skills、hook 與權限）。",
+          missing: "此專案尚未安裝 Agora：AI 不知道可以透過 Agora 找其他 AI 討論，也沒有額度提醒。安裝時三方的 skills、hook 與權限都會裝（在沒勾選的 AI 對話框下指令時，由它轉達給勾選的 AI）。",
         }[install.state];
         children.push(el("div", { class: "notice" }, text,
-          el("button", { onclick: () => vscode.postMessage({ type: "install" }) },
-            install.state === "outdated" ? "更新" : "安裝到此專案")));
+          el("button", { onclick: () => vscode.postMessage({ type: install.state === "missing" ? "install" : "update" }) },
+            install.state === "missing" ? "安裝到此專案" : "更新")));
       }
       if (state.errors.parties) children.push(el("div", { class: "error" }, state.errors.parties));
       if (state.parties) {

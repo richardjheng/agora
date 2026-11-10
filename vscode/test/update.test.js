@@ -82,12 +82,68 @@ test("下載 .vsix 到指定資料夾，失敗時不留下不完整的檔案", a
   try {
     const info = { name: "agora-0.2.15.vsix", url: "https://a.test/agora.vsix" };
     const file = await download(info, tmp, { get: fakeGet({ [info.url]: { body: "PK-vsix" } }) });
-    assert.strictEqual(file, path.join(tmp, "agora-0.2.15.vsix"));
+    assert.strictEqual(path.dirname(file), tmp);
+    assert.match(path.basename(file), /^agora-0\.2\.15-[0-9a-f-]+\.vsix$/);
     assert.strictEqual(fs.readFileSync(file, "utf8"), "PK-vsix");
 
     await assert.rejects(download({ ...info, name: "agora-0.2.16.vsix" }, tmp, { get: fakeGet({}) }), /HTTP 404/);
-    assert.deepStrictEqual(fs.readdirSync(tmp).sort(), ["agora-0.2.15.vsix"]);
+    assert.deepStrictEqual(fs.readdirSync(tmp), [path.basename(file)]);
   } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("多視窗同時下載同版使用唯一檔名，保留各自內容與既有檔案", async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "agora-update-"));
+  try {
+    const info = { name: "agora-0.2.15.vsix", url: "https://a.test/agora.vsix" };
+    fs.writeFileSync(path.join(tmp, info.name), "existing");
+    const files = await Promise.all(["first", "second"].map((body) =>
+      download(info, tmp, { get: fakeGet({ [info.url]: { body } }) })));
+    assert.notStrictEqual(files[0], files[1]);
+    assert.deepStrictEqual(files.map((file) => fs.readFileSync(file, "utf8")), ["first", "second"]);
+    assert.strictEqual(fs.readFileSync(path.join(tmp, info.name), "utf8"), "existing");
+    assert.ok(fs.readdirSync(tmp).every((name) => name.endsWith(".vsix")));
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("串流中斷會關閉輸出並移除 .part，不影響另一個下載", async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "agora-update-"));
+  try {
+    const info = { name: "agora.vsix", url: "https://a.test/agora.vsix" };
+    const brokenGet = (url, opts, cb) => {
+      const res = new PassThrough();
+      res.statusCode = 200;
+      res.headers = {};
+      process.nextTick(() => {
+        cb(res);
+        res.write("partial");
+        setImmediate(() => res.destroy(new Error("connection lost")));
+      });
+      return new PassThrough();
+    };
+    const [file] = await Promise.all([
+      download(info, tmp, { get: fakeGet({ [info.url]: { body: "complete" } }) }),
+      assert.rejects(download(info, tmp, { get: brokenGet }), /connection lost/),
+    ]);
+    assert.deepStrictEqual(fs.readdirSync(tmp), [path.basename(file)]);
+    assert.strictEqual(fs.readFileSync(file, "utf8"), "complete");
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("下載完成但改名失敗也清除殘檔", async (t) => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "agora-update-"));
+  try {
+    t.mock.method(fs, "renameSync", () => { throw new Error("rename failed"); });
+    const info = { name: "agora.vsix", url: "https://a.test/agora.vsix" };
+    await assert.rejects(download(info, tmp, { get: fakeGet({ [info.url]: { body: "complete" } }) }), /rename failed/);
+    assert.deepStrictEqual(fs.readdirSync(tmp), []);
+  } finally {
+    t.mock.restoreAll();
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });

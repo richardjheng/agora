@@ -200,3 +200,8 @@ input.share {
 .version.mismatch {
   color: var(--vscode-editorWarning-foreground);
 }
+
+.version-actions {
+  justify-content: flex-end;
+  margin-top: 4px;
+}

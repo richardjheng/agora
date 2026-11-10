@@ -6,9 +6,10 @@ const cp = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const editorCtx = require("./context");
-const { syncCore } = require("./core");
+const { syncCore, readBuild } = require("./core");
 const { findPython, missingPythonMessage } = require("./python");
 const updates = require("./update");
+const { coreMatches } = require("./versions");
 
 const PARTIES = ["claude", "antigravity", "codex"];
 const EXTENSION_VERSION = require("./package.json").version;
@@ -469,6 +470,7 @@ class Model {
     this.shareDays = data.share_days || 7;
     this.summarizer = data.summarizer || null;
     this.install = data.install || null;
+    this.core = data.core || null;   // 實際執行的核心：{version, root, kind, build}（舊版核心沒有）
   }
 
   async loadVersion() {
@@ -522,7 +524,7 @@ class Model {
       catalog: this.catalog,
       quota: this.quota,
       errors: this.errors,
-      versions: { extension: EXTENSION_VERSION, core: this.coreVersion },
+      versions: { extension: EXTENSION_VERSION, core: this.coreVersion, source: this.core },
       names: NAMES,
       order: PARTIES,
     };
@@ -639,6 +641,9 @@ class PartiesView {
       case "install":
         await vscode.commands.executeCommand("agora.install");
         break;
+      case "update":
+        await vscode.commands.executeCommand(msg.repair ? "agora.repair" : "agora.update");
+        break;
       case "newThread":
         await vscode.commands.executeCommand("agora.newThread");
         break;
@@ -710,8 +715,8 @@ class Updater {
     else if (choice === "略過此版本") await this.state.update(UPDATE_KEYS.skipped, info.version);
   }
 
-  /** 下載 .vsix 並安裝；visible 時顯示下載進度 */
-  async install(info, visible) {
+  /** 下載 .vsix 並安裝；visible 時顯示下載進度；promptReload 為 false 時由呼叫者自己重新載入（一鍵更新）。回傳是否安裝成功 */
+  async install(info, visible, { promptReload = true } = {}) {
     output.appendLine(`下載 Agora 擴充套件 ${info.version}：${info.url}`);
     let file;
     try {
@@ -723,13 +728,14 @@ class Updater {
     } catch (e) {
       output.appendLine(`更新擴充套件失敗：${e.message}`);
       this.failed(`更新到 ${info.version} 失敗：${e.message}`);
-      return;
+      return false;
     } finally {
       if (file) fs.rmSync(file, { force: true });
     }
     await this.state.update(UPDATE_KEYS.installed, info.version);
     output.appendLine(`已安裝 Agora 擴充套件 ${info.version}，重新載入視窗後生效。`);
-    this.promptReload(info.version);
+    if (promptReload) this.promptReload(info.version);
+    return true;
   }
 
   promptReload(version) {
@@ -740,6 +746,215 @@ class Updater {
   failed(message) {
     vscode.window.showWarningMessage(`Agora：${message}`, "開啟 Releases 頁面")
       .then((choice) => choice && vscode.env.openExternal(vscode.Uri.parse(updates.RELEASES_PAGE)));
+  }
+}
+
+// ───────────────────────── 一鍵更新 ─────────────────────────
+
+// 待完成的一鍵更新，以工作區路徑為 key 存在 globalState（多個視窗共用；每個視窗只處理自己的工作區）：
+// { version, phase, repair, at }。phase：waiting（等進行中的討論與分派結束）、installing（下載安裝中，安裝前就記下，
+// 避免裝完、記錄前被中斷而漏掉補檔）、installed（已安裝，等重新載入後補齊此專案的檔案）
+const PENDING_KEY = "agora.update.pending";
+const UPDATE_LOCK_STALE = 10 * 60 * 1000;
+
+class OneClickUpdate {
+  /** hooks：{ coreVersion() 目前顯示的核心版本, refresh() 重新整理面板與討論串 } */
+  constructor(context, updater, activity, hooks) {
+    this.state = context.globalState;
+    this.updater = updater;
+    this.activity = activity;
+    this.hooks = hooks;
+    this.busy = false;
+    activity.onDidChange(() => this.onActivityChange());
+  }
+
+  pending(ws = workspaceRoot()) {
+    return ws ? (this.state.get(PENDING_KEY) || {})[ws] : undefined;
+  }
+
+  async setPending(ws, value) {
+    const all = { ...(this.state.get(PENDING_KEY) || {}) };
+    if (value) all[ws] = { ...value, at: Date.now() };
+    else delete all[ws];
+    await this.state.update(PENDING_KEY, all);
+  }
+
+  /** 同一個工作區同時只讓一個視窗執行補齊（多個視窗開同一個專案時）；回傳釋放函式，拿不到時回傳 null */
+  lock(ws) {
+    const file = path.join(ws, ".agora", "update.lock");
+    try {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      try {
+        if (Date.now() - fs.statSync(file).mtimeMs > UPDATE_LOCK_STALE) fs.rmSync(file, { force: true });
+      } catch {}
+      fs.writeFileSync(file, JSON.stringify({ pid: process.pid, at: Date.now() }), { flag: "wx" });
+    } catch {
+      return null;
+    }
+    return () => fs.rmSync(file, { force: true });
+  }
+
+  /** 面板的「更新 Agora」（repair=false）與「重新下載修復」（repair=true） */
+  async run(repair) {
+    const ws = workspaceRoot();
+    if (!ws) throw new AgoraError("請先開啟一個資料夾。");
+    if (this.busy) return;
+    this.busy = true;
+    try {
+      await this.activity.load();
+      const active = this.activity.items || [];
+      if (active.length) {
+        const wait = "等它們結束後再更新";
+        const choice = await vscode.window.showWarningMessage(
+          `Agora：此專案有 ${active.length} 個討論或分派正在進行。它們是獨立程序，重新載入視窗不會中斷，`
+          + "但更新會替換它們正在使用的 Agora 核心。", { modal: true }, wait, "現在更新");
+        if (!choice) return;
+        if (choice === wait) {
+          await this.setPending(ws, { phase: "waiting", repair });
+          vscode.window.showInformationMessage("Agora：會在進行中的討論與分派都結束後自動更新。");
+          return;
+        }
+      }
+      await this.download(ws, repair);
+    } finally {
+      this.busy = false;
+    }
+  }
+
+  /** 查 Release；有新版（或修復時同版）就下載安裝並重新載入，否則只補齊此專案的檔案 */
+  async download(ws, repair) {
+    let info;
+    try {
+      info = await updates.fetchLatest();
+    } catch (e) {
+      const go = await vscode.window.showWarningMessage(
+        `Agora：無法查詢 GitHub Releases（${e.message}）。`, "只補齊此專案的檔案", "開啟 Releases 頁面");
+      if (go === "開啟 Releases 頁面") vscode.env.openExternal(vscode.Uri.parse(updates.RELEASES_PAGE));
+      if (go === "只補齊此專案的檔案") await this.complete(ws);
+      return;
+    }
+    const diff = info ? updates.compareVersions(info.version, EXTENSION_VERSION) : -1;
+    if (diff > 0 || (repair && diff === 0)) {
+      await this.setPending(ws, { version: info.version, phase: "installing", repair });
+      if (!(await this.updater.install(info, true, { promptReload: false }))) {
+        await this.setPending(ws, null);
+        return;
+      }
+      await this.setPending(ws, { version: info.version, phase: "installed", repair });
+      output.appendLine(`一鍵更新：已安裝 ${info.version}，重新載入視窗後補齊此專案的 Agora 檔案。`);
+      await vscode.commands.executeCommand("workbench.action.reloadWindow");
+      return;
+    }
+    if (repair) {
+      vscode.window.showWarningMessage(info
+        ? `Agora：GitHub 上最新的 Release 是 ${info.version}，比目前的擴充套件（${EXTENSION_VERSION}）舊，不會降版；改為只補齊此專案的檔案。`
+        : "Agora：GitHub 上沒有可用的 Release（含 .vsix）；改為只補齊此專案的檔案。");
+    } else {
+      output.appendLine(`一鍵更新：遠端沒有比 ${EXTENSION_VERSION} 新的版本${info ? `（最新 ${info.version}）` : ""}，只補齊此專案的檔案。`);
+    }
+    await this.complete(ws, info && diff >= 0 ? null : `遠端沒有比 ${EXTENSION_VERSION} 新的版本`);
+  }
+
+  /** 啟動時接續：重新載入後補齊；上次安裝被中斷時詢問 */
+  async resume() {
+    const ws = workspaceRoot();
+    const p = this.pending(ws);
+    if (!p || this.busy) return;
+    if (p.phase === "waiting") return this.onActivityChange();
+    if (updates.compareVersions(p.version, EXTENSION_VERSION) > 0) {
+      // 還是舊版：安裝被中斷，或另一個視窗裝好但這個視窗還沒重新載入
+      const installed = this.state.get(UPDATE_KEYS.installed) === p.version;
+      const choice = await vscode.window.showWarningMessage(
+        installed ? `Agora：擴充套件 ${p.version} 已安裝，重新載入視窗後補齊此專案的檔案。`
+          : `Agora：上次更新到 ${p.version} 沒有完成。`,
+        installed ? "重新載入" : "重試", "取消更新");
+      if (choice === "重新載入") await vscode.commands.executeCommand("workbench.action.reloadWindow");
+      else if (choice === "重試") await this.run(!!p.repair);
+      else if (choice === "取消更新") await this.setPending(ws, null);
+      return;
+    }
+    this.busy = true;
+    try {
+      await this.complete(ws);
+    } finally {
+      this.busy = false;
+    }
+  }
+
+  async onActivityChange() {
+    const ws = workspaceRoot();
+    const p = this.pending(ws);
+    if (!p || p.phase !== "waiting" || this.busy || !this.activity.items || this.activity.items.length) return;
+    this.busy = true;
+    try {
+      vscode.window.showInformationMessage("Agora：進行中的討論與分派都結束了，開始更新。");
+      await this.download(ws, !!p.repair);
+    } finally {
+      this.busy = false;
+    }
+  }
+
+  /** 確認實際執行的核心是這次的版本，再執行 agora install 補齊此專案的檔案，install --status 驗收通過才清掉待辦 */
+  async complete(ws, note = null) {
+    const release = this.lock(ws);
+    if (!release) {
+      output.appendLine("一鍵更新：另一個視窗正在補齊此專案的檔案，略過。");
+      return;
+    }
+    try {
+      await this.fill(ws, note);
+    } finally {
+      release();
+    }
+  }
+
+  /** complete 的本體（持有工作區鎖時呼叫）；重試時呼叫自己，不再取鎖 */
+  async fill(ws, note) {
+    // 核心在啟動時同步；被占用（例如背景程序正在使用）時換不上，這裡再試一次
+    bundledCore = syncCore(path.join(extensionPath, "core"), undefined, (m) => output.appendLine(m)) || bundledCore;
+    const bundledBuild = readBuild(path.join(extensionPath, "core"));
+    const data = await runJson(["parties", "--json"]);
+    const core = data.core || { kind: "unknown", version: this.hooks.coreVersion(), root: (agoraCommand() || {}).source };
+    let source = "";
+    if (!coreMatches(core, bundledBuild, EXTENSION_VERSION)) {
+      if (core.kind === "bundled") {
+        const retry = await vscode.window.showWarningMessage(
+          `Agora：內建核心還沒換成 ${EXTENSION_VERSION}（可能有程序正在使用 ~/.agora/core），先不補齊此專案的檔案。`, "重試");
+        if (retry) return this.fill(ws, note);
+        return;   // 保留待辦，下次啟動時再試
+      }
+      const useBundled = "改用內建核心";
+      const keep = "仍用目前核心";
+      const choice = await vscode.window.showWarningMessage(
+        `Agora：目前執行的核心是 ${core.root || "未知位置"}（版本 ${core.version || "未知"}，`
+        + `${core.kind === "source" ? "原始碼" : "來源不明"}），不是這次更新的 ${EXTENSION_VERSION}。`
+        + "用它補齊的檔案會是它那個版本的內容。", { modal: true }, useBundled, keep);
+      if (!choice) return;   // 保留待辦
+      if (choice === useBundled) {
+        if (!bundledCore) throw new AgoraError("擴充套件內建的核心無法使用，請查看 Agora 輸出面板。");
+        // agora.root 優先於 PATH（agoraCommand）；之後要改回原始碼核心，清掉這個設定即可
+        await vscode.workspace.getConfiguration("agora").update("root", bundledCore, vscode.ConfigurationTarget.Global);
+        output.appendLine(`一鍵更新：已把設定 agora.root 改為內建核心 ${bundledCore}（清掉這個設定即可改回 ${core.root}）。`);
+        return this.fill(ws, note);
+      }
+      source = `（使用 ${core.root} 的核心 ${core.version || ""}）`;
+    } else if (core.kind === "source") {
+      source = `（使用原始碼核心 ${core.root}）`;
+    }
+    const out = await runAgora(["install"]);
+    const status = await runJson(["install", "--status", "--json"]);
+    this.hooks.refresh();
+    if (status.state !== "installed") {
+      const left = [...(status.missing || []).map((x) => `缺少 ${x}`), ...(status.outdated || []).map((x) => `舊版 ${x}`)];
+      const retry = await vscode.window.showWarningMessage(
+        `Agora：補齊後仍有項目未完成：${left.join("、") || status.state}。詳細內容在 Agora 輸出面板。`, "重試", "開啟輸出面板");
+      if (retry === "開啟輸出面板") output.show(true);
+      if (retry === "重試") return this.fill(ws, note);
+      return;   // 保留待辦
+    }
+    await this.setPending(ws, null);
+    const first = out.trim().split("\n")[0];
+    vscode.window.showInformationMessage(`Agora 已更新到 ${status.version || EXTENSION_VERSION}${source}${note ? `；${note}` : ""}。${first}`);
   }
 }
 
@@ -867,6 +1082,7 @@ function activate(context) {
     const target = await vscode.window.showQuickPick(
       [
         { label: "$(organization) 所有 AI 依序回覆", description: inThread.map((p) => NAMES[p]).join("、"), to: "all" },
+        { label: "$(eye-closed) 所有 AI 各自獨立作答", description: "看不到同一輪其他人的答案，適合決策題，之後再請大家互評", to: "all", blind: true },
         ...enabled.map((p) => ({ label: `$(person) 只請 ${NAMES[p]} 回覆`, to: p })),
         { label: "$(note) 只記錄，不請任何人回覆", to: "none" },
       ],
@@ -875,7 +1091,7 @@ function activate(context) {
     if (!target) return;
     await openTranscript(thread);
     await runLong(target.to === "none" ? "記錄訊息" : "等待 AI 回覆",
-      ["send", thread.id, "--from", "human", "--to", target.to], text);
+      ["send", thread.id, "--from", "human", "--to", target.to, ...(target.blind ? ["--blind"] : [])], text);
   });
 
   command("agora.auto", async (arg) => {
@@ -1118,6 +1334,13 @@ function activate(context) {
 
   const updater = new Updater(context);
   command("agora.checkUpdate", () => updater.check(true));
+  const oneClick = new OneClickUpdate(context, updater, activity,
+    { coreVersion: () => model.coreVersion, refresh: () => { refreshAll(); model.loadVersion(); } });
+  command("agora.update", () => oneClick.run(false));
+  command("agora.repair", () => oneClick.run(true));
+  // 一鍵更新重新載入後接續：補齊此專案的檔案（等啟動時的其他查詢先跑）
+  const resumeDelay = setTimeout(() => oneClick.resume().catch(showError), 3 * 1000);
+  context.subscriptions.push({ dispose: () => clearTimeout(resumeDelay) });
   const updateDelay = setTimeout(() => updater.check(), 15 * 1000);   // 不和啟動時的其他查詢搶時間
   const updateTimer = setInterval(() => updater.check(), 3600 * 1000);   // 是否真的查詢由 UPDATE_INTERVAL 決定
   context.subscriptions.push({ dispose: () => { clearTimeout(updateDelay); clearInterval(updateTimer); } });

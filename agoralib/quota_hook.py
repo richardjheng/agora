@@ -5,6 +5,9 @@
   python <agora>/agoralib/quota_hook.py claude-tool     # Claude Code PostToolUse：只在需要交接/停工時提醒
   python <agora>/agoralib/quota_hook.py agy-pre         # Antigravity PreInvocation：首次呼叫附額度，需要時提醒
   python <agora>/agoralib/quota_hook.py agy-tool        # Antigravity PreToolUse（子代理工具）：Agora 設定不允許時擋下
+  python <agora>/agoralib/quota_hook.py codex-prompt    # Codex UserPromptSubmit：同 claude-prompt
+
+使用者自己開的對話（不是被 Agora 呼叫的）另外附上依勾選分工的指示（見 routing.py）。
 
 只讀檔案、不做網路請求，確保 hook 本身很快；快取過期時另開背景程序更新。
 """
@@ -17,7 +20,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from agoralib import config, quota, shares  # noqa: E402
+from agoralib import config, quota, routing, shares  # noqa: E402
 
 STATE_FILE = quota.AGORA_HOME / "hook_state.json"
 NAMES = quota.LABELS
@@ -77,6 +80,14 @@ def project_parties() -> list:
     return config.enabled(root) if root else list(quota.USAGE)
 
 
+def routing_line(me: str, prompt: str = "") -> str | None:
+    """依勾選分工的指示；被 Agora 呼叫的回覆、斜線指令（例如 /code-review）不附"""
+    root = project_root()
+    if os.getenv("AGORA_INVOKED") or prompt.lstrip().startswith("/") or not root:
+        return None
+    return routing.instruction(me, config.enabled(root))
+
+
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "claude-prompt"
     if mode == "agy-tool":
@@ -94,7 +105,7 @@ def main():
     except Exception:
         payload = {}
 
-    me = "antigravity" if mode.startswith("agy") else "claude"
+    me = "antigravity" if mode.startswith("agy") else "codex" if mode.startswith("codex") else "claude"
     parties = set(project_parties()) | {me}
     usages = {p: u for p, u in quota.all_usage().items() if p in parties}
     max_age = quota.wanted_max_age(*usages.values())
@@ -112,8 +123,9 @@ def main():
         state[key] = level
         save_state(state)
 
-    if mode == "claude-prompt":
-        lines = [status] + ([text] if text else [])
+    if mode in ("claude-prompt", "codex-prompt"):
+        route = routing_line(me, str(payload.get("prompt") or ""))
+        lines = [status] + ([text] if text else []) + ([route] if route else [])
         out = {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": "\n".join(lines)}}
     elif mode == "claude-tool":
         out = {}
@@ -126,6 +138,9 @@ def main():
             msgs.append(status)
         if text and (first or not already):
             msgs.append(text)
+        route = routing_line(me) if first else None
+        if route:
+            msgs.append(route)
         out = {"injectSteps": [{"ephemeralMessage": "\n".join(msgs)}]} if msgs else {}
 
     sys.stdout.buffer.write(json.dumps(out, ensure_ascii=False).encode("utf-8"))
