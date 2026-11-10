@@ -38,6 +38,7 @@ MAX_WORK_ROUNDS = int(os.getenv("AGORA_MAX_WORK_ROUNDS", "12"))
 QUOTA_BACKOFF = int(os.getenv("AGORA_QUOTA_BACKOFF", "900"))   # 回報額度用盡、但查不到重置時間時，等多久再試
 QUOTA_RETRIES = int(os.getenv("AGORA_QUOTA_RETRIES", "4"))     # 上述情況最多重試幾次，超過就判定失敗
 CONSENSUS = "【已達成共識】"
+UPGRADE = "【需要升級】"
 
 PREAMBLE = """\
 【Agora 討論環境說明】
@@ -69,13 +70,14 @@ WORK_PREAMBLE = """\
 
 終端指令只能用以下幾個，而且必須一字不差、不能加任何參數（部分 CLI 的權限是完整比對）：
 `{agora} quota`（查額度）、{build_cmd}`{agora} check`（工作區的驗證，例如語法檢查與測試）、`git status`、`git diff`、`git log`。
-列目錄、讀檔、搜尋、寫檔請用內建的檔案工具。
+{file_rule}
 
 工作方式：每完成一個小步驟（約 10~20 分鐘的工作量）就做以下三件事：
 1. 在 {progress} 末尾追加一段：時間、完成了什麼、改了哪些檔案、下一步是什麼。
 2. 讀 {control}；若 "stop_requested" 為 true，把交接說明寫進進度檔後結束這一輪，最後一行寫「【已暫停】」。
 3. 執行 `{agora} quota`；若你（{me}）的額度低於 {threshold:.0f}%，把交接說明寫進進度檔後結束，最後一行寫「【額度不足】」。
 全部完成時，執行 {finish_cmds}，在進度檔寫總結，回覆最後一行寫「【工作完成】」。
+這次的等級：{tier_line}。若判斷這個等級（模型）不足以完成，不要勉強：在進度檔寫明理由，回覆最後一行寫「【需要升級】」後結束。
 
 以下是 {owner} 的工作單：
 """
@@ -110,10 +112,15 @@ SUMMARY_PROMPT = """\
 以下是完整逐字稿：
 """
 
+FILE_RULE = "列目錄、讀檔、搜尋、寫檔請用內建的檔案工具。"
+# Codex 沒有內建的讀檔與搜尋工具，只能用終端指令讀（只照字面遵守白名單時會什麼都讀不到）；寫檔仍用 apply_patch，沙箱限制在工作區
+FILE_RULES = {"codex": "Codex 沒有內建的讀檔工具：列目錄、讀檔、搜尋可以用唯讀的終端指令（例如 Get-Content、Get-ChildItem、rg、Select-String），"
+                       "這些指令不受上面的白名單限制；但不能用終端指令建立、修改、刪除或移動檔案，寫檔一律用 apply_patch。"}
+
 CONTINUE_PROMPT = """\
 【Agora 工作分派・繼續】
 請先讀 {progress} 與 {control}，從上次停下的地方繼續。界線與工作方式和第一輪相同：
-每完成一小步就更新進度檔、檢查 control.json、執行 `{agora} quota`；結束時最後一行寫「【工作完成】」「【已暫停】」或「【額度不足】」。
+每完成一小步就更新進度檔、檢查 control.json、執行 `{agora} quota`；結束時最後一行寫「【工作完成】」「【已暫停】」「【額度不足】」或「【需要升級】」。
 """
 
 
@@ -220,10 +227,35 @@ def append_transcript(thread: Path, text: str):
         f.write(text)
 
 
-def add_message(thread: Path, state: dict, speaker: str, text: str, via_cli: bool = False, meta: str = ""):
-    state["messages"].append({"speaker": speaker, "text": text.strip(), "time": now_str(), "via_cli": via_cli})
+def stats_meta(entry: Optional[dict]) -> str:
+    """逐字稿標題的子代理附註：有觀測到才寫（未觀測不寫成「沒使用」）"""
+    sub = (entry or {}).get("subagents")
+    if not sub or not sub.get("started"):
+        return ""
+    extra = "、".join(f"{label} {sub[k]}" for k, label in (("completed", "完成"), ("failed", "失敗")) if sub.get(k))
+    return f"子代理 {sub['started']}" + (f"（{extra}）" if extra else "")
+
+
+def add_message(thread: Path, state: dict, speaker: str, text: str, via_cli: bool = False, meta: str = "",
+                stats: Optional[dict] = None):
+    message = {"speaker": speaker, "text": text.strip(), "time": now_str(), "via_cli": via_cli}
+    if stats:   # 這次呼叫的用量紀錄（shares.record_call），之後可以統計
+        message["stats"] = {k: v for k, v in stats.items() if k not in ("time", "thread")}
+        meta = ", ".join(x for x in (meta, stats_meta(stats)) if x)
+    state["messages"].append(message)
     header = f"### {NAMES.get(speaker, speaker)} · {now_str()}" + (f"  _({meta})_" if meta else "")
     append_transcript(thread, f"\n{header}\n\n{text.strip()}\n")
+
+
+def remember_failed_call(thread: Path, entry: dict):
+    """失敗（例外、逾時）的呼叫也保存用量到 state.failed_calls（成功的跟著訊息存在 messages[].stats）"""
+    try:
+        with thread_lock(thread):
+            state = load_state(thread)
+            state.setdefault("failed_calls", []).append({k: v for k, v in entry.items() if k != "thread"})
+            save_state(thread, state)
+    except (OSError, KeyError, json.JSONDecodeError, SystemExit):   # 討論串被占用（thread_lock 逾時）時不中斷呼叫流程
+        pass
 
 
 def add_system_note(thread: Path, text: str):
@@ -240,6 +272,18 @@ def read_message(args) -> str:
     if not text.strip():
         sys.exit("訊息內容是空的。")
     return text
+
+
+def parse_tier_pairs(items: Optional[List[str]]) -> dict:
+    """["antigravity.heavy=gemini-4-argon-high", "claude.light=haiku:low"] → {"antigravity.heavy": "…", …}"""
+    out = {}
+    for item in items or []:
+        key, sep, value = item.partition("=")
+        party, _, level = key.partition(".")
+        if not sep or not level:
+            sys.exit(f"格式應為 <AI>.<{'|'.join(config.TIER_LEVELS)}>=<模型>[:<推理強度>]：{item}")
+        out[f"{canonical(party.strip())}.{level.strip()}"] = value.strip()
+    return out
 
 
 def parse_pairs(items: Optional[List[str]]) -> dict:
@@ -261,11 +305,24 @@ def guard_nested():
         sys.exit("你是被 Agora 呼叫來的，回覆內容會自動轉給其他人，請直接回覆，不要再執行 agora.py 的討論或分派指令。")
 
 
-def remember_session(state: dict, party: str, session_id: Optional[str], external: bool = False):
-    """記下 Agora 在各 CLI 開過的對話，清理討論串時一併刪除（external：使用者帶進來的對話，不刪）"""
+def remember_session(state: dict, party: str, session_id: Optional[str], external: bool = False,
+                     opts: Optional[dict] = None):
+    """記下 Agora 在各 CLI 開過的對話，清理討論串時一併刪除（external：使用者帶進來的對話，不刪）。
+    opts 是這段對話第一次使用的模型與推理強度：之後用 assign --session 延續時沿用（見 session_plan）"""
     sessions = state.setdefault("sessions", [])
-    if session_id and not any(x["id"] == session_id for x in sessions):
-        sessions.append({"party": party, "id": session_id, "external": external})
+    if not session_id:
+        return
+    entry = next((x for x in sessions if x["id"] == session_id), None)
+    if entry is None:
+        entry = {"party": party, "id": session_id, "external": external}
+        sessions.append(entry)
+    if opts is not None:
+        # 請求的模型是 CLI 預設（None）時，用 CLI 實際回報的模型（parties 的 _stats.model）補上，之後延續時才能明確指定
+        reported = (opts.get("_stats") or {}).get("model")
+        if "model" not in entry:
+            entry.update(model=opts.get("model") or reported, effort=opts.get("effort"))
+        elif entry.get("model") is None and reported:
+            entry["model"] = reported
 
 
 def new_party(model: Optional[str] = None, effort: Optional[str] = None) -> dict:
@@ -376,17 +433,19 @@ def invoke(ws: Workspace, thread: Path, party: str, upto: Optional[int] = None) 
         with thread_lock(thread):
             fresh = load_state(thread)
             for sid in sessions:
-                remember_session(fresh, party, sid)
+                remember_session(fresh, party, sid, opts=opts)
             update(fresh)
             save_state(thread, fresh)
 
     for attempt in (1, 2):
         live = Live(live_path(thread, "discussion"), NAMES[party], ws.root)
+        opts["_stats"] = {}   # parties 在串流中即時更新；失敗時已收到的用量也要記
         try:
             reply, session_id, meta = call_party(party, prompt, session, opts, False, ws.root, TIMEOUT, thread, live=live)
             break
         except (CallError, subprocess.TimeoutExpired, FileNotFoundError) as e:
             live.close()
+            remember_failed_call(thread, shares.record_call(ws.root, party, thread.name, "discussion", opts["_stats"], False))
             sessions.append(getattr(e, "session_id", None))
             if attempt == 1 and isinstance(e, CallError) and e.denied:
                 note = f"⚠️ {NAMES[party]} 用了不被允許的工具或終端指令，整輪被中斷；已提醒改用讀檔工具，重試一次。"
@@ -403,11 +462,13 @@ def invoke(ws: Workspace, thread: Path, party: str, upto: Optional[int] = None) 
     live.close()
     after = git_status(ws.root)
     sessions.append(session_id)
+    usage_entry = shares.record_call(ws.root, party, thread.name, "discussion", opts["_stats"], True)
 
     def record(fresh):
         info = fresh["parties"].setdefault(party, new_party())
         info["session_id"] = session_id
-        add_message(thread, fresh, party, reply, via_cli=True, meta=", ".join(x for x in (model, meta) if x))
+        add_message(thread, fresh, party, reply, via_cli=True, meta=", ".join(x for x in (model, meta) if x),
+                    stats=usage_entry)
         info["seen"] = seen   # 它自己的回覆在 build_prompt 會略過；呼叫期間別人加的訊息下次才轉給它
     save(record)
     if before != after:
@@ -653,25 +714,28 @@ def cmd_summarize(ws: Workspace, args):
     print(f"…等待 {NAMES[party]} 產出總結", file=sys.stderr, flush=True)
     jobs.set_current(party)
     live = Live(live_path(thread, "discussion"), f"{NAMES[party]}（總結）", ws.root)
+    opts["_stats"] = {}
     try:   # 新的對話（不續接討論的 session），確保讀到完整逐字稿；呼叫期間不持有 thread_lock（見 invoke）
         reply, session_id, meta = call_party(party, prompt, None, opts, False, ws.root, TIMEOUT, thread, live=live)
     except (CallError, subprocess.TimeoutExpired, FileNotFoundError) as e:
         live.close()
+        remember_failed_call(thread, shares.record_call(ws.root, party, thread.name, "summary", opts["_stats"], False))
         add_system_note(thread, f"⚠️ {NAMES[party]} 產出總結失敗：{e}")
         with thread_lock(thread):
             state = load_state(thread)
-            remember_session(state, party, getattr(e, "session_id", None))
+            remember_session(state, party, getattr(e, "session_id", None), opts=opts)
             save_state(thread, state)
         sys.exit(f"{NAMES[party]} 產出總結失敗：{e}")
     live.close()
+    usage_entry = shares.record_call(ws.root, party, thread.name, "summary", opts["_stats"], True)
     try:
         order, error = work_order(reply), None
     except ValueError as e:
         order, error = "", str(e)
     with thread_lock(thread):
         state = load_state(thread)
-        remember_session(state, party, session_id)
-        add_message(thread, state, party, f"【討論總結】\n{reply}", meta=f"總結（新對話）, {meta}")
+        remember_session(state, party, session_id, opts=opts)
+        add_message(thread, state, party, f"【討論總結】\n{reply}", meta=f"總結（新對話）, {meta}", stats=usage_entry)
         # 涵蓋到總結本身；總結期間別人加的訊息不算涵蓋，之後依此總結分派時會提示過期
         state["summary"] = {"by": party, "time": now_str(), "messages": len(messages) + 1,
                             "files": referenced_files(ws.root, order), "error": error}
@@ -751,30 +815,139 @@ def stop_requested(thread: Path) -> bool:
         return False
 
 
-def party_usage(party: str) -> Optional[dict]:
+def party_usage(party: str, model: Optional[str] = None) -> Optional[dict]:
+    """這一方用 model 時的額度（Antigravity 依模型系列分池，見 quota.usage_for）"""
     quota.refresh(min_interval=120)
-    return quota.usage(party)
+    return quota.usage_for(party, model)
 
 
-def pick_worker(ws: Workspace, owner: str, candidates: List[str]) -> str:
-    """沒指定接手方時依分配比例挑選（見 shares.py）；大家額度都不足時挑額度最多的，等它重置後開始"""
+def plan_model(ws: Workspace, state: dict, party: str, tier: Optional[str], model: Optional[str],
+               effort: Optional[str]) -> dict:
+    """這次分派要用的模型與推理強度（分派時凍結在 relay）：
+    --model/--effort ＞ --tier 的設定 ＞ 討論串明確指定的模型 ＞ 標準等級的設定 ＞ 專案設定 ＞ CLI 預設。
+    沒給 --tier 時不覆蓋討論串明確指定的模型"""
+    base = call_opts(ws, state, party)
+    if model:
+        return resolve_default(party, {"model": model, "effort": effort or base.get("effort"), "source": "指定"})
+    tiers = config.party_settings(ws.root)[party]["tiers"]
+    explicit = (state["parties"].get(party) or {}).get("model")
+    level = tier or (None if explicit else "standard")
+    spec = tiers.get(level) if level else None
+    if spec:   # --effort 只覆蓋推理強度，模型仍依等級
+        return resolve_default(party, {"model": spec["model"], "effort": effort or spec.get("effort"),
+                                       "fallback": spec.get("fallback"), "source": f"{config.TIER_LABELS[level]}等級"})
+    return resolve_default(party, {"model": base.get("model"), "effort": effort or base.get("effort"),
+                                   "source": "討論串設定" if explicit else "專案設定" if base.get("model") else "CLI 預設"})
+
+
+def resolve_default(party: str, plan: dict) -> dict:
+    """模型是 CLI 預設（None）時，用模型清單快取（agora models）查到的具體預設模型，分派時就凍結；
+    查不到時維持 None，並標記 model_known=False（不能宣稱已凍結）。只讀快取，不另外執行 CLI"""
+    if plan.get("model"):
+        return {**plan, "model_known": True}
+    default = ((quota._read_json(models.CACHE) or {}).get(party) or {}).get("default") or {}
+    if default.get("model"):
+        return {**plan, "model": default["model"], "effort": plan.get("effort") or default.get("effort"),
+                "model_known": True, "source": plan["source"] + "（CLI 預設）"}
+    return {**plan, "model_known": False}
+
+
+def session_config(ws: Workspace, party: str, session_id: str) -> Optional[dict]:
+    """Agora 記錄過的對話設定（remember_session 的 model／effort）；沒記錄時回傳 None"""
+    for state_file in ws.threads.glob("*/state.json"):
+        try:
+            sessions = json.loads(state_file.read_text(encoding="utf-8")).get("sessions") or []
+        except (OSError, json.JSONDecodeError):
+            continue
+        for x in sessions:
+            if x.get("id") == session_id and x.get("party") == party and "model" in x:
+                return {"model": x.get("model"), "effort": x.get("effort")}
+    return None
+
+
+def session_plan(ws: Workspace, party: str, session_id: str) -> dict:
+    """延續既有對話（--session）：不套等級、不換替代模型，沿用這段對話原本的模型與推理強度。
+    Agora 沒記錄過它的設定時不指定模型與推理強度（讓 CLI 沿用該對話自己的設定），標記為未知，
+    不拿目前的專案設定冒充，避免隱性換模型"""
+    known = session_config(ws, party, session_id)
+    if known is not None:   # 記錄過、但模型仍是 CLI 預設且沒有回報實際模型時，仍算未知
+        return {**known, "model_known": bool(known.get("model")), "source": "延續對話（原本的設定）"}
+    return {"model": None, "effort": None, "model_known": False, "source": "延續對話（原本的設定未知，不指定模型）"}
+
+
+def choose_model(party: str, plan: dict) -> Tuple[dict, Optional[dict]]:
+    """這個等級的額度池不足、而使用者設定了替代模型且它的額度足夠時，改用替代模型（不擅自降成較低等級）；
+    回傳 (計畫, 對應的額度)"""
+    u = party_usage(party, plan.get("model"))
+    fb = plan.get("fallback")
+    if u is not None and quota.low(u) and fb:
+        fu = party_usage(party, fb["model"])
+        if fu is not None and not quota.unavailable(fu):
+            return {**plan, "model": fb["model"], "effort": fb.get("effort"), "fallback_used": True,
+                    "source": plan["source"] + "的替代模型"}, fu
+    return plan, u
+
+
+def usage_info(plan: dict, u: Optional[dict]) -> dict:
+    """分派決策裡每個候選的額度資訊"""
+    info = {"model": plan.get("model"), "effort": plan.get("effort"), "source": plan.get("source"),
+            "pool": (u or {}).get("window_label") or (u or {}).get("window"),
+            "remaining_pct": (u or {}).get("remaining_pct"), "resets_at": (u or {}).get("resets_at")}
+    if u is None:
+        info["excluded"] = "額度未知"
+    elif u.get("blocked"):
+        info["excluded"] = f"無法使用（{u['blocked'].get('reason')}）"
+    elif quota.low(u):
+        info["excluded"] = f"額度低於 {quota.THRESHOLD_PCT:.0f}%"
+    return info
+
+
+def describe_candidate(party: str, info: dict) -> str:
+    pct = info.get("remaining_pct")
+    text = f"{NAMES[party]} {info.get('model') or 'CLI 預設'}" + (f"（{info['pool']}）" if info.get("pool") else "")
+    text += f" 剩 {pct:.0f}%" if isinstance(pct, (int, float)) else " 額度未知"
+    return text + (f"，不挑：{info['excluded']}" if info.get("excluded") else "")
+
+
+def pick_worker(ws: Workspace, owner: str, candidates: List[str], state: dict, tier: Optional[str] = None,
+                model: Optional[str] = None, effort: Optional[str] = None) -> Tuple[str, dict, dict]:
+    """沒指定接手方時，在勾選、可用、分配比例 > 0 的 AI 中挑這次等級對應額度池剩餘 % 最高的一方（見 shares.pick）。
+    都不足時：挑已知最早重置的一方，接手程序等它重置後開始；重置時間都未知就停止並說明，不假定可用、不擅自降級。
+    回傳 (接手方, 模型計畫, 分派決策)"""
     weights = config.shares(ws.root)
     others = [p for p in candidates if p != owner and weights[p] > 0]
     if not others:
-        sys.exit("沒有可自動分派的 AI（其他啟用中 AI 的分配比例都是 0），請用 --to 指定接手方。")
-    usages = {p: quota.usage(p) for p in others}
-    usable = [p for p in others if not (usages[p] or {}).get("blocked")]
-    if not usable:
+        sys.exit("沒有可自動分派的 AI（其他勾選中 AI 的分配比例都是 0），請用 --to 指定接手方。")
+    plans, usages, infos = {}, {}, {}
+    for p in others:   # 先只看各方這個等級的主模型
+        plans[p] = plan_model(ws, state, p, tier, model, effort)
+        usages[p] = party_usage(p, plans[p].get("model"))
+        infos[p] = usage_info(plans[p], usages[p])
+    if all((usages[p] or {}).get("blocked") for p in others):
         sys.exit("其他可自動分派的 AI 都標記為無法使用（" + "、".join(
             f"{NAMES[p]}：{usages[p]['blocked']['reason']}" for p in others) + "）。處理後用 "
             f"{agora_cmd()} quota --unblock <AI> 清除標記，或用 --to 指定接手方。")
-    work = shares.recent_work(ws.root)
-    worker = shares.pick(usable, weights, work, usages) \
-        or max(usable, key=lambda p: (usages[p] or {}).get("remaining_pct", 0))
-    total = sum(weights[p] for p in others)
-    print(f"依分配比例挑選 {NAMES[worker]}（" + "、".join(
-        f"{NAMES[p]} 目標 {int(weights[p] / total * 100 + 0.5)}% 近 {shares.SHARE_DAYS:g} 天 {work.get(p, 0)} 輪" for p in others) + "）")
-    return worker
+    worker = shares.pick(others, weights, {}, usages)
+    if not worker:   # 主模型都不足，才考慮使用者設定的替代模型（不擅自降成較低等級）
+        for p in others:
+            if plans[p].get("fallback") and not (usages[p] or {}).get("blocked"):
+                fb_plan, fb_usage = choose_model(p, plans[p])
+                if fb_plan.get("fallback_used"):
+                    plans[p], usages[p] = fb_plan, fb_usage
+                    infos[p] = usage_info(fb_plan, fb_usage)
+        worker = shares.pick(others, weights, {}, usages)
+    waiting = False
+    if not worker:
+        known = [p for p in others if usages[p] and not usages[p].get("blocked") and usages[p].get("resets_at")]
+        if not known:
+            sys.exit("沒有可自動分派的 AI：這次等級對應的額度都不足或查不到，也不知道何時重置。"
+                     "請稍後再試、設定替代模型（agora parties --tier-fallback），或用 --to 指定接手方。\n"
+                     + "\n".join(f"  {describe_candidate(p, infos[p])}" for p in others))
+        worker, waiting = min(known, key=lambda p: usages[p]["resets_at"]), True
+    print(("這次等級的額度都不足，" if waiting else "") + f"依剩餘額度挑選 {NAMES[worker]}（"
+          + "；".join(describe_candidate(p, infos[p]) for p in others) + "）"
+          + (f"，接手程序會等到 {quota.fmt_time(usages[worker]['resets_at'])} 重置後開始" if waiting else ""))
+    return worker, plans[worker], {"selection": "auto", "candidates": infos, "waiting": waiting}
 
 
 def cmd_assign(ws: Workspace, args):
@@ -788,7 +961,28 @@ def cmd_assign(ws: Workspace, args):
         text = summary_handoff(ws, thread, state, args.yes)
     else:
         text = read_message(args)
-    worker = require_enabled(ws, canonical(args.to)) if args.to else pick_worker(ws, owner, ws.enabled())
+    tier, model_arg, effort_arg = getattr(args, "tier", None), getattr(args, "model", None), getattr(args, "effort", None)
+    if args.session and (tier or model_arg or effort_arg):
+        sys.exit("延續既有對話（--session）時不能指定 --tier、--model 或 --effort：中途換模型可能不相容；要換等級請開新的分派。")
+    if model_arg and tier:
+        sys.exit("--model 與 --tier 只能擇一：--tier 依專案設定的等級選模型，--model 直接指定。")
+    if args.session and not args.to:
+        sys.exit("延續既有對話（--session）時要用 --to 指定接手方（那段對話屬於哪個 AI）。")
+    if args.to:
+        worker = require_enabled(ws, canonical(args.to))
+        if args.session:
+            plan = session_plan(ws, worker, args.session)
+            u = party_usage(worker, plan.get("model"))
+        else:
+            plan, u = choose_model(worker, plan_model(ws, state, worker, tier, model_arg, effort_arg))
+        decision = {"selection": "explicit", "candidates": {worker: usage_info(plan, u)}, "waiting": bool(u and quota.low(u))}
+        if decision["waiting"]:
+            print(f"⏸ {NAMES[worker]} 的{plan.get('source')}額度不足（{describe_candidate(worker, decision['candidates'][worker])}），"
+                  f"接手程序會等它重置後開始。")
+    else:
+        worker, plan, decision = pick_worker(ws, owner, ws.enabled(), state, tier, model_arg, effort_arg)
+    subagents_arg = getattr(args, "subagents", None)
+    subagents = None if subagents_arg is None else subagents_arg == "on"
     mark = quota.blocked(worker)
     if mark:
         print(f"⚠️ {NAMES[worker]} 在 {quota.fmt_time(mark.get('at'))} 被標記為無法使用（{mark.get('reason')}）；"
@@ -814,11 +1008,31 @@ def cmd_assign(ws: Workspace, args):
         state = load_state(thread)
         state["parties"].setdefault(worker, new_party())
         add_message(thread, state, owner, f"【工作分派 → {NAMES[worker]}】\n{text}")
+        # 模型在分派時凍結：之後各輪都用這裡記的，專案設定中途改了也不會悄悄換模型（model 為 None 表示 CLI 預設）
         state["relay"] = {"from": owner, "worker": worker, "status": "starting", "rounds": 0,
                           "session_id": args.session, "external_session": args.session,
                           "handoff": text.strip(), "started": now_str(), "started_ts": time.time(),
-                          "updated": now_str(), "baseline": baseline}
+                          "updated": now_str(), "baseline": baseline, "frozen": True,
+                          "tier": None if args.session else tier, "model": plan.get("model"), "effort": plan.get("effort"),
+                          "model_source": plan.get("source"), "fallback_used": bool(plan.get("fallback_used")),
+                          "model_known": bool(plan.get("model_known")),
+                          "subagents": subagents, "selection": decision["selection"],
+                          "trigger": getattr(args, "trigger", None) or "manual"}
         save_state(thread, state)
+    try:
+        shares.append(ws.root, {"kind": "dispatch", "party": worker, "thread": thread.name, "from": owner,
+                                "selection": decision["selection"], "trigger": getattr(args, "trigger", None) or "manual",
+                                "tier": tier, "model": plan.get("model"), "effort": plan.get("effort"),
+                                "fallback_used": bool(plan.get("fallback_used")), "candidates": decision["candidates"]})
+    except OSError:
+        pass
+    level = f"{config.TIER_LABELS[tier]}等級" if tier else plan.get("source")
+    add_system_note(thread, f"📋 {'自動挑選' if decision['selection'] == 'auto' else '指定'} {NAMES[worker]}"
+                            f"（{level}：{plan.get('model') or 'CLI 預設模型'}"
+                            + (f"、{plan['effort']}" if plan.get("effort") else "")
+                            + ("，額度不足改用使用者設定的替代模型" if plan.get("fallback_used") else "")
+                            + ("，子代理：" + ("允許" if subagents else "不允許") if subagents is not None else "") + "）"
+                            + "；候選：" + "；".join(describe_candidate(p, i) for p, i in decision["candidates"].items()))
 
     # 背景程序一啟動就讀 state.json 的 relay，所以先寫入 starting 再啟動；記下 PID 前的空檔由 relay_alive 的緩衝涵蓋
     entry = AGORA_ROOT_DIR / "agora.py"
@@ -1097,7 +1311,7 @@ def cmd_work(ws: Workspace, args):
             add_system_note(thread, f"🔁 {NAMES[owner]} 已收回工作，{NAMES[worker]} 停止接手。")
             return
 
-        usage = party_usage(worker)
+        usage = party_usage(worker, relay.get("model"))
         if quota.low(usage):
             wake = (usage.get("resets_at") or time.time() + 3600) + 120
             update_relay(thread, status="waiting", waiting_until=wake)
@@ -1109,7 +1323,9 @@ def cmd_work(ws: Workspace, args):
             continue
 
         relay = update_relay(thread, status="running", waiting_until=None, round_started=time.time())
-        fmt = dict(me=NAMES[worker], owner=NAMES[owner], human=NAMES[HUMAN], workspace=ws.root,
+        fmt = dict(me=NAMES[worker], owner=NAMES[owner], human=NAMES[HUMAN], workspace=ws.root, file_rule=FILE_RULES.get(worker, FILE_RULE),
+                   tier_line=(f"{config.TIER_LABELS.get(relay.get('tier'), '未指定')}（{relay.get('model') or 'CLI 預設模型'}）"
+                              if relay.get("frozen") else "未指定"),
                    progress=paths["progress"], control=paths["control"], threshold=quota.THRESHOLD_PCT,
                    agora=agora_cmd())
         cfg = ws.config()
@@ -1131,6 +1347,11 @@ def cmd_work(ws: Workspace, args):
         config_before = read_config_text(ws.root)
         files_before, round_ts = protected_files(ws.root), time.time()
         opts = call_opts(ws, state, worker)
+        if relay.get("frozen"):   # 分派時凍結的模型與子代理設定（cmd_assign）；舊版的分派沒有，沿用每輪讀設定
+            opts.update(model=relay.get("model"), effort=relay.get("effort"))
+            if relay.get("subagents") is not None:
+                opts["subagents"] = relay["subagents"]
+        opts["_stats"] = {}
         # 接手方執行的 agora build / check 用這輪開始時的指令，這輪中途改設定檔也不會被執行
         opts["env"] = {LOCKED_ENV: json.dumps({k: cfg.get(k) for k in LOCKED_KEYS}, ensure_ascii=False)}
         try:
@@ -1138,6 +1359,7 @@ def cmd_work(ws: Workspace, args):
                                                  True, ws.root, WORK_TIMEOUT, thread, live=live)
         except (CallError, subprocess.TimeoutExpired, FileNotFoundError) as e:
             live.close()
+            remember_failed_call(thread, shares.record_call(ws.root, worker, thread.name, "work", opts["_stats"], False))
             guard_config(ws.root, config_before, thread, worker)
             guard_files(ws.root, files_before, thread, worker, round_ts)
             exhausted = isinstance(e, CallError) and e.quota_exhausted
@@ -1146,7 +1368,7 @@ def cmd_work(ws: Workspace, args):
             if getattr(e, "session_id", None):
                 with thread_lock(thread, wait=WORKER_LOCK_WAIT):
                     state = load_state(thread)
-                    remember_session(state, worker, e.session_id, e.session_id == relay.get("external_session"))
+                    remember_session(state, worker, e.session_id, e.session_id == relay.get("external_session"), opts=opts)
                     save_state(thread, state)
             if isinstance(e, CallError) and e.blocked:
                 # 帳務或權限問題（例如 workspace 沒有 credits）：等待也不會恢復，直接停下讓人處理
@@ -1157,9 +1379,9 @@ def cmd_work(ws: Workspace, args):
                 append_progress(thread, msg, str(e)[:500])
                 log(msg)
                 return
-            if exhausted or quota.low(party_usage(worker)):
+            if exhausted or quota.low(party_usage(worker, relay.get("model"))):
                 quota.refresh(force=True)
-                if not quota.low(party_usage(worker)):
+                if not quota.low(party_usage(worker, relay.get("model"))):
                     # 判定額度用盡，但查到的額度看不出不足（快取過舊或查不到）：先等一段時間，不要立刻重試；有次數上限
                     quota_retries += 1
                     if quota_retries > QUOTA_RETRIES:
@@ -1193,14 +1415,21 @@ def cmd_work(ws: Workspace, args):
         guard_config(ws.root, config_before, thread, worker)
         guard_files(ws.root, files_before, thread, worker, round_ts)
         changed = git_status(ws.root)
+        usage_entry = shares.record_call(ws.root, worker, thread.name, "work", opts["_stats"], True)
 
         with thread_lock(thread, wait=WORKER_LOCK_WAIT):
             state = load_state(thread)
-            add_message(thread, state, worker, reply, via_cli=True, meta=f"接手第 {relay['rounds'] + 1} 輪, {meta}")
+            add_message(thread, state, worker, reply, via_cli=True, meta=f"接手第 {relay['rounds'] + 1} 輪, {meta}",
+                        stats=usage_entry)
             state["relay"].update(session_id=session_id, rounds=relay["rounds"] + 1, updated=now_str())
+            if usage_entry.get("model") and not state["relay"].get("model_reported"):
+                state["relay"]["model_reported"] = usage_entry["model"]   # CLI 回報的實際模型
+                if state["relay"].get("frozen") and not state["relay"].get("model"):
+                    # 分派時查不到 CLI 預設模型：用第一輪回報的實際模型凍結，之後各輪明確指定，不受 CLI 預設變動影響
+                    state["relay"].update(model=usage_entry["model"], model_known=True)
             if STREAM_INTERRUPTED in meta:
                 state["relay"]["interrupted_rounds"] = (state["relay"].get("interrupted_rounds") or 0) + 1
-            remember_session(state, worker, session_id, session_id == relay.get("external_session"))
+            remember_session(state, worker, session_id, session_id == relay.get("external_session"), opts=opts)
             save_state(thread, state)
         rounds += 1
         quota_retries = 0
@@ -1208,6 +1437,15 @@ def cmd_work(ws: Workspace, args):
         if before != changed:
             add_system_note(thread, f"📝 本輪檔案變動：\n{changed or '(工作區已乾淨)'}")
 
+        if has_marker(reply, UPGRADE):
+            # 接手方判斷這次的等級（模型）不足：停下，由分派方以較高等級重新分派（新的對話，不在原對話中途換模型）
+            relay = update_relay(thread, status="needs_upgrade")
+            level = config.TIER_LABELS.get(relay.get("tier")) or "未指定"
+            msg = (f"{NAMES[worker]} 判斷這次的等級（{level}，{relay.get('model') or 'CLI 預設模型'}）不足，需要升級；"
+                   f"請 {NAMES[owner]} 以較高等級重新分派（assign --tier heavy，會開新的對話）。")
+            add_system_note(thread, f"⬆️ {msg}")
+            append_progress(thread, "需要升級", msg)
+            return
         if has_marker(reply, "【工作完成】"):
             relay = update_relay(thread, status="done")
             warning = unverified_warning(relay)
@@ -1559,10 +1797,12 @@ def cmd_parties(ws: Workspace, args):
     models_, efforts, shares_ = parse_pairs(args.model), parse_pairs(args.effort), parse_pairs(args.share)
     subagents = parse_pairs(args.subagents)
     sandboxes = parse_pairs(args.sandbox)
-    if enable or disable or models_ or efforts or shares_ or subagents or sandboxes:
+    tiers, tier_fallbacks = parse_tier_pairs(getattr(args, "tier", None)), parse_tier_pairs(getattr(args, "tier_fallback", None))
+    if enable or disable or models_ or efforts or shares_ or subagents or sandboxes or tiers or tier_fallbacks:
         guard_nested()
         try:
-            settings = config.update_parties(ws.root, enable, disable, models_, efforts, shares_, subagents, sandboxes)
+            settings = config.update_parties(ws.root, enable, disable, models_, efforts, shares_, subagents, sandboxes,
+                                             tiers, tier_fallbacks)
         except ValueError as e:
             sys.exit(str(e))
     else:
@@ -1571,23 +1811,39 @@ def cmd_parties(ws: Workspace, args):
     if args.json:
         print(json.dumps({"workspace": str(ws.root), "parties": settings, "work": work,
                           "share_days": shares.SHARE_DAYS, "summarizer": ws.config().get("summarizer"),
-                          "install": install_status(ws), "core": core_info()},
+                          "install": install_status(ws), "core": core_info(),
+                          "usage": shares.recent_usage(ws.root, AI_PARTIES)},
                          ensure_ascii=False, indent=2))
         return
+    usage = shares.recent_usage(ws.root, AI_PARTIES)
     total = sum(s["share"] for s in settings.values() if s["enabled"])
-    done = sum(work.get(p, 0) for p, s in settings.items() if s["enabled"])
+    used = sum(usage[p]["tokens_7d"] for p, s in settings.items() if s["enabled"])
     print(f"工作區：{ws.root}")
     for p, s in settings.items():
         detail = "、".join(v for v in (s["model"], s["effort"]) if v) or "CLI 預設"
         line = f"  {'☑' if s['enabled'] else '☐'} {NAMES[p]:<12} {detail}"
         if s["enabled"]:
+            # 分配比例只當 token 用量的參考目標（自動挑選依剩餘額度，見 shares.pick）；0 表示不自動分派給它
             target = f"{int(s['share'] / total * 100 + 0.5)}%" if total else "-"
-            actual = f"{int(work.get(p, 0) / done * 100 + 0.5)}%" if done else "-"
-            line += f"｜分配比例 {s['share']}（目標 {target}，近 {shares.SHARE_DAYS:g} 天 {work.get(p, 0)} 輪 {actual}）"
+            actual = f"{int(usage[p]['tokens_7d'] / used * 100 + 0.5)}%" if used else "-"
+            line += (f"｜分配比例 {s['share']}（token 目標 {target}，近 {shares.SHARE_DAYS:g} 天實際 {actual}）"
+                     if s["share"] else "｜分配比例 0（不自動分派）")
             line += f"｜內建子代理：{'允許' if s['subagents'] else '不允許'}"
             if s.get("sandbox"):
                 line += f"｜沙箱：{s['sandbox']}"
         print(line)
+        levels = [f"{config.TIER_LABELS[k]} {t['model']}" + (f"、{t['effort']}" if t.get("effort") else "")
+                  + (f"（替代 {t['fallback']['model']}）" if t.get("fallback") else "")
+                  for k, t in s["tiers"].items() if t]
+        if levels:
+            print(f"      等級：{'；'.join(levels)}")
+        u = usage.get(p) or {}
+        if u.get("calls_7d") or u.get("dispatch_auto") or u.get("dispatch_explicit"):
+            print(f"      近 {shares.SHARE_DAYS:g} 天：已觀測 {u['tokens_7d']:,} tokens"
+                  + (f"（另有 {u['calls_missing_tokens']} 次呼叫缺資料）" if u["calls_missing_tokens"] else "")
+                  + f"｜分派：自動 {u['dispatch_auto']}、指定 {u['dispatch_explicit']}"
+                  + f"｜子代理啟動 {u['subagents_started_7d']} 次" + (f"（{u['subagents_unobserved']} 次呼叫未觀測）"
+                                                                    if u["subagents_unobserved"] else ""))
 
 
 def cmd_wait(ws: Workspace, args):
@@ -2238,7 +2494,13 @@ def main(argv=None):
         p = sub.add_parser(name, help="把工作分派給某一方在背景執行" + ("（assign 的別名）" if name == "relay" else ""))
         p.add_argument("thread")
         p.add_argument("--from", dest="sender", required=True, choices=who)
-        p.add_argument("--to", help="接手方（預設：剩餘額度最多的另一方）")
+        p.add_argument("--to", help="接手方（預設：勾選的其他 AI 中，這次等級對應額度池剩餘 % 最高的一方）")
+        p.add_argument("--tier", choices=config.TIER_LEVELS,
+                       help="等級：依專案設定（agora parties --tier）選模型；沒給時用標準等級，但不覆蓋討論串明確指定的模型")
+        p.add_argument("--model", help="這次分派直接指定模型（不能和 --tier 同用）")
+        p.add_argument("--effort", help="這次分派的推理強度")
+        p.add_argument("--subagents", choices=("on", "off"), help="這次分派是否允許內建子代理（預設依專案設定）")
+        p.add_argument("--trigger", choices=("manual", "relay"), help="觸發情境（額度交接用 relay；預設 manual）")
         p.add_argument("--session", help="接續接手方先前的對話 ID")
         p.add_argument("--from-summary", action="store_true", help="用討論串總結（summarize）的工作單分派")
         p.add_argument("--yes", action="store_true", help="總結可能已過期時仍確認分派")
@@ -2288,7 +2550,12 @@ def main(argv=None):
     p.add_argument("--share", action="append",
                    help="自動分派的工作比例，例如 --share claude=5 --share codex=3；0 表示不自動分派給它，default 改回 1")
     p.add_argument("--subagents", action="append",
-                   help="被 Agora 呼叫時能否啟動自己的內建子代理，例如 --subagents claude=off（on / off，預設 on）")
+                   help="被 Agora 呼叫時能否啟動自己的內建子代理，例如 --subagents claude=on（on / off，預設 off，評估中）")
+    p.add_argument("--tier", action="append",
+                   help="分派等級的模型，例如 --tier antigravity.heavy=gemini-4-argon-high --tier claude.light=haiku:low"
+                        "（light / standard / heavy；值為 default 表示清除、沿用目前模型）")
+    p.add_argument("--tier-fallback", action="append",
+                   help="等級的替代模型（該等級額度不足、其他 AI 的主模型也不足時才用），例如 --tier-fallback claude.heavy=sonnet:high")
     p.add_argument("--sandbox", action="append",
                    help="Codex 接手工作時的沙箱，例如 --sandbox codex=danger-full-access"
                         "（workspace-write / danger-full-access / read-only，default 改回 workspace-write；討論一律唯讀）")

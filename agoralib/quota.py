@@ -662,6 +662,25 @@ def usage(party: str) -> dict | None:
     return result
 
 
+def usage_for(party: str, model: str | None = None) -> dict | None:
+    """這一方用 model 時的額度：Antigravity 各模型系列是獨立額度池（例如 Argon 與 Flash），回傳該池的剩餘與重置時間；
+    Claude、Codex 各模型共用同一份額度，或沒指定模型時，回傳整體額度。
+    Antigravity 指定了模型卻對不到它的額度池（例如快取裡沒有 Argon 池）時回傳 None（未知），
+    不能拿其他池（例如 Flash）的剩餘冒充，否則可能錯派"""
+    u = usage(party)
+    if party != "antigravity" or not u or not model:
+        return u
+    pools = u.get("pools") or {}
+    key = _match_agy_pool(pools, model) if pools else None
+    if key and key == "gemini" and _pool_of(model, model) != "gemini":
+        key = None   # _match_agy_pool 對不到時退回通用的 gemini 池，不能當成這個模型的池
+    pool = pools.get(key) if key else None
+    if not pool:
+        return None
+    return {**u, "remaining_pct": pool["remaining_pct"], "resets_at": pool.get("resets_at"), "window": key,
+            "window_label": pool.get("short_label") or pool.get("label")}
+
+
 def all_usage() -> dict:
     return {p: usage(p) for p in USAGE}
 

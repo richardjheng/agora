@@ -20,7 +20,7 @@ description: 額度快用完時把工作交接給還有額度的 AI、回來後�
    - 如何驗證（要跑的測試指令）
 3. 交接（若目前沒有相關討論串，先 `python D:/github/agora/agora.py new "主題"`）：
    ```powershell
-   python D:/github/agora/agora.py assign <thread> --from <你> --to <AI> --file <交接單路徑>
+   python D:/github/agora/agora.py assign <thread> --from <你> --to <AI> --trigger relay --file <交接單路徑>
    ```
    `--to` 用 ⚠️ 提醒裡指名的接手方（已依此專案的工作分配比例與額度挑好）；沒有提醒時可省略 `--to`，
    Agora 會在啟用的 AI 中依分配比例挑選。

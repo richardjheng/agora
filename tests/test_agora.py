@@ -610,10 +610,10 @@ class TestSubagents(unittest.TestCase):
     def test_setting_defaults_and_update(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            self.assertTrue(config.party_settings(root)["codex"]["subagents"])
+            self.assertFalse(config.party_settings(root)["codex"]["subagents"])   # 預設不允許（評估中）
+            self.assertTrue(config.update_parties(root, subagents={"codex": "on"})["codex"]["subagents"])
             settings = config.update_parties(root, subagents={"codex": "off"})
             self.assertFalse(settings["codex"]["subagents"])
-            self.assertTrue(config.update_parties(root, subagents={"codex": "on"})["codex"]["subagents"])
             with self.assertRaises(ValueError):
                 config.update_parties(root, subagents={"codex": "maybe"})
 
@@ -778,6 +778,326 @@ class TestHookAdvice(unittest.TestCase):
 
     def test_healthy_self_no_advice(self):
         self.assertEqual(quota_hook.advice("claude", {"claude": self.usage(50), "codex": self.usage(1)}), (None, None))
+
+
+def pct(value, reset_in=3600):
+    return {"remaining_pct": value, "resets_at": time.time() + reset_in, "updated_at": time.time()}
+
+
+class TestTiers(unittest.TestCase):
+    """輕量／標準／重度：先定等級再挑 AI；模型在分派時凍結；額度不足只用使用者設定的替代模型，不擅自降級"""
+
+    def setUp(self):
+        # 不讀這台電腦的模型清單快取（CLI 預設模型）；需要時各測試自己寫入
+        self._cache = tempfile.TemporaryDirectory()
+        patcher = patch.object(cli.models, "CACHE", Path(self._cache.name) / "models.json")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self._cache.cleanup)
+
+    def setup(self, tmp):
+        ws = cli.Workspace(Path(tmp))
+        config.update_parties(ws.root, models={"antigravity": "gemini-3.8-flash-high"},
+                              tiers={"antigravity.heavy": "gemini-4-argon-high", "claude.heavy": "opus:max",
+                                     "claude.standard": "sonnet"},
+                              tier_fallbacks={"claude.heavy": "sonnet:high"})
+        return ws
+
+    def test_config_tiers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = self.setup(tmp)
+            tiers = config.party_settings(ws.root)["claude"]["tiers"]
+            self.assertEqual(tiers["heavy"], {"model": "opus", "effort": "max", "fallback": {"model": "sonnet", "effort": "high"}})
+            self.assertIsNone(tiers["light"])
+            config.update_parties(ws.root, tiers={"claude.heavy": "fable"})          # 換模型保留替代模型
+            self.assertEqual(config.party_settings(ws.root)["claude"]["tiers"]["heavy"]["fallback"]["model"], "sonnet")
+            config.update_parties(ws.root, tiers={"claude.heavy": "default"})
+            self.assertIsNone(config.party_settings(ws.root)["claude"]["tiers"]["heavy"])
+            for bad in ({"tiers": {"claude.huge": "x"}}, {"tier_fallbacks": {"codex.heavy": "x"}}):
+                with self.assertRaises(ValueError):
+                    config.update_parties(ws.root, **bad)
+
+    def test_plan_model_precedence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = self.setup(tmp)
+            s = state_with(["claude", "codex", "antigravity"])
+            self.assertEqual(cli.plan_model(ws, s, "claude", "heavy", None, None)["model"], "opus")
+            self.assertEqual(cli.plan_model(ws, s, "claude", None, None, None)["model"], "sonnet")   # 沒給等級用標準
+            self.assertEqual(cli.plan_model(ws, s, "claude", "heavy", "haiku", None)["model"], "haiku")
+            self.assertEqual(cli.plan_model(ws, s, "antigravity", "light", None, None)["model"],
+                             "gemini-3.8-flash-high")                                          # 沒設定的等級沿用專案模型
+            s["parties"]["claude"]["model"] = "fable"                                           # 討論串明確指定
+            self.assertEqual(cli.plan_model(ws, s, "claude", None, None, None)["model"], "fable")
+            self.assertEqual(cli.plan_model(ws, s, "claude", "heavy", None, None)["model"], "opus")
+
+    def test_fallback_only_when_configured_and_available(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = self.setup(tmp)
+            s = state_with(["claude"])
+            plan = cli.plan_model(ws, s, "claude", "heavy", None, None)
+            with patch.object(cli, "party_usage", side_effect=lambda p, m=None: pct(2 if m == "opus" else 50)):
+                chosen, _ = cli.choose_model("claude", plan)
+            self.assertEqual((chosen["model"], chosen["effort"], chosen["fallback_used"]), ("sonnet", "high", True))
+            with patch.object(cli, "party_usage", side_effect=lambda p, m=None: pct(2)):
+                chosen, u = cli.choose_model("claude", plan)
+            self.assertEqual(chosen["model"], "opus")   # 替代模型也不足：不降級，維持原等級（之後等重置）
+            plan = cli.plan_model(ws, s, "claude", "standard", None, None)   # 沒設定替代模型
+            with patch.object(cli, "party_usage", return_value=pct(2)):
+                self.assertEqual(cli.choose_model("claude", plan)[0]["model"], "sonnet")
+
+    def test_auto_pick_uses_the_tier_pool(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = self.setup(tmp)
+            s = state_with(["claude", "codex", "antigravity"])
+            pools = {("antigravity", "gemini-4-argon-high"): 30, ("antigravity", "gemini-3.8-flash-high"): 99,
+                     ("codex", None): 60}
+            with patch.object(cli, "party_usage", side_effect=lambda p, m=None: pct(pools[(p, m)])), \
+                    patch("sys.stdout", io.StringIO()):
+                worker, plan, decision = cli.pick_worker(ws, "claude", ["claude", "codex", "antigravity"], s, "heavy")
+                self.assertEqual((worker, decision["selection"]), ("codex", "auto"))   # 重度看 Argon 30%，不是 Flash 99%
+                worker, plan, _ = cli.pick_worker(ws, "claude", ["claude", "codex", "antigravity"], s, "light")
+                self.assertEqual((worker, plan["model"]), ("antigravity", "gemini-3.8-flash-high"))
+            self.assertEqual(decision["candidates"]["antigravity"]["remaining_pct"], 30)
+
+    def test_all_low_waits_for_earliest_reset_or_stops_when_unknown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = self.setup(tmp)
+            s = state_with(["claude", "codex", "antigravity"])
+            usage = {"codex": pct(2, 7200), "antigravity": pct(3, 600)}
+            with patch.object(cli, "party_usage", side_effect=lambda p, m=None: usage[p]), patch("sys.stdout", io.StringIO()):
+                worker, _, decision = cli.pick_worker(ws, "claude", ["claude", "codex", "antigravity"], s, "heavy")
+            self.assertEqual((worker, decision["waiting"]), ("antigravity", True))
+            unknown = {"codex": {**pct(2), "resets_at": None}, "antigravity": None}
+            with patch.object(cli, "party_usage", side_effect=lambda p, m=None: unknown[p]), \
+                    self.assertRaises(SystemExit) as ctx:
+                cli.pick_worker(ws, "claude", ["claude", "codex", "antigravity"], s, "heavy")
+            self.assertIn("不知道何時重置", str(ctx.exception.code))
+
+    def assign(self, ws, **kw):
+        args = {"thread": "t1", "sender": "claude", "to": None, "message": "做事", "file": None, "session": None,
+                "from_summary": False, "yes": False, "tier": None, "model": None, "effort": None, "subagents": None,
+                "trigger": None, **kw}
+        with patch.object(cli.jobs, "spawn", return_value=123), patch.object(cli.jobs, "pid_started", return_value=None), \
+                patch.object(cli.snapshot, "create", return_value={}), patch("sys.stdout", io.StringIO()), \
+                patch.object(cli, "party_usage", return_value=pct(80)):
+            os.environ.pop(cli.NESTED_ENV, None)
+            cli.cmd_assign(ws, type("Args", (), args)())
+
+    def test_assign_freezes_model_and_logs_decision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = self.setup(tmp)
+            thread = ws.threads / "t1"
+            thread.mkdir(parents=True)
+            cli.save_state(thread, state_with(["claude", "codex", "antigravity"]))
+            (thread / "transcript.md").write_text("", encoding="utf-8")
+            self.assign(ws, to="antigravity", tier="heavy", subagents="on")
+            relay = cli.load_state(thread)["relay"]
+            self.assertEqual((relay["model"], relay["tier"], relay["selection"], relay["subagents"], relay["frozen"]),
+                             ("gemini-4-argon-high", "heavy", "explicit", True, True))
+            log = [json.loads(x) for x in shares.log_path(ws.root).read_text(encoding="utf-8").splitlines()]
+            self.assertEqual([(e["kind"], e["party"], e["selection"]) for e in log], [("dispatch", "antigravity", "explicit")])
+            self.assertIn("📋 指定 Antigravity（重度等級：gemini-4-argon-high", (thread / "transcript.md").read_text(encoding="utf-8"))
+            usage = shares.recent_usage(ws.root, parties.AI_PARTIES)
+            self.assertEqual((usage["antigravity"]["dispatch_explicit"], usage["antigravity"]["rounds_7d"]), (1, 0))
+
+    def test_assign_rejects_conflicting_options(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = self.setup(tmp)
+            thread = ws.threads / "t1"
+            thread.mkdir(parents=True)
+            cli.save_state(thread, state_with(["claude", "codex"]))
+            for kw in ({"session": "s1", "tier": "heavy"}, {"session": "s1", "effort": "high"}, {"model": "x", "tier": "light"}):
+                with self.assertRaises(SystemExit):
+                    self.assign(ws, to="codex", **kw)
+
+    def run_frozen_worker(self, reply):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = self.setup(tmp)
+            thread = ws.threads / "t1"
+            thread.mkdir(parents=True)
+            state = state_with(["claude", "antigravity"])
+            state["relay"] = {"worker": "antigravity", "from": "claude", "handoff": "做事", "rounds": 0, "status": "starting",
+                              "frozen": True, "tier": "heavy", "model": "gemini-4-argon-high", "effort": None, "subagents": None}
+            cli.save_state(thread, state)
+            (thread / "transcript.md").write_text("", encoding="utf-8")
+            config.update_parties(ws.root, models={"antigravity": "changed-mid-way"})   # 分派後才改專案設定
+            seen = {}
+
+            def agy(prompt, session_id, opts, work, workspace, timeout, scratch, live=None):
+                seen.update(model=opts["model"], prompt=prompt)
+                opts["_stats"].update(total_tokens=1234, model="gemini-4-argon-high", subagents=None)
+                return reply, "s1", "1s"
+
+            with patch.dict(cli.CALLERS, {"antigravity": agy}), patch.object(cli, "party_usage", return_value=pct(80)), \
+                    patch.object(cli, "git_status", return_value=""), patch.object(quota, "refresh"), \
+                    patch.object(cli, "MAX_WORK_ROUNDS", 1), patch("sys.stdout", io.StringIO()):
+                cli.cmd_work(ws, type("Args", (), {"thread": "t1"})())
+            return seen, cli.load_state(thread), shares.recent_usage(ws.root, parties.AI_PARTIES), \
+                (thread / "transcript.md").read_text(encoding="utf-8")
+
+    def test_worker_uses_frozen_model_and_records_usage(self):
+        seen, state, usage, _ = self.run_frozen_worker("做完一步")
+        self.assertEqual(seen["model"], "gemini-4-argon-high")
+        self.assertIn("這次的等級：重度（gemini-4-argon-high）", seen["prompt"])
+        self.assertEqual(state["messages"][-1]["stats"]["total_tokens"], 1234)
+        self.assertEqual((usage["antigravity"]["tokens_7d"], usage["antigravity"]["calls_7d"],
+                          usage["antigravity"]["rounds_7d"], usage["antigravity"]["subagents_unobserved"]), (1234, 1, 1, 1))
+
+    def test_worker_needs_upgrade(self):
+        _, state, _, transcript = self.run_frozen_worker("這個等級不夠，需要跨模組重構。\n【需要升級】")
+        self.assertEqual(state["relay"]["status"], "needs_upgrade")
+        self.assertIn("需要升級", transcript)
+        self.assertEqual(cli.relay_exit_code(state["relay"], False), 1)
+
+    # ── Codex 審查指出的問題（回歸測試） ──
+
+    def test_parties_tier_options_are_registered(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = io.StringIO()
+            with patch("sys.stdout", out):
+                os.environ.pop(cli.NESTED_ENV, None)
+                cli.main(["--workspace", tmp, "parties", "--tier", "claude.heavy=opus:max",
+                          "--tier-fallback", "claude.heavy=sonnet", "--json"])
+            tiers = json.loads(out.getvalue())["parties"]["claude"]["tiers"]
+            self.assertEqual(tiers["heavy"]["model"], "opus")
+            self.assertEqual(tiers["heavy"]["fallback"]["model"], "sonnet")
+
+    def test_effort_only_keeps_the_tier_model(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = self.setup(tmp)
+            plan = cli.plan_model(ws, state_with(["claude"]), "claude", "heavy", None, "high")
+            self.assertEqual((plan["model"], plan["effort"]), ("opus", "high"))
+
+    def test_cli_default_is_resolved_or_marked_unknown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = cli.Workspace(Path(tmp))
+            plan = cli.plan_model(ws, state_with(["codex"]), "codex", None, None, None)
+            self.assertEqual((plan["model"], plan["model_known"]), (None, False))   # 查不到：不宣稱已凍結
+            cli.models.CACHE.write_text(json.dumps({"codex": {"default": {"model": "gpt-6-astra", "effort": "high"}}}),
+                                        encoding="utf-8")
+            plan = cli.plan_model(ws, state_with(["codex"]), "codex", None, None, None)
+            self.assertEqual((plan["model"], plan["effort"], plan["model_known"]), ("gpt-6-astra", "high", True))
+
+    def test_session_keeps_its_original_settings(self):
+        """延續對話沿用那段對話原本的模型；專案設定之後改了也不換；查不到原設定時不指定模型，不拿目前設定冒充"""
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = self.setup(tmp)
+            old = ws.threads / "t0"
+            old.mkdir(parents=True)
+            s0 = state_with(["claude"])
+            cli.remember_session(s0, "claude", "s-old", opts={"model": "opus", "effort": "max"})
+            cli.save_state(old, s0)
+            config.update_parties(ws.root, models={"claude": "haiku"}, efforts={"claude": "low"})   # 之後才改設定
+            thread = ws.threads / "t1"
+            thread.mkdir(parents=True)
+            cli.save_state(thread, state_with(["claude", "codex"]))
+            (thread / "transcript.md").write_text("", encoding="utf-8")
+            with patch.object(cli, "party_usage", return_value=pct(1)):   # 額度不足也不換替代模型
+                self.assign(ws, sender="codex", to="claude", session="s-old")
+            relay = cli.load_state(thread)["relay"]
+            self.assertEqual((relay["model"], relay["effort"], relay["tier"], relay["fallback_used"], relay["model_known"]),
+                             ("opus", "max", None, False, True))
+            cli.save_state(thread, state_with(["claude", "codex"]))
+            self.assign(ws, sender="codex", to="claude", session="s-unknown")
+            relay = cli.load_state(thread)["relay"]
+            self.assertEqual((relay["model"], relay["effort"], relay["model_known"]), (None, None, False))
+            with self.assertRaises(SystemExit):
+                self.assign(ws, session="s-old")   # --session 必須搭配 --to
+            # 記錄過但模型是 CLI 預設（None）、也沒有回報實際模型：仍是未知
+            cli.remember_session(s0, "claude", "s-default", opts={"model": None, "effort": None})
+            cli.save_state(old, s0)
+            cli.save_state(thread, state_with(["claude", "codex"]))
+            self.assign(ws, sender="codex", to="claude", session="s-default")
+            relay = cli.load_state(thread)["relay"]
+            self.assertEqual((relay["model"], relay["model_known"]), (None, False))
+            # 之後 CLI 回報了實際模型：補上，延續時就能明確指定
+            cli.remember_session(s0, "claude", "s-default", opts={"model": None, "_stats": {"model": "claude-opus-5-5"}})
+            cli.save_state(old, s0)
+            cli.save_state(thread, state_with(["claude", "codex"]))
+            self.assign(ws, sender="codex", to="claude", session="s-default")
+            relay = cli.load_state(thread)["relay"]
+            self.assertEqual((relay["model"], relay["model_known"]), ("claude-opus-5-5", True))
+
+    def test_reported_model_freezes_when_default_unknown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = cli.Workspace(Path(tmp))
+            thread = ws.threads / "t1"
+            thread.mkdir(parents=True)
+            state = state_with(["claude", "codex"])
+            state["relay"] = {"worker": "codex", "from": "claude", "handoff": "做事", "rounds": 0, "status": "starting",
+                              "frozen": True, "tier": None, "model": None, "effort": None, "subagents": None}
+            cli.save_state(thread, state)
+            (thread / "transcript.md").write_text("", encoding="utf-8")
+            models_seen = []
+
+            def codex(prompt, session_id, opts, work, workspace, timeout, scratch, live=None):
+                models_seen.append(opts["model"])
+                opts["_stats"]["model"] = "gpt-6-astra"
+                return "做完一步", "s1", "1s"
+
+            with patch.dict(cli.CALLERS, {"codex": codex}), patch.object(cli, "party_usage", return_value=pct(80)), \
+                    patch.object(cli, "git_status", return_value=""), patch.object(quota, "refresh"), \
+                    patch.object(cli, "MAX_WORK_ROUNDS", 2), patch("sys.stdout", io.StringIO()):
+                cli.cmd_work(ws, type("Args", (), {"thread": "t1"})())
+            self.assertEqual(models_seen, [None, "gpt-6-astra"])   # 第二輪起明確使用第一輪回報的模型
+            self.assertTrue(cli.load_state(thread)["relay"]["model_known"])
+
+    def test_missing_pool_is_unknown_not_another_pool(self):
+        u = {"remaining_pct": 97.0, "resets_at": 1, "pools": {
+            "gemini-3.8-flash": {"label": "Gemini 3.8 Flash", "short_label": "Flash 3.8", "remaining_pct": 97.0, "resets_at": 1}}}
+        with patch.object(quota, "usage", return_value=u):
+            self.assertIsNone(quota.usage_for("antigravity", "gemini-4-argon-high"))
+        with patch.object(quota, "usage", return_value={"remaining_pct": 97.0}):   # 沒有任何池的資料
+            self.assertIsNone(quota.usage_for("antigravity", "gemini-4-argon-high"))
+
+    def test_fallback_only_after_all_primaries_are_low(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = self.setup(tmp)
+            config.update_parties(ws.root, models={"codex": "gpt-6.1-sol"})
+            s = state_with(["claude", "codex", "antigravity"])
+            pools = {("antigravity", "gemini-4-argon-high"): 30, ("codex", "gpt-6.1-sol"): 65,
+                     ("claude", "opus"): 2, ("claude", "sonnet"): 99}
+            with patch.object(cli, "party_usage", side_effect=lambda p, m=None: pct(pools[(p, m)])), \
+                    patch("sys.stdout", io.StringIO()):
+                worker, plan, _ = cli.pick_worker(ws, "antigravity", ["claude", "codex", "antigravity"], s, "heavy")
+            self.assertEqual((worker, plan.get("fallback_used")), ("codex", None))   # Codex 主模型 65% 優先於 Claude 替代模型 99%
+            pools[("codex", "gpt-6.1-sol")] = 1
+            with patch.object(cli, "party_usage", side_effect=lambda p, m=None: pct(pools[(p, m)])), \
+                    patch("sys.stdout", io.StringIO()):
+                worker, plan, _ = cli.pick_worker(ws, "antigravity", ["claude", "codex", "antigravity"], s, "heavy")
+            self.assertEqual((worker, plan["model"], plan["fallback_used"]), ("claude", "sonnet", True))
+
+    def test_usage_source_and_failed_calls_are_saved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            entry = shares.record_call(root, "codex", "t1", "work", {"usage_source": "codex:turn.failed",
+                                                                    "input_tokens": 5}, False)
+            self.assertEqual(entry["usage_source"], "codex:turn.failed")
+            thread = root / ".agora" / "threads" / "t1"
+            thread.mkdir(parents=True)
+            cli.save_state(thread, state_with(["codex"]))
+            cli.remember_failed_call(thread, entry)
+            failed = cli.load_state(thread)["failed_calls"]
+            self.assertEqual((failed[0]["ok"], failed[0]["input_tokens"]), (False, 5))
+
+    def test_call_tokens_avoid_double_counting_cache(self):
+        self.assertEqual(shares.call_tokens({"total_tokens": 10, "input_tokens": 99}), 10)
+        self.assertEqual(shares.call_tokens({"input_tokens": 100, "output_tokens": 5, "cached_tokens": 80,
+                                             "cached_in_input": True}), 105)
+        self.assertEqual(shares.call_tokens({"input_tokens": 100, "output_tokens": 5, "cached_tokens": 80,
+                                             "cached_in_input": False}), 185)
+        self.assertIsNone(shares.call_tokens({"input_tokens": 100}))
+
+    def test_usage_for_antigravity_pool(self):
+        u = {"remaining_pct": 97.0, "resets_at": 1, "pools": {
+            "gemini-4-argon": {"label": "Gemini 4 Argon", "short_label": "Argon", "remaining_pct": 30.0, "resets_at": 2},
+            "gemini-3.8-flash": {"label": "Gemini 3.8 Flash", "short_label": "Flash 3.8", "remaining_pct": 97.0, "resets_at": 1}}}
+        with patch.object(quota, "usage", return_value=u):
+            self.assertEqual(quota.usage_for("antigravity", "gemini-4-argon-high")["remaining_pct"], 30.0)
+            self.assertEqual(quota.usage_for("antigravity", "gemini-4-argon-high")["window_label"], "Argon")
+            self.assertEqual(quota.usage_for("antigravity", None)["remaining_pct"], 97.0)
+        with patch.object(quota, "usage", return_value={"remaining_pct": 60.0}):
+            self.assertEqual(quota.usage_for("claude", "opus")["remaining_pct"], 60.0)
 
 
 def routing_tag():
@@ -1249,8 +1569,8 @@ class TestPartySettings(unittest.TestCase):
             config.update_parties(ws.root, models={"codex": "proj-model", "claude": "opus"}, efforts={"codex": "low"})
             s = state_with(["claude", "codex"])
             s["parties"]["codex"]["model"] = "thread-model"
-            self.assertEqual(cli.call_opts(ws, s, "codex"), {"model": "thread-model", "effort": "low", "sandbox": None, "subagents": True, "add_dirs": []})
-            self.assertEqual(cli.call_opts(ws, s, "claude"), {"model": "opus", "effort": None, "sandbox": None, "subagents": True, "add_dirs": []})
+            self.assertEqual(cli.call_opts(ws, s, "codex"), {"model": "thread-model", "effort": "low", "sandbox": None, "subagents": False, "add_dirs": []})
+            self.assertEqual(cli.call_opts(ws, s, "claude"), {"model": "opus", "effort": None, "sandbox": None, "subagents": False, "add_dirs": []})
 
     def test_disabled_party_is_not_asked_to_reply(self):
         s = state_with(["claude", "antigravity", "codex"])
@@ -1273,14 +1593,13 @@ class TestShares(unittest.TestCase):
     def ok(self, pct=50):
         return {"remaining_pct": pct, "resets_at": time.time() + 3600, "updated_at": time.time()}
 
-    def test_assignments_follow_shares(self):
-        weights = {"claude": 5, "codex": 3, "antigravity": 2}
-        usages = {p: self.ok() for p in weights}
-        work = {}
-        for _ in range(10):
-            p = shares.pick(weights, weights, work, usages)
-            work[p] = work.get(p, 0) + 1
-        self.assertEqual(work, {"claude": 5, "codex": 3, "antigravity": 2})
+    def test_picks_most_remaining_quota(self):
+        """挑剩餘 % 最高的一方；分配比例只當 0 = 不自動分派，不影響排序"""
+        weights = {"claude": 5, "codex": 3, "antigravity": 1}
+        usages = {"claude": self.ok(40), "codex": self.ok(60), "antigravity": self.ok(95)}
+        self.assertEqual(shares.pick(weights, weights, {}, usages), "antigravity")
+        self.assertEqual(shares.pick(weights, {**weights, "antigravity": 0}, {}, usages), "codex")
+        self.assertIsNone(shares.pick(["claude"], weights, {}, {"claude": None}))   # 額度未知不當作滿額
 
     def test_skips_zero_share_and_low_quota(self):
         usages = {"claude": self.ok(), "codex": self.ok(2), "antigravity": self.ok()}
@@ -1313,9 +1632,11 @@ class TestShares(unittest.TestCase):
             shares.log_path(root).write_text("\n".join(bad_lines) + "\n", encoding="utf-8")
             self.assertEqual(shares.recent_work(root), {"codex": 1})
 
-    def test_hook_hands_off_by_share_not_just_quota(self):
+    def test_hook_hands_off_to_most_remaining_quota(self):
         usages = {"claude": self.ok(3), "antigravity": self.ok(90), "codex": self.ok(40)}
         _, text = quota_hook.advice("claude", usages, {"antigravity": 1, "codex": 3}, {"antigravity": 0, "codex": 1})
+        self.assertIn("交接給 Antigravity", text)
+        _, text = quota_hook.advice("claude", usages, {"antigravity": 0, "codex": 3})
         self.assertIn("交接給 Codex", text)
 
     def test_hook_with_no_eligible_partner_stops(self):
@@ -1730,12 +2051,12 @@ class TestLock(unittest.TestCase):
 class TestVersion(unittest.TestCase):
     def test_version_defined_and_cli_flag(self):
         from agoralib import __version__
-        self.assertEqual(__version__, "0.2.18")
+        self.assertEqual(__version__, "0.2.19")
         out = io.StringIO()
         with patch("sys.stdout", out), self.assertRaises(SystemExit) as cm:
             cli.main(["--version"])
         self.assertEqual(cm.exception.code, 0)
-        self.assertIn("0.2.18", out.getvalue())
+        self.assertIn("0.2.19", out.getvalue())
 
 
 class TestQuotaWindows(unittest.TestCase):
@@ -2355,7 +2676,8 @@ class TestBuildAndSandbox(unittest.TestCase):
     def test_work_preamble_mentions_build_only_when_configured(self):
         fmt = dict(me="Codex", owner="Claude", human="Richard", workspace="W", progress="P", control="C",
                    threshold=5, agora="agora")
-        text = cli.WORK_PREAMBLE.format(**fmt, build_cmd="", finish_cmds="`agora check`")
+        text = cli.WORK_PREAMBLE.format(**fmt, build_cmd="", finish_cmds="`agora check`", file_rule=cli.FILE_RULE,
+                                        tier_line="未指定")
         self.assertNotIn("agora build", text)
 
 

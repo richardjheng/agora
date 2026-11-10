@@ -70,14 +70,28 @@ description: 透過 Agora 與 Antigravity（Gemini）、Codex 進行多輪技術
 
 ## 分派工作
 
-討論出分工後，把工作單（範圍、不能碰的檔案、驗收方式）寫成檔案再分派，或先 `summarize` 再用總結的工作單：
+討論出分工後，把工作單（範圍、不能碰的檔案、驗收方式、等級選擇理由）寫成檔案再分派，或先 `summarize` 再用總結的工作單：
 
 ```bash
-python D:/github/agora/agora.py assign "$T" --from claude --to codex --file 工作單.md
+python D:/github/agora/agora.py assign "$T" --from claude --tier standard --file 工作單.md
 python D:/github/agora/agora.py summarize "$T" --by codex      # 或：先總結
-python D:/github/agora/agora.py assign "$T" --from claude --to codex --from-summary
+python D:/github/agora/agora.py assign "$T" --from claude --tier standard --from-summary
 python D:/github/agora/agora.py status "$T" --wait 900          # 等它完成（可用 run_in_background）
 ```
+
+### 分派對象（--to）
+- **沒有特定理由時不寫 `--to`**：交給 Agora 依各方在該等級對應的額度池剩餘 % 自動挑選接手方。
+- **有理由才寫 `--to <AI>`**（例如使用者指定、專長契合），並在工作單寫明理由。
+
+### 等級選擇準則（--tier）
+使用 `assign --tier light|standard|heavy`，並在工作單寫明選擇理由；不確定時用 `standard`：
+- **`light`（輕量）**：改動範圍極小、單檔或局部修正、配置調整、有現成且完整的測試可直接驗證。
+- **`standard`（標準，預設／不確定時使用）**：一般功能改動、跨少數檔案（約 2~5 檔）、可依既有模式循序修改與驗證。
+- **`heavy`（重度）**：涉及架構設計、核心安全性、跨多檔案重構（5 檔以上）、複雜除錯或缺乏測試防護。
+
+### 等級不足與升級處理
+- **若接手方回報等級不足**：接手方若判斷當前等級不足以勝任，會在進度檔寫理由，最後一行回覆「【需要升級】」（Agora 會把狀態設為 `needs_upgrade`）。分派方看到後以較高等級（如 standard 升為 heavy）重新分派（會開啟新 session）。
+- **若你是接手方**：接手工作時依上述準則評估，若判斷指派的模型等級不足以安全完成任務，不要勉強猜測；在進度檔寫明理由，回覆最後一行寫「【需要升級】」後結束。
 
 接手方在背景執行，只能在範圍內改檔、不能 commit。完成後**逐項審查它的 git diff**、跑驗證，再由你 commit（使用者要求時）。
 

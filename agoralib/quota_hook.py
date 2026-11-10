@@ -36,7 +36,7 @@ def save_state(state: dict):
 
 def advice(me: str, usages: dict, weights: dict | None = None, work: dict | None = None) -> tuple[str | None, str | None]:
     """回傳 (提醒等級, 指示文字)；等級用來避免同一個重置週期內重複提醒。
-    weights / work 是工作分配比例與近期接手輪數（見 shares.py），沒給時視為比例相同，等於挑額度最多的一方。"""
+    weights 是分配比例（0 表示不自動分派給它），work 保留在介面上；接手方挑額度剩餘 % 最高的一方（見 shares.pick）。"""
     weights, work = weights or {}, work or {}
     mine = usages.get(me)
     if not quota.low(mine):
@@ -65,7 +65,7 @@ def advice(me: str, usages: dict, weights: dict | None = None, work: dict | None
             + f"安排自己在 {quota.fmt_time(my_reset)} 重置後喚醒，然後停止工作。")
     return f"self-{my_reset}", (
         f"⚠️ {NAMES[me]} 額度剩 {mine['remaining_pct']:.0f}%（{quota.fmt_time(my_reset)} 重置），"
-        f"依工作分配比例由 {NAMES[best]} 接手（尚有 {others[best]['remaining_pct']:.0f}%）。"
+        f"依剩餘額度由 {NAMES[best]} 接手（尚有 {others[best]['remaining_pct']:.0f}%）。"
         f"立即依 relay skill 把手邊工作交接給 {NAMES[best]}（assign --to {best}），安排自己在重置後喚醒，然後停止工作。")
 
 

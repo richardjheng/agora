@@ -74,8 +74,10 @@ A=agora    # 或 A="python D:/github/agora/agora.py"
 
 $A parties                                          # 此專案參與的 AI 與模型
 $A parties --disable antigravity --model codex=gpt-6.1-sol --effort claude=high
+$A parties --tier codex.heavy=gpt-5 --tier claude.light=haiku:low  # 各等級模型（light/standard/heavy，default 清除）
+$A parties --tier-fallback codex.heavy=gpt-4.5:medium               # 各等級替代模型（fallback）
 $A parties --share claude=5 --share codex=3          # 自動分派的工作比例
-$A parties --subagents codex=off                    # 被 Agora 呼叫時能否啟動自己的內建子代理（on / off）
+$A parties --subagents codex=off                    # 被 Agora 呼叫時能否啟動自己的內建子代理（on / off，預設 off）
 $A parties --sandbox codex=danger-full-access       # Codex 接手工作時的沙箱（預設 workspace-write）
 $A models [--refresh]                               # 各 AI 可選的模型與推理強度
 $A new "主題" [--parties claude,codex] [--model codex=gpt-5] [--effort codex=high]
@@ -85,7 +87,7 @@ $A send <id> --from claude --blind --file q.md      # 獨立作答：各方看�
 $A send <id> --from human --message "..."           # 使用者插話（只記錄，下次轉給 AI）
 $A reply <id> --party antigravity                   # 不發言，直接請某方回覆
 $A auto <id> --rounds 6 [--order codex,claude]      # AI 依序自動發言（各方都表示【已達成共識】時提前結束）
-$A assign <id> --from claude --to codex --file 工作單.md   # 分派工作（不指定 --to 則依分配比例挑選）
+$A assign <id> --from claude [--tier standard] [--to codex] --file 工作單.md   # 分派工作（--to 留空則依等級對應額度池挑選）
 $A summarize <id> --by claude                       # 用新對話讀完整逐字稿，產出共識、取捨、異議與工作單（summary.md）
 $A assign <id> --from human --from-summary [--yes]  # 用總結的工作單分派；總結過期時要 --yes 確認
 $A status <id> [--wait 900] [--json]                # 分派狀態與最新進度（見下方 exit code）
@@ -174,7 +176,7 @@ skills 建議的流程：決策、設計、取捨類問題用中立開場（不�
 
 ### 內建子代理
 
-三個 AI 都有自己的內建子代理。`subagents`（預設允許）決定被 Agora 呼叫時能不能使用：
+三個 AI 都有自己的內建子代理。`subagents`（預設關閉，評估中）決定被 Agora 呼叫時能不能使用：
 
 | AI | 內建子代理 | 不允許時 |
 |---|---|---|
@@ -182,14 +184,40 @@ skills 建議的流程：決策、設計、取捨類問題用中立開場（不�
 | Antigravity | `invoke_subagent`、`define_subagent`、`manage_subagents`、`browser_subagent` | `install` 裝在 `.agents/hooks.json` 的 PreToolUse hook 擋下（只看 Agora 傳的環境變數，你自己開的 Antigravity 不受影響）；被擋時它會改用自己的工具完成 |
 | Codex | `spawn_agent` 等 | 目前版本無法強制關閉（關掉 `multi_agent` 功能後仍可使用），只在提示中要求不要使用；若仍使用，逐字稿的附註會標記 |
 
-### 工作分配比例
+- 評估階段：預設關閉以評估各 AI 內建子代理在背景自主工作時的穩定性、可觀察性與額度消耗，避免難以追蹤的子呼叫；面板勾選文字標記為「允許使用內建子代理（預設關閉，評估中）」。
 
-`share`（預設 1）決定**自動挑選接手方**時各 AI 分到的工作量：`assign` 沒指定 `--to`、以及額度不足時 hook 提醒交接給誰。
-明確指定接手方時不受比例限制；`0` 表示只參與討論、不自動分派給它。
+### 等級設定與模型選擇
 
-- 工作量以**接手輪數**計：接手方每跑完一輪記一筆在 `.agora/work_log.jsonl`，統計最近 7 天（`AGORA_SHARE_DAYS`）；進行中的分派先算 1 輪。
-- 每次挑「再分一輪後占比仍最落後」的一方，也就是 `(輪數 + 1) / 比例` 最小者；額度低於門檻或被標記無法使用的跳過，大家都不足時退回挑額度最多的（仍不挑無法使用的）。
-- 例如 Claude 5、Codex 3、Antigravity 2，十輪工作大約分成 5 / 3 / 2。
+工作分派支援依任務難度指定等級（`assign --tier light|standard|heavy`；沒指定時用 standard，但不覆蓋討論串明確指定的模型；`--model` 與 `--tier` 不能同用，延續 `--session` 時三者都不能指定），各 AI 可針對各等級指定最適模型與推理強度：
+
+- **等級選擇準則**：
+  - `light`（輕量）：改動範圍極小、單檔或局部修復、單純配置調整、有現成完整測試可直接驗證。
+  - `standard`（標準，預設／不確定時推薦）：一般功能改動、跨少數檔案（2~5 檔）、可依既有模式循序修改與驗證。
+  - `heavy`（重度）：涉及架構設計、核心安全性、跨多檔案重構（5 檔以上）、複雜除錯或缺乏測試保護。
+- **設定指令**：
+  ```bash
+  agora parties --tier codex.heavy=gpt-5 --tier claude.light=haiku:low   # 各等級模型（default 恢復沿用目前模型）
+  agora parties --tier-fallback codex.heavy=gpt-4.5:medium                # 各等級替代模型（default 清除）
+  ```
+- **VSCode 面板**：每個 AI 卡片提供「工作分派等級」區塊，三列分別下拉選擇模型與推理強度（有 efforts 時顯示），選「沿用目前模型」表示清除；可展開設定替代模型（fallback）。
+
+### 工作分配比例與自動挑選
+
+`share`（預設 1）：`0` 表示不自動分派給它；其他值只是 **token 用量的參考目標**（`agora parties` 與面板顯示「token 目標 % · 近 7 天實際 %」），不影響挑選。`assign` 沒指定 `--to` 時，交由 Agora 自動挑選接手方：
+
+- **依等級額度挑選**：分派時沒有指定 `--to`，Agora 依該分派指定的等級（`--tier`）查詢候選 AI 對應額度池的**剩餘百分比（%）**，優先挑選剩餘 % 最高且額度充足者。
+- **排除不參與者**：`share=0` 的 AI 表示只參與討論、不參與自動分派；額度低於門檻或被標記無法使用（blocked）的 AI 也會自動略過。
+- **額度不足與 fallback**：若被選中的 AI 額度不足，優先切換至該等級設定的 fallback 替代模型；若無 fallback 或替代模型額度亦不足，接手方進入等待（waiting）直到額度重置，**絕不擅自降級**至較低等級模型執行。
+- **等級不足回報（【需要升級】）**：接手方在執行期間若評估當前等級模型無法勝任，會在進度檔寫明理由，回覆最後一行寫「【需要升級】」（Agora 會把狀態設為 `needs_upgrade`）；分派方看到後以較高等級重新分派（開啟新 session）。
+- 明確指定接手方（`--to <AI>`）時不受比例與自動挑選限制；有特定理由（例如使用者指定或專長要求）才寫 `--to` 並在工作單註明理由。
+
+### 近 7 天用量顯示
+
+VSCode 面板各 AI 卡片底端與 `agora parties --json`（頂層 `usage` 欄位）提供最近 7 天的用量統計：
+
+- **已觀測 Tokens**：最近 7 天各次呼叫的輸入與輸出 tokens 總計；若部分呼叫因 CLI 限制未回報 tokens，會附註「另有 N 次呼叫缺資料」。
+- **接手輪數與分派**：最近 7 天跑完的接手輪數（rounds），並列出自動分派（auto）與指定分派（explicit）的次數。
+- **子代理**：最近 7 天啟動子代理的次數，以及未觀測到狀態的次數。
 
 | AI | 模型清單來源 | 推理強度 |
 |---|---|---|

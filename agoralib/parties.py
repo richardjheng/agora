@@ -320,6 +320,199 @@ def _run(cmd: list, workspace: Path, stdin_text: Optional[str], timeout: int,
     return events, stderr
 
 
+class _CallStats:
+    """每次呼叫的旁路統計；只接受 CLI 證據，不以請求設定冒充觀測值。
+
+    Claude 的 input 不含 cache read/creation；Codex 的 cached input 已包含在 input。
+    Antigravity 未宣告快取口徑時不推算 total。最終 usage 取代部分 usage，不能再相加。
+    includes_subagents 只接受明確回報，不能從是否看到子代理事件推測。
+    """
+
+    def __init__(self, opts: dict, party: str):
+        self.data = opts.get("_stats")
+        self.party = party
+        self.agents = {}
+        self.messages = {}
+        self.message_id = None
+        if isinstance(self.data, dict):
+            self.data.update(dict.fromkeys(("model", "input_tokens", "output_tokens", "cached_tokens",
+                                            "total_tokens", "cached_in_input", "includes_subagents",
+                                            "usage_source", "subagents")))
+            self.data["complete"] = False
+
+    @staticmethod
+    def number(value):
+        return value if type(value) is int and value >= 0 else None
+
+    def model(self, obj):
+        model = obj.get("model")
+        if isinstance(model, str) and model:
+            self.data["model"] = model
+
+    def usage(self, raw, source, final=False):
+        if self.data["complete"] and not final:
+            return
+        if not isinstance(raw, dict) or not raw:
+            return
+        values = {k: self.number(raw.get(k)) for k in
+                  ("input_tokens", "output_tokens", "cached_tokens", "total_tokens")}
+        cached_in_input = {"claude": False, "codex": True}.get(self.party)
+        if type(raw.get("cached_in_input")) is bool:
+            cached_in_input = raw["cached_in_input"]
+        if self.party == "claude":
+            cache = [self.number(raw.get(k)) for k in ("cache_read_input_tokens", "cache_creation_input_tokens")]
+            if any(v is not None for v in cache):
+                values["cached_tokens"] = sum(v for v in cache if v is not None)
+        elif self.party == "codex" and "cached_input_tokens" in raw:
+            values["cached_tokens"] = self.number(raw["cached_input_tokens"])
+        if not any(v is not None for v in values.values()):
+            return
+        if values["total_tokens"] is None and all(values[k] is not None for k in ("input_tokens", "output_tokens")):
+            if cached_in_input is True or values["cached_tokens"] == 0:
+                values["total_tokens"] = values["input_tokens"] + values["output_tokens"]
+            elif cached_in_input is False and values["cached_tokens"] is not None:
+                values["total_tokens"] = values["input_tokens"] + values["output_tokens"] + values["cached_tokens"]
+        includes = raw.get("includes_subagents")
+        self.data.update(values, cached_in_input=cached_in_input,
+                         includes_subagents=includes if type(includes) is bool else None,
+                         usage_source=source, complete=final)
+
+    def observable(self):
+        if self.data["subagents"] is None:
+            self.data["subagents"] = {"started": 0, "completed": 0, "failed": 0, "ids": []}
+
+    def agent(self, ident, state):
+        self.observable()
+        if not isinstance(ident, (str, int)) or isinstance(ident, bool) or ident == "":
+            return   # 沒有穩定 ID 時不猜測次數
+        ident = str(ident)
+        states = self.agents.setdefault(ident, set())
+        stats = self.data["subagents"]
+        if ident not in stats["ids"]:
+            stats["ids"].append(ident)
+        if state not in states:
+            states.add(state)
+            stats[state] += 1
+
+    def claude_usage(self, message, source):
+        self.model(message)
+        ident = message.get("id") or self.message_id
+        raw = message.get("usage")
+        if not isinstance(raw, dict) or not raw:
+            return
+        if not ident:
+            self.usage(raw, source)
+            return
+        self.messages.setdefault(ident, {}).update(raw)
+        # message_start / message_delta / assistant 會重複報同一則訊息；按 ID 合併後才加總。
+        keys = set().union(*(m.keys() for m in self.messages.values()))
+        total = {}
+        for key in keys:
+            values = [self.number(m.get(key)) for m in self.messages.values()]
+            if all(v is not None for v in values):
+                total[key] = sum(values)
+        self.usage(total, source)
+
+    def claude(self, e):
+        kind = e.get("type")
+        if kind == "system" and e.get("subtype") == "init":
+            self.model(e)
+            if isinstance(e.get("tools"), list):
+                self.observable()
+        elif kind == "result":
+            self.model(e)
+            models = e.get("modelUsage")
+            if self.data["model"] is None and isinstance(models, dict) and len(models) == 1:
+                self.model({"model": next(iter(models))})
+            self.usage(e.get("usage"), "claude:result.usage", True)
+        elif kind == "stream_event":
+            event = e.get("event") or {}
+            if event.get("type") == "message_start" and not e.get("parent_tool_use_id"):
+                message = event.get("message") or {}
+                self.message_id = message.get("id")
+                self.claude_usage(message, "claude:message_start.usage")
+            elif event.get("type") == "message_delta" and not e.get("parent_tool_use_id"):
+                self.claude_usage(event, "claude:message_delta.usage")
+            elif event.get("type") == "content_block_start":
+                self.claude_blocks([event.get("content_block") or {}])
+        elif kind in ("assistant", "user"):
+            message = e.get("message") or {}
+            if kind == "assistant" and not e.get("parent_tool_use_id"):
+                self.claude_usage(message, "claude:assistant.usage")
+            # 非同步 Task 的 tool_result 只是啟動確認，並不代表子代理完成。
+            result = e.get("tool_use_result") or {}
+            background = isinstance(result, dict) and result.get("isAsync")
+            self.claude_blocks(message.get("content"), background)
+
+    def claude_blocks(self, blocks, background=False):
+        if not isinstance(blocks, list):
+            return
+        self.observable()
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use" and block.get("name") in ("Task", "Agent"):
+                self.agent(block.get("id"), "started")
+            elif block.get("type") == "tool_result" and str(block.get("tool_use_id")) in self.agents:
+                if block.get("is_error"):
+                    self.agent(block["tool_use_id"], "failed")
+                elif not background:
+                    self.agent(block["tool_use_id"], "completed")
+
+    def antigravity(self, e):
+        kind = e.get("event")
+        if kind == "result":
+            result = e.get("result") or {}
+            self.model(result)
+            self.usage(result.get("usage"), "antigravity:result.usage", True)
+        elif kind == "step_update":
+            step = e.get("step_update") or {}
+            self.observable()
+            if step.get("step_type") == "subagent":
+                ident = step.get("subagent_id") or step.get("step_id") or step.get("id")
+                state = step.get("state")
+                if state in ("ACTIVE", "RUNNING"):
+                    self.agent(ident, "started")
+                elif state in ("COMPLETE", "COMPLETED", "SUCCESS", "DONE"):
+                    self.agent(ident, "completed")
+                elif state in ("ERROR", "FAILED"):
+                    self.agent(ident, "failed")
+            else:
+                self.model(step)
+                self.usage(step.get("usage"), "antigravity:step_update.usage")
+        elif kind == "init":
+            self.model(e)
+
+    def codex(self, e):
+        kind = e.get("type")
+        if kind in ("thread.started", "turn.started", "turn.completed", "turn.failed"):
+            self.model(e)
+            self.usage(e.get("usage"), "codex:" + kind, kind in ("turn.completed", "turn.failed"))
+        if kind not in ("item.started", "item.updated", "item.completed"):
+            return
+        item = e.get("item") or {}
+        self.observable()
+        if item.get("type") != "collab_tool_call":
+            return
+        # item.completed 是工具呼叫完成，不是子代理完成；只有 spawn 成功才計啟動。
+        states = item.get("agents_states") or {}
+        if not isinstance(states, dict):
+            states = {}
+        if item.get("tool") == "spawn_agent" and item.get("status") == "completed":
+            for ident in item.get("receiver_thread_ids") or []:
+                self.agent(ident, "started")
+        for ident, value in states.items():
+            status = value.get("status") if isinstance(value, dict) else value
+            if status == "completed":
+                self.agent(ident, "completed")
+            elif status in ("errored", "failed"):
+                self.agent(ident, "failed")
+
+    def event(self, e):
+        if isinstance(self.data, dict) and isinstance(e, dict):
+            getattr(self, self.party)(e)
+
+
 # ───────────────────────── Antigravity ─────────────────────────
 
 def find_agy() -> str:
@@ -358,6 +551,7 @@ def stream_interrupted(result: dict, reply: str) -> bool:
 
 def call_antigravity(prompt: str, session_id: Optional[str], opts: dict, work: bool, workspace: Path,
                      timeout: int, scratch: Path, live: Optional[Live] = None) -> Tuple[str, str, str]:
+    stats = _CallStats(opts, "antigravity")
     overflow = None
     try:
         if len(prompt) > 20000:  # Windows 命令列上限約 32k；agy 只能從參數收訊息
@@ -378,6 +572,7 @@ def call_antigravity(prompt: str, session_id: Optional[str], opts: dict, work: b
         steps = []   # 這輪的工具動作（名稱, 參數），被拒時用來找出目標
 
         def on_event(e):
+            stats.event(e)
             step = e.get("step_update") or {}
             if e.get("event") == "step_update" and step.get("step_type") == "tool" and step.get("state") == "ACTIVE":
                 steps.append((step.get("tool_name") or "", (step.get("tool_info") or {}).get("parameters") or {}))
@@ -386,6 +581,8 @@ def call_antigravity(prompt: str, session_id: Optional[str], opts: dict, work: b
 
         events, stderr = _run(cmd, workspace, None, timeout, on_event,
                               {**(opts.get("env") or {}), SUBAGENTS_ENV: "1" if opts.get("subagents", True) else "0"})
+        for e in events:
+            stats.event(e)   # 也支援非串流 JSON fallback；重播不增加計數
         result = next((e["result"] for e in reversed(events) if e.get("event") == "result" and e.get("result")),
                       events[-1])
         reply = (result.get("response") or "").strip()
@@ -425,6 +622,7 @@ def claude_event(live: Live, e: dict):
 
 def call_claude(prompt: str, session_id: Optional[str], opts: dict, work: bool, workspace: Path,
                 timeout: int, scratch: Path, live: Optional[Live] = None) -> Tuple[str, str, str]:
+    stats = _CallStats(opts, "claude")
     cmd = [quota.find_claude(), "-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages"]
     if work:
         # 可改檔；Bash 只開放 Agora 的固定指令與唯讀 git，其餘在非互動模式下會被拒絕
@@ -445,8 +643,14 @@ def call_claude(prompt: str, session_id: Optional[str], opts: dict, work: bool, 
         cmd += ["--model", opts["model"]]
     if opts.get("effort"):
         cmd += ["--effort", opts["effort"]]
-    events, stderr = _run(cmd, workspace, prompt, timeout, live and (lambda e: claude_event(live, e)), opts.get("env"))
+    def on_event(e):
+        stats.event(e)
+        if live:
+            claude_event(live, e)
+
+    events, stderr = _run(cmd, workspace, prompt, timeout, on_event, opts.get("env"))
     for e in events:
+        stats.event(e)
         if e.get("type") == "rate_limit_event":
             quota.write_claude_snapshot(quota.windows_from_rate_limit_info(e.get("rate_limit_info") or {}), "agora")
     result = next((e for e in reversed(events) if e.get("type") == "result"), events[-1])
@@ -478,6 +682,7 @@ def codex_event(live: Live, e: dict):
 
 def call_codex(prompt: str, session_id: Optional[str], opts: dict, work: bool, workspace: Path,
                timeout: int, scratch: Path, live: Optional[Live] = None) -> Tuple[str, str, str]:
+    stats = _CallStats(opts, "codex")
     # 討論與總結一律唯讀；工作模式預設只能寫工作區（Codex 沙箱），可由專案設定改為其他模式
     sandbox = (opts.get("sandbox") or "workspace-write") if work else "read-only"
     cmd = [quota.find_codex(), "exec", "--json", "-s", sandbox, "-C", str(workspace), "--skip-git-repo-check"]
@@ -497,7 +702,14 @@ def call_codex(prompt: str, session_id: Optional[str], opts: dict, work: bool, w
         cmd += ["--disable", "multi_agent"]
         prompt = NO_SUBAGENT_NOTE + prompt
     cmd += ["resume", session_id, "-"] if session_id else ["-"]
-    events, stderr = _run(cmd, workspace, prompt, timeout, live and (lambda e: codex_event(live, e)), opts.get("env"))
+    def on_event(e):
+        stats.event(e)
+        if live:
+            codex_event(live, e)
+
+    events, stderr = _run(cmd, workspace, prompt, timeout, on_event, opts.get("env"))
+    for e in events:
+        stats.event(e)
     thread_id = next((e.get("thread_id") for e in events if e.get("type") == "thread.started"), session_id)
     messages = [e["item"].get("text", "") for e in events
                 if e.get("type") == "item.completed" and (e.get("item") or {}).get("type") == "agent_message"]

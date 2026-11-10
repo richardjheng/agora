@@ -192,6 +192,102 @@ input.share {
   text-overflow: ellipsis;
 }
 
+.subagents-row .share-text {
+  white-space: normal;
+  line-height: 1.3;
+}
+
+.tiers-block {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 4px;
+  padding: 6px 8px;
+  background: var(--vscode-editor-inactiveSelectionBackground, rgba(128, 128, 128, 0.08));
+  border-radius: 4px;
+  border: 1px solid var(--vscode-widget-border, rgba(128, 128, 128, 0.15));
+}
+
+.tiers-title {
+  font-size: 0.85em;
+  font-weight: 600;
+  color: var(--vscode-descriptionForeground);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.tier-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.tier-main {
+  display: grid;
+  grid-template-columns: 2.8em 1fr auto;
+  align-items: center;
+  gap: 6px;
+}
+
+.tier-main.no-effort {
+  grid-template-columns: 2.8em 1fr;
+}
+
+.tier-label {
+  font-size: 0.9em;
+  color: var(--vscode-descriptionForeground);
+}
+
+.tier-effort {
+  width: 5.5em;
+}
+
+.tier-fallback {
+  margin-left: 2.8em;
+  font-size: 0.85em;
+}
+
+.tier-fallback summary {
+  cursor: pointer;
+  color: var(--vscode-textLink-foreground, var(--vscode-descriptionForeground));
+  user-select: none;
+  margin-bottom: 4px;
+}
+
+.tier-fallback-content {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 6px;
+  align-items: center;
+  padding: 4px 0 2px;
+}
+
+.tier-fallback-content.no-effort {
+  grid-template-columns: 1fr;
+}
+
+.usage-block {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 4px;
+  padding: 6px 8px;
+  background: var(--vscode-editor-inactiveSelectionBackground, rgba(128, 128, 128, 0.05));
+  border-radius: 4px;
+  border: 1px dashed var(--vscode-widget-border, rgba(128, 128, 128, 0.2));
+  font-size: 0.85em;
+}
+
+.usage-title {
+  font-weight: 600;
+  color: var(--vscode-descriptionForeground);
+}
+
+.usage-row {
+  color: var(--vscode-descriptionForeground);
+  line-height: 1.3;
+}
+
 .version {
   margin-top: 4px;
   text-align: right;

@@ -19,6 +19,7 @@ const ACTIVE_RELAY = ["starting", "running", "waiting"];
 const RELAY_LABELS = {
   starting: "啟動中", running: "執行中", waiting: "等額度重置", done: "已完成", stopped: "已暫停",
   failed: "失敗", max_rounds: "已達最大輪數", blocked: "需要人工處理", interrupted: "已中斷",
+  needs_upgrade: "需要升級",
 };
 
 let output;
@@ -467,6 +468,7 @@ class Model {
   setParties(data) {
     this.parties = data.parties;
     this.work = data.work || {};
+    this.usage = data.usage || null;
     this.shareDays = data.share_days || 7;
     this.summarizer = data.summarizer || null;
     this.install = data.install || null;
@@ -520,6 +522,7 @@ class Model {
       install: this.install,
       parties: this.parties,
       work: this.work,
+      usage: this.usage,
       shareDays: this.shareDays,
       catalog: this.catalog,
       quota: this.quota,
@@ -630,6 +633,33 @@ class PartiesView {
         });
         if (value !== undefined) await m.update(["--model", `${msg.party}=${value.trim() || "default"}`]);
         else this.post();
+        break;
+      }
+      case "tier":
+        await m.update(["--tier", `${msg.party}.${msg.level}=${msg.value || "default"}`]);
+        break;
+      case "tierFallback":
+        await m.update(["--tier-fallback", `${msg.party}.${msg.level}=${msg.value || "default"}`]);
+        break;
+      case "customTier": {
+        const tiers = (m.parties && m.parties[msg.party] && m.parties[msg.party].tiers) || {};
+        const curTier = tiers[msg.level];
+        const curObj = msg.fallback ? (curTier && curTier.fallback) : curTier;
+        const curModel = curObj ? curObj.model : "";
+        const role = msg.fallback ? "替代模型" : "模型";
+        const levelNames = { light: "輕量", standard: "標準", heavy: "重度" };
+        const levelLabel = levelNames[msg.level] || msg.level;
+        const value = await vscode.window.showInputBox({
+          prompt: `${NAMES[msg.party]} ${levelLabel}等級的${role}名稱（CLI 接受的完整名稱或別名）`,
+          value: curModel || "",
+        });
+        if (value !== undefined) {
+          const val = value.trim() || "default";
+          const flag = msg.fallback ? "--tier-fallback" : "--tier";
+          await m.update([flag, `${msg.party}.${msg.level}=${val}`]);
+        } else {
+          this.post();
+        }
         break;
       }
       case "refreshModels":
