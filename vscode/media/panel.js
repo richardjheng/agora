@@ -241,25 +241,30 @@
         ...tierItems);
     }
 
-    // 分配比例：0 表示不自動分派給它；其他值只當 token 用量的參考目標（自動挑選依額度池剩餘 %）
+    // 自動派工比例：0 表示不自動分派給它（只討論與審查）；其他值為自動派工件數權重（依比例輪流，不保證 token 比例）
     let shareRow = null;
     if (!disabled) {
       const enabled = state.order.filter((x) => state.parties[x].enabled);
       const total = enabled.reduce((sum, x) => sum + state.parties[x].share, 0);
-      const tokens = (x) => (state.usage && state.usage[x] && state.usage[x].tokens_7d) || 0;
-      const used = enabled.reduce((sum, x) => sum + tokens(x), 0);
-      const target = setting.share === 0 ? "不自動分派" : total ? `token 目標 ${Math.round(setting.share / total * 100)}%` : "";
-      const actual = setting.share === 0 ? "" : ` · 近 ${state.shareDays} 天實際 ${used ? `${Math.round(tokens(p) / used * 100)}%` : "-"}`;
+      const autoDispatches = (x) => (state.usage && state.usage[x] && state.usage[x].dispatch_auto) || 0;
+      const totalAuto = enabled.reduce((sum, x) => sum + autoDispatches(x), 0);
+      const targetPct = total ? Math.round(setting.share / total * 100) : 0;
+      const days = state.shareDays || 7;
+      const actualPct = totalAuto ? `${Math.round(autoDispatches(p) / totalAuto * 100)}%` : "-";
+      const target = `目標 ${targetPct}%`;
+      const actual = ` · 近 ${days} 天自動派工 ${actualPct}`;
       const input = el("input", {
         type: "number", min: "0", step: "1", value: String(setting.share), class: "share",
-        title: "0 表示只參與討論、不自動分派給它；其他值是 token 用量的參考目標，不影響自動挑選（依額度剩餘 %）",
+        title: setting.share === 0
+          ? "你的分配比例是 0：只負責討論、主持、交接與審查，不自己實作（也不透過子代理代做）；需要動手時寫工作單分派（預設不寫 --to）。要讓你實作，須由使用者明確指定。"
+          : "自動派工件數的加權比例（依比例輪流，不保證 token 比例）；0 表示只負責討論、主持、交接與審查（不自己實作）",
         onchange: (e) => {
           const v = e.target.value.trim();
           if (/^\d+$/.test(v)) vscode.postMessage({ type: "set", party: p, field: "share", value: v });
           else e.target.value = String(setting.share);
         },
       });
-      shareRow = el("label", { class: "row" }, el("span", { class: "label" }, "分配比例"),
+      shareRow = el("label", { class: "row" }, el("span", { class: "label" }, "自動派工比例"),
         el("span", { class: "share-line" }, input, el("span", { class: "share-text" }, `${target}${actual}`)));
     }
 
@@ -394,9 +399,9 @@
         "勾選表示同意該 AI 參與此專案接下來的討論與分派：進行中的討論串在下一次輪到發言時就會加入它（先讀完前面的討論），"
         + "取消勾選後不再請它回覆；已在背景進行的分派工作不會換人，用「新增討論串」時指定參與者的討論串也不會自動加入。"
         + "設定存在 .agora/config.json；未參與的 AI 不會被呼叫，也不會成為接手方。"
-        + "各 AI 可依工作等級（輕量／標準／重度）設定對應的模型與替代模型（fallback）；分派時依等級對應的額度池剩餘 % 挑選接手方。"
+        + "各 AI 可依工作等級（輕量／標準／重度）設定對應的模型與替代模型（fallback）；分派時依比例輪流，額度只作為資格篩選。"
         + "內建子代理預設關閉（評估中），被呼叫時盡量由主模型完成。"
-        + "分配比例為 0 表示不自動分派給它，其他值只是 token 用量的參考目標；指定接手方時不受限制。"));
+        + "自動派工比例為 0 表示只負責討論、主持、交接與審查（不自己實作），大於 0 為自動派工件數的加權比例（依比例輪流，不保證 token 比例）；指定接手方仍須符合額度資格，零權重接手方需使用者明確覆寫。"));
     }
     children.push(versionLine(state.versions || {}));
     app.replaceChildren(...children);

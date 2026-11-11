@@ -21,14 +21,14 @@ description: 透過 Agora 與 Antigravity（Gemini）、Codex 進行多輪技術
 你只是轉達者：不要自己完成、不要先讀程式碼替它寫答案或方案。
 
 1. 把使用者的原話（完整，不要改寫成你的解讀）加上對話中已知、它需要的背景寫成檔案。
-2. 依性質轉交（`$X` 是被勾選的 AI）：
-   - 要改檔案的工作：
+2. 依性質轉交（`$X` 是唯一被勾選的 AI）：
+   - 要改檔案的工作（因使用者只勾選該 AI，指定 `--to $X --reason "使用者只勾選該 AI"`）：
      ```bash
      T=$(python D:/github/agora/agora.py new "主題")
-     python D:/github/agora/agora.py assign "$T" --from claude --to $X --file 工作單.md
+     python D:/github/agora/agora.py assign "$T" --from claude --to $X --reason "使用者只勾選該 AI" --file 工作單.md
      python D:/github/agora/agora.py status "$T" --wait 900     # 可用 run_in_background
      ```
-     完成後讀 progress.md、審查 git diff、跑 `python D:/github/agora/agora.py check`，向使用者呈現它做了什麼與你審查發現的問題。
+     完成後讀 progress.md、審查 git diff、跑 `python D:/github/agora/agora.py check`，依審查原則向使用者呈現它做了什麼與審查發現的問題。
      有問題時再分派給它修，不要自己改。
    - 問題、分析、說明（不改檔）：`python D:/github/agora/agora.py send "$T" --from claude --to $X --file 訊息.md`，
      把它的回覆完整呈現給使用者；你查證後發現的錯誤另外標明是你的註記。
@@ -38,10 +38,11 @@ description: 透過 Agora 與 Antigravity（Gemini）、Codex 進行多輪技術
 
 依下面「發起討論」進行，參與者就是勾選的 AI（`new` 預設即是）。
 
-- 你有被勾選：照常參與討論；需要動手時依共識分工，可以自己做，也可以分派給其他被勾選的 AI。
+- 你有被勾選：照常參與討論；若你的分配比例大於 0，需要動手時依共識分工，可以自己做，也可以分派給其他被勾選的 AI。
+  若**你的分配比例是 0**：你的分配比例是 0：只負責討論、主持、交接與審查，不自己實作（也不透過子代理代做）；需要動手時寫工作單分派（預設不寫 --to）。要讓你實作，須由使用者明確指定。
 - 你沒被勾選：只當主持人。開場用中立框架、不寫自己的立場，用 `send --blind` 請它們各自作答，再送互評範本，
   之後用 `python D:/github/agora/agora.py auto "$T" --rounds 4` 讓它們討論；需要動手時 `summarize --by <被勾選的一方>`，
-  再 `assign "$T" --from claude --to <被勾選的一方> --from-summary`。你只審查 diff 與回報，不提出意見、不改程式碼。
+  再 `assign "$T" --from claude --from-summary`（被勾選者有多方時預設不加 `--to`，交由 Agora 依自動派工比例輪流；只有一方時才指定 `--to`）。你只審查 diff 與回報，不提出意見、不改程式碼。
 
 ## 發起討論
 
@@ -80,8 +81,9 @@ python D:/github/agora/agora.py status "$T" --wait 900          # 等它完成�
 ```
 
 ### 分派對象（--to）
-- **沒有特定理由時不寫 `--to`**：交給 Agora 依各方在該等級對應的額度池剩餘 % 自動挑選接手方。
-- **有理由才寫 `--to <AI>`**（例如使用者指定、專長契合），並在工作單寫明理由。
+- **預設不寫 `--to`**：交給 Agora 依各方的自動派工比例（加權輪流）與額度資格自動挑選接手方。
+- **有理由才寫 `--to <AI>`**（例如使用者明確指定、專長契合）：必須加 `--reason "<理由>"` 記錄指派原因（例如 `--to codex --reason "使用者指定"`）。
+- **零權重 AI 實作覆寫**：若被指定的接手方分配比例為 0，另需加上 `--user-override`（僅在使用者明確指定時才使用；例如 `--to claude --reason "使用者指定" --user-override`）。
 
 ### 等級選擇準則（--tier）
 使用 `assign --tier light|standard|heavy`，並在工作單寫明選擇理由；不確定時用 `standard`：
@@ -93,7 +95,12 @@ python D:/github/agora/agora.py status "$T" --wait 900          # 等它完成�
 - **若接手方回報等級不足**：接手方若判斷當前等級不足以勝任，會在進度檔寫理由，最後一行回覆「【需要升級】」（Agora 會把狀態設為 `needs_upgrade`）。分派方看到後以較高等級（如 standard 升為 heavy）重新分派（會開啟新 session）。
 - **若你是接手方**：接手工作時依上述準則評估，若判斷指派的模型等級不足以安全完成任務，不要勉強猜測；在進度檔寫明理由，回覆最後一行寫「【需要升級】」後結束。
 
-接手方在背景執行，只能在範圍內改檔、不能 commit。完成後**逐項審查它的 git diff**、跑驗證，再由你 commit（使用者要求時）。
+### 審查原則
+接手方在背景執行，只能在範圍內改檔、不能 commit。完成後依下列原則審查：
+1. **先看 diff 與測試**：逐項審查接手方的 `git diff`，確認未超出工作單範圍，並執行 `python D:/github/agora/agora.py check` 驗證。
+2. **必要時定點查證上下文**：對關鍵邏輯改動進行定點上下文查證，避免漫無目的全局搜尋。
+3. **深入除錯交回實作者**：審查若發現問題，先釐清現象後再分派給接手方修復，不要自己動手改或替它深入除錯。
+4. **適時建議開新對話**：大段工作完成並 commit 後，適時建議使用者開新對話（此為建議，不保證節省 token，但可避免單一長對話消耗過大）。
 
 ## 規則
 

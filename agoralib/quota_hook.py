@@ -36,7 +36,7 @@ def save_state(state: dict):
 
 def advice(me: str, usages: dict, weights: dict | None = None, work: dict | None = None) -> tuple[str | None, str | None]:
     """回傳 (提醒等級, 指示文字)；等級用來避免同一個重置週期內重複提醒。
-    weights 是分配比例（0 表示不自動分派給它），work 保留在介面上；接手方挑額度剩餘 % 最高的一方（見 shares.pick）。"""
+    hook 只檢查是否有人合格；實際接手方由 assign 在專案鎖內依比例輪流挑選，不預先消耗排程。"""
     weights, work = weights or {}, work or {}
     mine = usages.get(me)
     if not quota.low(mine):
@@ -52,21 +52,14 @@ def advice(me: str, usages: dict, weights: dict | None = None, work: dict | None
         return f"none-{my_reset}", (
             f"⚠️ {NAMES[me]} 額度剩 {mine['remaining_pct']:.0f}%（{quota.fmt_time(my_reset)} 重置），"
             f"此專案沒有其他可接手的 AI（未啟用或分配比例為 0）。依 relay skill 把目前進度寫進 Agora 討論串，"
-            f"安排自己在重置後喚醒，然後停止工作。")
-    best = shares.pick(others, weights, work, others)
-    if not best:
-        earliest = min(others.items(), key=lambda kv: kv[1].get("resets_at") or float("inf"), default=(None, {}))
-        party, u = earliest
-        hand_off = bool(party and u.get("resets_at") and my_reset and u["resets_at"] < my_reset)
+            f"回報沒有合格接手方後退出，不等待重置，也不自行實作。")
+    if not shares.eligible(others, weights, others):
         return f"all-{my_reset}", (
-            f"⚠️ 所有 AI 的額度都低於 {quota.THRESHOLD_PCT:.0f}%，停止手邊工作。"
-            + (f"{NAMES[party]} 最早重置（{quota.fmt_time(u['resets_at'])}），依 relay skill 仍交接給它；"
-               f"接手程序會等它額度重置後才開始。" if hand_off else "依 relay skill 把目前進度寫進 Agora 討論串，不要交接。")
-            + f"安排自己在 {quota.fmt_time(my_reset)} 重置後喚醒，然後停止工作。")
+            f"⚠️ 沒有合格接手方（額度不足、未知、過期或無法使用）。"
+            f"依 relay skill 把目前進度寫進 Agora 討論串後回報退出，不等待重置，也不自行實作。")
     return f"self-{my_reset}", (
         f"⚠️ {NAMES[me]} 額度剩 {mine['remaining_pct']:.0f}%（{quota.fmt_time(my_reset)} 重置），"
-        f"依剩餘額度由 {NAMES[best]} 接手（尚有 {others[best]['remaining_pct']:.0f}%）。"
-        f"立即依 relay skill 把手邊工作交接給 {NAMES[best]}（assign --to {best}），安排自己在重置後喚醒，然後停止工作。")
+        f"立即依 relay skill 寫工作單交接（assign 預設不寫 --to，由 Agora 額度篩選後依比例輪流挑選），然後停止工作。")
 
 
 def project_root() -> Path | None:
@@ -85,7 +78,7 @@ def routing_line(me: str, prompt: str = "") -> str | None:
     root = project_root()
     if os.getenv("AGORA_INVOKED") or prompt.lstrip().startswith("/") or not root:
         return None
-    return routing.instruction(me, config.enabled(root))
+    return routing.instruction(me, config.enabled(root), config.shares(root))
 
 
 def main():

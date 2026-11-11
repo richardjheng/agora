@@ -100,15 +100,174 @@ def alive(record: dict) -> bool:
     return pid_alive(record.get("pid"), record.get("pid_started"))
 
 
-def kill_tree(pid: int):
+def _handle_created(k, handle) -> Optional[float]:
+    """用這個 handle 讀程序的建立時間（epoch 秒）；讀不到回傳 None"""
+    import ctypes
+    from ctypes import wintypes
+    times = [wintypes.FILETIME() for _ in range(4)]
+    if not k.GetProcessTimes(handle, *[ctypes.byref(t) for t in times]):
+        return None
+    ticks = (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime   # 1601 年起的 100 奈秒
+    return ticks / 1e7 - 11644473600
+
+
+def _kill_windows_fallback(pid: int, proc=None) -> list:
+    """taskkill 不可用時，用 Win32 快照終止後代，根程序優先用既有 Popen handle。"""
+    import ctypes
+    from ctypes import wintypes
+
+    class Entry(ctypes.Structure):
+        _fields_ = [("size", wintypes.DWORD), ("usage", wintypes.DWORD), ("pid", wintypes.DWORD),
+                    ("heap", ctypes.c_size_t), ("module", wintypes.DWORD), ("threads", wintypes.DWORD),
+                    ("parent", wintypes.DWORD), ("priority", wintypes.LONG), ("flags", wintypes.DWORD),
+                    ("exe", wintypes.WCHAR * 260)]
+
+    k = ctypes.WinDLL("kernel32", use_last_error=True)
+    k.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    k.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    k.Process32FirstW.argtypes = k.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(Entry)]
+    k.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k.OpenProcess.restype = wintypes.HANDLE
+    k.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    k.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    k.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    k.CloseHandle.argtypes = [wintypes.HANDLE]
+    k.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+    failures = []
+
+    def snapshot_parents() -> dict:
+        """目前所有程序的 {PID: 父 PID}；快照失敗時回傳空的（不會找到後代，寧可漏殺也不誤殺）"""
+        parents = {}
+        snapshot = k.CreateToolhelp32Snapshot(2, 0)   # TH32CS_SNAPPROCESS
+        if snapshot == ctypes.c_void_p(-1).value:
+            failures.append(f"程序樹快照失敗：{ctypes.WinError(ctypes.get_last_error())}")
+            return parents
+        try:
+            entry = Entry()
+            entry.size = ctypes.sizeof(entry)
+            found = k.Process32FirstW(snapshot, ctypes.byref(entry))
+            while found:
+                parents[entry.pid] = entry.parent
+                found = k.Process32NextW(snapshot, ctypes.byref(entry))
+            if ctypes.get_last_error() != 18:   # ERROR_NO_MORE_FILES
+                failures.append(f"程序樹列舉失敗：{ctypes.WinError(ctypes.get_last_error())}")
+        finally:
+            k.CloseHandle(snapshot)
+        return parents
+
+    descendants, root_handle = _collect_targets(k, pid, snapshot_parents(), snapshot_parents)
+    deadline = time.monotonic() + 2
+    try:
+        for target, handle in descendants:   # 由深到淺，用持有的 handle 終止（不重新開啟，PID 不會被換掉）
+            _terminate_handle(k, handle, target, deadline, failures)
+        if proc is not None:
+            try:
+                proc.kill()
+                proc.wait(timeout=max(0, deadline - time.monotonic()))
+            except (OSError, subprocess.TimeoutExpired) as e:
+                failures.append(f"proc.kill PID {pid}：{e}")
+        elif root_handle:
+            _terminate_handle(k, root_handle, pid, deadline, failures)
+        else:
+            failures.append(f"OpenProcess PID {pid}：{ctypes.WinError(ctypes.get_last_error())}")
+    finally:
+        for _, handle in descendants:
+            k.CloseHandle(handle)
+        if root_handle:
+            k.CloseHandle(root_handle)
+    return failures
+
+
+PROCESS_ACCESS = 0x100001 | 0x1000   # SYNCHRONIZE | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION
+
+
+def _collect_targets(k, pid: int, parents: dict, resnapshot) -> tuple:
+    """找出 pid 的後代並持有它們的 handle：回傳 ([(PID, handle)] 由深到淺, 根程序 handle 或 None)，handle 由呼叫者關閉。
+    - 先開啟並持有每個候選的 handle（持有期間這個 PID 不會被系統重複使用），在同一個 handle 上讀建立時間；
+      比父程序更早建立的不算後代（父程序結束後子程序記錄的 parent PID 不會清除，PID 可能被重複使用）。
+    - 全部開啟後重新快照：候選的父 PID 和第一次快照不同（開啟前原程序已結束、PID 被無關程序重用），
+      或它的父程序已被放棄時，就放棄它與它的後代。任何一步確認不了都放棄，寧可漏殺也不誤殺"""
+    root = k.OpenProcess(PROCESS_ACCESS, False, pid)
+    births = {pid: _handle_created(k, root) if root else None}
+    held, order, pending, seen = {}, [], [pid], {pid}
+    while pending:
+        parent = pending.pop(0)
+        born = births.get(parent)
+        if born is None:
+            continue
+        for child, owner in list(parents.items()):
+            if owner != parent or child in seen:
+                continue
+            seen.add(child)
+            handle = k.OpenProcess(PROCESS_ACCESS, False, child)
+            if not handle:
+                continue
+            created = _handle_created(k, handle)
+            if created is None or created < born:
+                k.CloseHandle(handle)
+                continue
+            held[child], births[child] = handle, created
+            order.append(child)
+            pending.append(child)
+    after = resnapshot()
+    valid, kept = {pid}, []
+    for child in order:   # 廣度優先：父程序一定先判斷
+        if after.get(child) == parents.get(child) and parents.get(child) in valid:
+            valid.add(child)
+            kept.append((child, held[child]))
+        else:
+            k.CloseHandle(held[child])
+    return list(reversed(kept)), root
+
+
+def _terminate_handle(k, handle, target: int, deadline: float, failures: list):
+    import ctypes
+    from ctypes import wintypes
+    code = wintypes.DWORD()
+    if k.GetExitCodeProcess(handle, ctypes.byref(code)) and code.value != 259:   # 已結束
+        return
+    if not k.TerminateProcess(handle, 1):
+        failures.append(f"TerminateProcess PID {target}：{ctypes.WinError(ctypes.get_last_error())}")
+    elif k.WaitForSingleObject(handle, max(0, int((deadline - time.monotonic()) * 1000))) != 0:
+        failures.append(f"等待 PID {target} 結束逾時或失敗")
+
+
+def kill_tree(pid: int, proc=None) -> str:
+    """終止程序樹；傳回並顯示失敗診斷，taskkill 失敗時仍嘗試 Win32 / proc.kill。"""
+    diagnostics = []
     if sys.platform.startswith("win"):
         from agoralib.quota import NO_WINDOW
-        subprocess.run(["taskkill", "/pid", str(pid), "/T", "/F"], capture_output=True, **NO_WINDOW)
+        try:
+            result = subprocess.run(["taskkill", "/pid", str(pid), "/T", "/F"], capture_output=True,
+                                    text=True, errors="replace", timeout=2, **NO_WINDOW)
+            if result.returncode:
+                diagnostics.append(f"終止失敗：taskkill PID {pid} exit={result.returncode}："
+                                   f"{(result.stderr or result.stdout).strip()}")
+        except (OSError, subprocess.TimeoutExpired) as e:
+            diagnostics.append(f"終止失敗：taskkill PID {pid}：{e}")
+        if diagnostics:
+            try:
+                failures = _kill_windows_fallback(pid, proc)
+            except (OSError, AttributeError) as e:
+                failures = [f"Win32 備援：{e}"]
+                if proc is not None:
+                    try:
+                        proc.kill()
+                    except OSError as kill_error:
+                        failures.append(f"proc.kill：{kill_error}")
+            diagnostics.append("終止失敗：備援終止：" + "；".join(failures) if failures else "已使用備援終止程序樹")
     else:
         try:
-            os.killpg(pid, 15)
-        except OSError:
-            pass
+            if proc is not None:
+                proc.kill()
+            else:
+                os.killpg(pid, 15)
+        except OSError as e:
+            diagnostics.append(f"終止失敗：PID {pid}：{e}")
+    detail = "\n".join(diagnostics)
+    if detail:
+        print(detail, file=sys.stderr, flush=True)
+    return detail
 
 
 # ───────────────────────── 兩段式啟動 ─────────────────────────

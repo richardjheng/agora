@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -382,6 +383,10 @@ def call_opts(ws: Workspace, state: dict, party: str) -> dict:
 
 # ───────────────────────── 討論 ─────────────────────────
 
+# 討論是唯讀模式：Antigravity 用 run_command 會被拒絕、整輪中斷（再由 DENIED_RETRY 重試），一開始就講清楚
+DISCUSS_TOOL_NOTES = {"antigravity": "（給 Antigravity）這是唯讀討論：不能用 run_command 執行終端指令，用了這一整輪會被中斷；"
+                                     "查證請用 read_file 等讀檔與搜尋工具。"}
+
 BLIND_NOTE = ("【獨立作答】這一輪其他 AI 也在回答同一則訊息，你看不到它們的答案、它們也看不到你的。"
               "請完整寫出你自己的判斷，不要預設別人會補充；下一輪會互相評論。")
 
@@ -392,6 +397,8 @@ def build_prompt(ws: Workspace, state: dict, party: str, upto: Optional[int] = N
     unseen = [m for m in state["messages"][info["seen"]:upto]
               if not (m["speaker"] == party and m["via_cli"])]
     parts = []
+    if config.shares(ws.root)[party] == 0:
+        parts.append(routing.ZERO_SHARE_ROLE)
     if not info["session_id"]:
         # 對話框所在的 AI 沒被勾選時只主持、不在參與者名單，但也是討論對象
         speakers = [m["speaker"] for m in state["messages"] if m["speaker"] in AI_PARTIES]
@@ -399,6 +406,8 @@ def build_prompt(ws: Workspace, state: dict, party: str, upto: Optional[int] = N
                           if p != party)
         parts.append(PREAMBLE.format(me=NAMES[party], others=others, human=NAMES[HUMAN], workspace=ws.root,
                                      topic=state["topic"]))
+        if party in DISCUSS_TOOL_NOTES:
+            parts.append(DISCUSS_TOOL_NOTES[party])
         if unseen:
             parts.append("以下是目前為止的討論內容：")
     for m in unseen:
@@ -903,9 +912,9 @@ def choose_model(party: str, plan: dict) -> Tuple[dict, Optional[dict]]:
     回傳 (計畫, 對應的額度)"""
     u = party_usage(party, plan.get("model"))
     fb = plan.get("fallback")
-    if u is not None and quota.low(u) and fb:
+    if shares.quota_info(u).get("excluded", "").startswith("額度不足") and fb:
         fu = party_usage(party, fb["model"])
-        if fu is not None and not quota.unavailable(fu):
+        if shares.eligible([party], {party: 1}, {party: fu}):
             return {**plan, "model": fb["model"], "effort": fb.get("effort"), "fallback_used": True,
                     "source": plan["source"] + "的替代模型"}, fu
     return plan, u
@@ -915,13 +924,7 @@ def usage_info(plan: dict, u: Optional[dict]) -> dict:
     """分派決策裡每個候選的額度資訊"""
     info = {"model": plan.get("model"), "effort": plan.get("effort"), "source": plan.get("source"),
             "pool": (u or {}).get("window_label") or (u or {}).get("window"),
-            "remaining_pct": (u or {}).get("remaining_pct"), "resets_at": (u or {}).get("resets_at")}
-    if u is None:
-        info["excluded"] = "額度未知"
-    elif u.get("blocked"):
-        info["excluded"] = f"無法使用（{u['blocked'].get('reason')}）"
-    elif quota.low(u):
-        info["excluded"] = f"額度低於 {quota.THRESHOLD_PCT:.0f}%"
+            **shares.quota_info(u)}
     return info
 
 
@@ -929,52 +932,76 @@ def describe_candidate(party: str, info: dict) -> str:
     pct = info.get("remaining_pct")
     text = f"{NAMES[party]} {info.get('model') or 'CLI 預設'}" + (f"（{info['pool']}）" if info.get("pool") else "")
     text += f" 剩 {pct:.0f}%" if isinstance(pct, (int, float)) else " 額度未知"
+    if info.get("quota_note"):
+        text += f"，{info['quota_note']}"
+    if info.get("reset_elapsed"):
+        text += "，重置時間已過，視為已重置"
     return text + (f"，不挑：{info['excluded']}" if info.get("excluded") else "")
 
 
 def pick_worker(ws: Workspace, owner: str, candidates: List[str], state: dict, tier: Optional[str] = None,
                 model: Optional[str] = None, effort: Optional[str] = None) -> Tuple[str, dict, dict]:
-    """沒指定接手方時，在勾選、可用、分配比例 > 0 的 AI 中挑這次等級對應額度池剩餘 % 最高的一方（見 shares.pick）。
-    都不足時：挑已知最早重置的一方，接手程序等它重置後開始；重置時間都未知就停止並說明，不假定可用、不擅自降級。
-    回傳 (接手方, 模型計畫, 分派決策)"""
+    """額度篩選後依比例輪流；回傳預覽排程，成功建立才提交。assign 已持有專案鎖。"""
     weights = config.shares(ws.root)
     others = [p for p in candidates if p != owner and weights[p] > 0]
     if not others:
-        sys.exit("沒有可自動分派的 AI（其他勾選中 AI 的分配比例都是 0），請用 --to 指定接手方。")
+        data = shares.dispatch_state(ws.root)
+        data["schedule"] = {}
+        shares.save_dispatch_state(ws.root, data)
+        sys.exit("沒有可自動分派的 AI（其他勾選中 AI 的分配比例都是 0）。已退出，不由主持人自行實作。")
     plans, usages, infos = {}, {}, {}
     for p in others:   # 先只看各方這個等級的主模型
         plans[p] = plan_model(ws, state, p, tier, model, effort)
         usages[p] = party_usage(p, plans[p].get("model"))
         infos[p] = usage_info(plans[p], usages[p])
-    if all((usages[p] or {}).get("blocked") for p in others):
-        sys.exit("其他可自動分派的 AI 都標記為無法使用（" + "、".join(
-            f"{NAMES[p]}：{usages[p]['blocked']['reason']}" for p in others) + "）。處理後用 "
-            f"{agora_cmd()} quota --unblock <AI> 清除標記，或用 --to 指定接手方。")
-    worker = shares.pick(others, weights, {}, usages)
-    if not worker:   # 主模型都不足，才考慮使用者設定的替代模型（不擅自降成較低等級）
+    if not shares.eligible(others, weights, usages):   # 主模型都不足才考慮設定的替代模型
         for p in others:
             if plans[p].get("fallback") and not (usages[p] or {}).get("blocked"):
                 fb_plan, fb_usage = choose_model(p, plans[p])
                 if fb_plan.get("fallback_used"):
                     plans[p], usages[p] = fb_plan, fb_usage
                     infos[p] = usage_info(fb_plan, fb_usage)
-        worker = shares.pick(others, weights, {}, usages)
-    waiting = False
+    data = shares.dispatch_state(ws.root)
+    worker, schedule = shares.schedule_next(others, weights, usages, data.get("schedule") or {})
+    if (data.get("schedule") or {}).get("signature") != schedule["signature"]:
+        data["schedule"] = {"signature": schedule["signature"], "current": {}}
+        shares.save_dispatch_state(ws.root, data)
     if not worker:
-        known = [p for p in others if usages[p] and not usages[p].get("blocked") and usages[p].get("resets_at")]
-        if not known:
-            sys.exit("沒有可自動分派的 AI：這次等級對應的額度都不足或查不到，也不知道何時重置。"
-                     "請稍後再試、設定替代模型（agora parties --tier-fallback），或用 --to 指定接手方。\n"
-                     + "\n".join(f"  {describe_candidate(p, infos[p])}" for p in others))
-        worker, waiting = min(known, key=lambda p: usages[p]["resets_at"]), True
-    print(("這次等級的額度都不足，" if waiting else "") + f"依剩餘額度挑選 {NAMES[worker]}（"
-          + "；".join(describe_candidate(p, infos[p]) for p in others) + "）"
-          + (f"，接手程序會等到 {quota.fmt_time(usages[worker]['resets_at'])} 重置後開始" if waiting else ""))
-    return worker, plans[worker], {"selection": "auto", "candidates": infos, "waiting": waiting}
+        sys.exit("沒有可自動分派的 AI。"
+                 "已退出，不等待重置，也不由主持人自行實作。\n"
+                 + "\n".join(f"  {describe_candidate(p, infos[p])}" for p in others))
+    print(f"依比例輪流挑選 {NAMES[worker]}（" + "；".join(describe_candidate(p, infos[p]) for p in others) + "）")
+    return worker, plans[worker], {"selection": "auto", "candidates": infos, "waiting": False, "schedule": schedule}
 
 
 def cmd_assign(ws: Workspace, args):
     guard_nested()
+    with shares.dispatch_lock(ws.root):
+        recover_assignments(ws)
+        try:
+            _cmd_assign_locked(ws, args)
+        except BaseException:
+            recover_assignments(ws)
+            raise
+
+
+def recover_assignments(ws: Workspace):
+    pending = shares.dispatch_state(ws.root).get("pending")
+    data = shares.recover_dispatch(ws.root)
+    if pending and pending["entry"]["dispatch_id"] not in data["dispatches"]:
+        entry = pending["entry"]
+        thread = ws.threads / entry["thread"]
+        if (thread / "state.json").exists():
+            with thread_lock(thread):
+                state = load_state(thread)
+                relay = state.get("relay") or {}
+                if relay.get("dispatch_id") == entry["dispatch_id"] and not relay.get("dispatch_created"):
+                    relay.update(status="failed", error="派工建立中斷，未提交，不計件。")
+                    save_state(thread, state)
+    return data
+
+
+def _cmd_assign_locked(ws: Workspace, args):
     thread = ws.resolve_thread(args.thread)
     owner = canonical(args.sender)
     state = load_state(thread)
@@ -991,17 +1018,44 @@ def cmd_assign(ws: Workspace, args):
         sys.exit("--model 與 --tier 只能擇一：--tier 依專案設定的等級選模型，--model 直接指定。")
     if args.session and not args.to:
         sys.exit("延續既有對話（--session）時要用 --to 指定接手方（那段對話屬於哪個 AI）。")
+    dispatch_id = getattr(args, "dispatch_id", None) or uuid.uuid4().hex
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", dispatch_id):
+        sys.exit("--dispatch-id 只能含英文字母、數字、底線或連字號，長度 1~128。")
+    reason = (getattr(args, "reason", None) or "").strip()
+    override = bool(getattr(args, "user_override", False))
+    if (reason or override) and not args.to:
+        sys.exit("--reason 與 --user-override 只用於 --to 指定分派。")
+    if args.to and not reason and config.shares(ws.root).get(canonical(args.to), 1) > 0:
+        sys.exit("指定分派須用 --reason 記錄使用者指定或專長等理由；預設請省略 --to。")
+    request = {"thread": thread.name, "from": owner, "text": text, "to": canonical(args.to) if args.to else None,
+               "session": args.session, "tier": tier, "model": model_arg, "effort": effort_arg,
+               "subagents": getattr(args, "subagents", None), "trigger": getattr(args, "trigger", None),
+               "reason": reason, "user_override": override}
+    import hashlib
+    fingerprint = hashlib.sha256(json.dumps(request, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+    previous = shares.dispatch_state(ws.root)["dispatches"].get(dispatch_id)
+    if previous:
+        if previous.get("request_hash") != fingerprint:
+            sys.exit("此派工識別碼已用於不同工作單；新工作請使用新 --dispatch-id。")
+        print(f"派工 {dispatch_id} 已成功建立（{NAMES[previous['party']]}），本次不重新執行或計件。")
+        return
+    old = state.get("relay") or {}
+    if relay_alive(old):
+        sys.exit(f"此討論串已有進行中的分派（{NAMES[old['worker']]}），請先 recall。")
     if args.to:
         worker = require_enabled(ws, canonical(args.to))
+        if config.shares(ws.root)[worker] == 0 and not (override and reason):
+            sys.exit(routing.ZERO_SHARE_ROLE + " 指定零權重實作須加 --user-override 與 --reason 記錄使用者明確指定。")
         if args.session:
             plan = session_plan(ws, worker, args.session)
             u = party_usage(worker, plan.get("model"))
         else:
             plan, u = choose_model(worker, plan_model(ws, state, worker, tier, model_arg, effort_arg))
-        decision = {"selection": "explicit", "candidates": {worker: usage_info(plan, u)}, "waiting": bool(u and quota.low(u))}
-        if decision["waiting"]:
-            print(f"⏸ {NAMES[worker]} 的{plan.get('source')}額度不足（{describe_candidate(worker, decision['candidates'][worker])}），"
-                  f"接手程序會等它重置後開始。")
+        decision = {"selection": "explicit", "candidates": {worker: usage_info(plan, u)}, "waiting": False}
+        if not shares.eligible([worker], {worker: 1}, {worker: u}):
+            sys.exit(f"指定的 {NAMES[worker]} 不合格：{describe_candidate(worker, decision['candidates'][worker])}。"
+                     "已退出，不等待重置。")
+        print(f"指定接手方：{describe_candidate(worker, decision['candidates'][worker])}")
     else:
         worker, plan, decision = pick_worker(ws, owner, ws.enabled(), state, tier, model_arg, effort_arg)
     subagents_arg = getattr(args, "subagents", None)
@@ -1010,10 +1064,6 @@ def cmd_assign(ws: Workspace, args):
     if mark:
         print(f"⚠️ {NAMES[worker]} 在 {quota.fmt_time(mark.get('at'))} 被標記為無法使用（{mark.get('reason')}）；"
               f"若問題還在，接手會立即停止並顯示原因。")
-    old = state.get("relay") or {}
-    if relay_alive(old):
-        sys.exit(f"此討論串已有進行中的分派（{NAMES[old['worker']]}），請先 recall。")
-
     paths = relay_paths(thread)
     paths["control"].write_text(json.dumps({"stop_requested": False}), encoding="utf-8")
     if not paths["progress"].exists():
@@ -1027,12 +1077,24 @@ def cmd_assign(ws: Workspace, args):
     except (snapshot.SnapshotError, OSError, subprocess.SubprocessError) as e:
         baseline = {"error": str(e)}
 
+    entry_record = {"kind": "dispatch", "dispatch_id": dispatch_id, "request_hash": fingerprint,
+                    "time": time.time(), "party": worker, "thread": thread.name, "from": owner,
+                    "selection": decision["selection"], "trigger": getattr(args, "trigger", None) or "manual",
+                    "tier": plan.get("level"), "tier_requested": tier, "model": plan.get("model"), "effort": plan.get("effort"),
+                    "fallback_used": bool(plan.get("fallback_used")), "candidates": decision["candidates"],
+                    "reason": reason, "user_override": override}
+    dispatch_data = shares.dispatch_state(ws.root)
+    dispatch_data["pending"] = {"entry": entry_record,
+                                "schedule": decision.get("schedule", dispatch_data.get("schedule") or {})}
+    shares.save_dispatch_state(ws.root, dispatch_data)
     with thread_lock(thread):
         state = load_state(thread)
         state["parties"].setdefault(worker, new_party())
         add_message(thread, state, owner, f"【工作分派 → {NAMES[worker]}】\n{text}")
         # 模型在分派時凍結：之後各輪都用這裡記的，專案設定中途改了也不會悄悄換模型（model 為 None 表示 CLI 預設）
         state["relay"] = {"from": owner, "worker": worker, "status": "starting", "rounds": 0,
+                          "dispatch_id": dispatch_id, "dispatch_created": False,
+                          "reason": reason, "user_override": override,
                           "session_id": args.session, "external_session": args.session,
                           "handoff": text.strip(), "started": now_str(), "started_ts": time.time(),
                           "updated": now_str(), "baseline": baseline, "frozen": True,
@@ -1044,30 +1106,28 @@ def cmd_assign(ws: Workspace, args):
                           "subagents": subagents, "selection": decision["selection"],
                           "trigger": getattr(args, "trigger", None) or "manual"}
         save_state(thread, state)
-    try:
-        shares.append(ws.root, {"kind": "dispatch", "party": worker, "thread": thread.name, "from": owner,
-                                "selection": decision["selection"], "trigger": getattr(args, "trigger", None) or "manual",
-                                "tier": plan.get("level"), "tier_requested": tier, "model": plan.get("model"), "effort": plan.get("effort"),
-                                "fallback_used": bool(plan.get("fallback_used")), "candidates": decision["candidates"]})
-    except OSError:
-        pass
     level = f"{config.TIER_LABELS[plan['level']]}等級" if plan.get("level") else plan.get("source")
     add_system_note(thread, f"📋 {'自動挑選' if decision['selection'] == 'auto' else '指定'} {NAMES[worker]}"
                             f"（{level}：{plan.get('model') or 'CLI 預設模型'}"
                             + (f"、{plan['effort']}" if plan.get("effort") else "")
                             + ("，額度不足改用使用者設定的替代模型" if plan.get("fallback_used") else "")
                             + ("，子代理：" + ("允許" if subagents else "不允許") if subagents is not None else "") + "）"
+                            + f"；派工識別碼：{dispatch_id}"
+                            + (f"；指定理由：{reason}" if reason else "")
+                            + ("；使用者明確覆寫零權重實作限制" if override else "")
                             + "；候選：" + "；".join(describe_candidate(p, i) for p, i in decision["candidates"].items()))
 
     # 背景程序一啟動就讀 state.json 的 relay，所以先寫入 starting 再啟動；記下 PID 前的空檔由 relay_alive 的緩衝涵蓋
     entry = AGORA_ROOT_DIR / "agora.py"
     try:
-        pid = jobs.spawn([sys.executable, str(entry), "--workspace", str(ws.root), "_work", thread.name],
+        pid = jobs.spawn([sys.executable, str(entry), "--workspace", str(ws.root), "_work", thread.name,
+                          "--dispatch-id", dispatch_id],
                          ws.root, paths["log"], paths["log"], append=True)
     except Exception as e:
         update_relay(thread, status="failed", error=f"無法啟動背景程序：{e}")
         sys.exit(f"無法啟動接手程序：{e}")
-    update_relay(thread, pid=pid, pid_started=jobs.pid_started(pid))
+    update_relay(thread, pid=pid, pid_started=jobs.pid_started(pid), dispatch_created=True)
+    shares.recover_dispatch(ws.root)
     print(f"已分派給 {NAMES[worker]}（背景程序 PID {pid}，關閉視窗也會繼續）。")
     if baseline.get("error"):
         print(f"⚠️ 沒有記錄分派基準，無法用 changes 檢視變更：{baseline['error']}")
@@ -1325,6 +1385,13 @@ def cmd_work(ws: Workspace, args):
     thread = ws.resolve_thread(args.thread)
     paths = relay_paths(thread)
     relay = load_state(thread)["relay"]
+    if relay.get("dispatch_id") or getattr(args, "dispatch_id", None):
+        with shares.dispatch_lock(ws.root):
+            data = recover_assignments(ws)
+            relay = load_state(thread)["relay"]
+            if (getattr(args, "dispatch_id", None) != relay.get("dispatch_id")
+                    or not relay.get("dispatch_created") or relay["dispatch_id"] not in data["dispatches"]):
+                return   # 建立中斷或已被新工作取代，絕不執行未提交的分派
     worker, owner = relay["worker"], relay["from"]
     log = lambda msg: print(f"[{now_str()}] {msg}", flush=True)  # noqa: E731
 
@@ -1336,8 +1403,17 @@ def cmd_work(ws: Workspace, args):
             add_system_note(thread, f"🔁 {NAMES[owner]} 已收回工作，{NAMES[worker]} 停止接手。")
             return
 
+        if config.shares(ws.root)[worker] == 0 and not (relay.get("user_override") and relay.get("reason")):
+            update_relay(thread, status="stopped", error="零權重實作未取得使用者明確覆寫。")
+            append_progress(thread, "零權重接手已停止", routing.ZERO_SHARE_ROLE)
+            return
+
         usage = party_usage(worker, relay.get("model"))
-        if quota.low(usage):
+        if relay.get("dispatch_id") and not shares.eligible([worker], {worker: 1}, {worker: usage}):
+            update_relay(thread, status="stopped", waiting_until=None, error="接手方額度不再合格，已退出，不等待重置。")
+            append_progress(thread, "接手方額度不再合格", "已退出，不等待重置；請在有合格接手方後建立新派工。")
+            return
+        if quota.low(usage) and not shares.quota_info(usage)["reset_elapsed"]:
             wake = (usage.get("resets_at") or time.time() + 3600) + 120
             update_relay(thread, status="waiting", waiting_until=wake)
             log(f"{NAMES[worker]} 額度不足，等到 {quota.fmt_time(wake)}")
@@ -1364,6 +1440,14 @@ def cmd_work(ws: Workspace, args):
                 prompt += f"\n\n{NAMES[owner]} 的工作單：\n{relay['handoff']}"
         else:
             prompt = WORK_PREAMBLE.format(**fmt) + relay["handoff"]
+        prompt += "\n\n" + routing.DISPATCH_GUIDE
+        if config.shares(ws.root)[worker] == 0:
+            prompt += "\n" + routing.ZERO_SHARE_ROLE
+            if relay.get("user_override"):
+                prompt += "\n本工作已記錄使用者明確指定你實作：" + relay.get("reason", "")
+            else:
+                update_relay(thread, status="stopped", error="零權重實作未取得使用者明確覆寫。")
+                return
         denial_note = ""
         state = load_state(thread)
         before = git_status(ws.root)
@@ -1409,6 +1493,10 @@ def cmd_work(ws: Workspace, args):
                 log(msg)
                 return
             if exhausted or quota.low(party_usage(worker, relay.get("model"))):
+                if relay.get("dispatch_id"):
+                    update_relay(thread, status="stopped", waiting_until=None, error="接手方額度不足，已退出，不等待重置。")
+                    append_progress(thread, "接手方額度不足", "已退出，不等待重置；呼叫重試不計為新派工。")
+                    return
                 quota.refresh(force=True)
                 if not quota.low(party_usage(worker, relay.get("model"))):
                     # 判定額度用盡，但查到的額度看不出不足（快取過舊或查不到）：先等一段時間，不要立刻重試；有次數上限
@@ -1872,16 +1960,16 @@ def cmd_parties(ws: Workspace, args):
         return
     usage = shares.recent_usage(ws.root, AI_PARTIES)
     total = sum(s["share"] for s in settings.values() if s["enabled"])
-    used = sum(usage[p]["tokens_7d"] for p, s in settings.items() if s["enabled"])
+    used = sum(usage[p]["dispatch_auto"] for p, s in settings.items() if s["enabled"])
     print(f"工作區：{ws.root}")
     for p, s in settings.items():
         detail = "、".join(v for v in (s["model"], s["effort"]) if v) or "CLI 預設"
         line = f"  {'☑' if s['enabled'] else '☐'} {NAMES[p]:<12} {detail}"
         if s["enabled"]:
-            # 分配比例只當 token 用量的參考目標（自動挑選依剩餘額度，見 shares.pick）；0 表示不自動分派給它
+            # 成功自動派工件數；呼叫 token 另列為觀測值。
             target = f"{int(s['share'] / total * 100 + 0.5)}%" if total else "-"
-            actual = f"{int(usage[p]['tokens_7d'] / used * 100 + 0.5)}%" if used else "-"
-            line += (f"｜分配比例 {s['share']}（token 目標 {target}，近 {shares.SHARE_DAYS:g} 天實際 {actual}）"
+            actual = f"{int(usage[p]['dispatch_auto'] / used * 100 + 0.5)}%" if used else "-"
+            line += (f"｜分配比例 {s['share']}（自動派工件數目標 {target}，近 {shares.SHARE_DAYS:g} 天實際 {actual}）"
                      if s["share"] else "｜分配比例 0（不自動分派）")
             line += f"｜內建子代理：{'允許' if s['subagents'] else '不允許'}"
             if s.get("sandbox"):
@@ -1977,7 +2065,7 @@ def cmd_route(ws: Workspace, args):
     """對話框所在的 AI 該怎麼處理使用者這則訊息（依此專案勾選的 AI，見 routing.py）；
     給 hook 沒有執行時（例如 Codex 還沒信任專案 hook）用"""
     me, enabled = canonical(args.me), ws.enabled()
-    text = routing.instruction(me, enabled)
+    text = routing.instruction(me, enabled, config.shares(ws.root))
     if args.json:
         print(json.dumps({"me": me, "enabled": enabled, "instruction": text}, ensure_ascii=False))
     else:
@@ -2139,6 +2227,49 @@ def install_plan() -> dict:
             "cmd": "agora" if agora_cmd() == "agora" or shutil.which("agora") else legacy}
 
 
+def plan_for_root(plan: dict, root: Path) -> dict:
+    """同一份範本（目前核心的 skills），但指令與 hook 路徑換成另一個 Agora 位置：
+    用來判斷「另一份 Agora 安裝的內容」是不是只差位置（例如面板用 ~/.agora/core、終端機用 pip -e 的 repo）"""
+    hook_file = root / "agoralib" / "quota_hook.py"
+    legacy = f"python {quote_path(root.as_posix() + '/agora.py')}"
+    return {**plan, "root": root, "template_root": plan.get("template_root", plan["root"]), "legacy": legacy,
+            "hook": f"python {quote_path(hook_file.as_posix())}", "agy_hook": f"python {no_space_path(hook_file)}",
+            "cmd": plan["cmd"] if plan["cmd"] == "agora" else legacy}
+
+
+HOOK_ROOT = re.compile(r"python\s+\"?(.+?)[/\\]agoralib[/\\]quota_hook\.py", re.I)
+
+
+def _all_commands(data) -> List[str]:
+    """設定檔（已解析的 JSON）裡所有 "command" 字串，不論巢狀結構"""
+    if isinstance(data, dict):
+        return [v for k, v in data.items() if k == "command" and isinstance(v, str)] \
+            + [c for v in data.values() for c in _all_commands(v)]
+    if isinstance(data, list):
+        return [c for v in data for c in _all_commands(v)]
+    return []
+
+
+def installed_roots(ws: Workspace) -> List[Path]:
+    """工作區的 hook 由哪些 Agora 位置安裝（hook 指令裡 quota_hook.py 的位置，依出現順序、不重複）；
+    設定檔損壞（不是合法 JSON）時略過該檔（_hook_commands），不中斷狀態查詢"""
+    roots: List[Path] = []
+    for path in (ws.root / ".claude" / "settings.local.json", ws.root / ".codex" / "hooks.json",
+                 ws.root / ".agents" / "hooks.json"):
+        for command in _hook_commands(path, _all_commands):
+            m = HOOK_ROOT.search(command)
+            if m and not any(same_root(Path(m.group(1)), r) for r in roots):
+                roots.append(Path(m.group(1)))
+    return roots
+
+
+def same_root(a: Path, b: Path) -> bool:
+    try:
+        return os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b))
+    except OSError:
+        return a.as_posix().lower() == b.as_posix().lower()
+
+
 AGENTS_BEGIN, AGENTS_END = "<!-- agora:begin -->", "<!-- agora:end -->"
 
 
@@ -2173,7 +2304,7 @@ def legacy_agents_section(root: Path, owned: bool = False) -> Tuple[str, Optiona
 
 def render_template(plan: dict, *parts: str) -> str:
     """skills 範本換成實際的指令與位置"""
-    content = (plan["root"] / "skills" / Path(*parts)).read_text(encoding="utf-8")
+    content = (plan.get("template_root", plan["root"]) / "skills" / Path(*parts)).read_text(encoding="utf-8")
     return content.replace(f"python {SKILL_ROOT}/agora.py", plan["cmd"]).replace(SKILL_ROOT, plan["root"].as_posix())
 
 
@@ -2190,21 +2321,36 @@ def install_status(ws: Workspace) -> dict:
     不論是否勾選都要裝：使用者可能在沒被勾選的 AI 對話框下指令，由它轉達給被勾選的 AI（見 routing.py）。
     只有 .agora/config.json（例如在面板調整過設定）不算安裝。"""
     plan = install_plan()
+    roots = installed_roots(ws)
+    others = [r for r in roots if not same_root(r, plan["root"])]
+    # 另一份 Agora（不同位置）安裝的：用目前的範本、換成它的位置來比對；內容一致只算「安裝來源不同」，不算舊版。
+    # 那份 Agora 已不存在（搬移或刪除）時 hook 無法執行，不能算已安裝
+    alive = [r for r in others if (r / "agoralib" / "quota_hook.py").is_file()]
+    plans = [plan] + [plan_for_root(plan, r) for r in alive]
     missing, outdated, checked, manual = [], [], [], []
+    via_other = []   # 只有換成安裝來源的位置才相符的項目
+    for r in others:
+        if r not in alive:
+            outdated.append(f"hook 指向已不存在的 Agora（{r.as_posix()}），install 會改回目前的位置")
 
-    def check(label: str, present: bool, current: bool):
+    def check(label: str, present: bool, current):
+        """current 是 plan → bool：依目前核心或安裝來源的位置，內容是否為目前版本"""
         checked.append(label)
         if not present:
             missing.append(label)
-        elif not current:
-            outdated.append(label)
+        elif not current(plans[0]):
+            if any(current(pl) for pl in plans[1:]):
+                via_other.append(label)
+            else:
+                outdated.append(label)
 
     for agent, rel in SKILL_DIRS:
         for skill in ("agora", "relay"):
             path = ws.root / rel / skill / "SKILL.md"
+            text = path.read_text(encoding="utf-8") if path.exists() else ""
             check(f"{SKILL_LABELS[agent]} skill「{skill}」", path.exists(),
-                  path.exists() and _normalized(path.read_text(encoding="utf-8"))
-                  == _normalized(render_template(plan, agent, skill, "SKILL.md")))
+                  lambda pl, text=text, agent=agent, skill=skill:
+                  _normalized(text) == _normalized(render_template(pl, agent, skill, "SKILL.md")))
     legacy, _ = legacy_agents_section(ws.root)
     if legacy == "section":
         outdated.append("AGENTS.md 裡舊的 Agora 段落（install 會移除）")
@@ -2214,27 +2360,31 @@ def install_status(ws: Workspace) -> dict:
                       "請手動移除 Agora 的內容與標記")
     commands = _hook_commands(ws.root / ".codex" / "hooks.json", lambda d: [
         h.get("command", "") for g in ((d.get("hooks") or {}).get("UserPromptSubmit") or []) for h in g.get("hooks", [])])
-    check("Codex hook", any("quota_hook.py" in c for c in commands), f"{plan['hook']} codex-prompt" in commands)
+    check("Codex hook", any("quota_hook.py" in c for c in commands),
+          lambda pl, commands=commands: f"{pl['hook']} codex-prompt" in commands)
     commands = _hook_commands(ws.root / ".claude" / "settings.local.json", lambda d: [
         h.get("command", "") for groups in (d.get("hooks") or {}).values() for g in groups for h in g.get("hooks", [])])
     check("Claude 額度 hook", any("quota_hook.py" in c for c in commands),
-          f"{plan['hook']} claude-prompt" in commands and f"{plan['hook']} claude-tool" in commands)
+          lambda pl, commands=commands: f"{pl['hook']} claude-prompt" in commands and f"{pl['hook']} claude-tool" in commands)
     commands = _hook_commands(ws.root / ".agents" / "hooks.json", lambda d: [
         h.get("command", "") for h in ((d.get("agora-quota") or {}).get("PreInvocation") or [])])
-    check("Antigravity 額度 hook", bool(commands), f"{plan['agy_hook']} agy-pre" in commands)
+    check("Antigravity 額度 hook", bool(commands), lambda pl, commands=commands: f"{pl['agy_hook']} agy-pre" in commands)
     matchers = _hook_commands(ws.root / ".agents" / "hooks.json", lambda d: [
         (g.get("matcher"), h.get("command", "")) for g in ((d.get("agora-subagents") or {}).get("PreToolUse") or [])
         for h in g.get("hooks", [])])
     check("Antigravity 子代理開關 hook", bool(matchers),
-          sorted(matchers) == sorted((t, f"{plan['agy_hook']} agy-tool") for t in AGY_SUBAGENT_TOOLS))
+          lambda pl: sorted(matchers) == sorted((t, f"{pl['agy_hook']} agy-tool") for t in AGY_SUBAGENT_TOOLS))
     if commands:   # 指令權限是全域設定，不能用來判斷這個專案有沒有裝；裝過才比對是否缺了新的指令
         allow = _hook_commands(Path.home() / ".gemini" / "antigravity-cli" / "settings.json",
                                lambda d: (d.get("permissions") or {}).get("allow") or [])
-        check("Antigravity 指令權限", True, all(f"command({plan['cmd']} {sub})" in allow for sub in AGENT_COMMANDS))
+        check("Antigravity 指令權限", True, lambda pl: all(f"command({pl['cmd']} {sub})" in allow for sub in AGENT_COMMANDS))
     present = len(checked) - len(missing)
     state = ("installed" if not missing and not outdated else "outdated" if not missing
              else "partial" if present else "missing")
-    return {"state": state, "missing": missing, "outdated": outdated, "manual": manual, "version": __version__}
+    return {"state": state, "missing": missing, "outdated": outdated, "manual": manual, "version": __version__,
+            "source": {"expected": plan["root"].as_posix(), "installed": roots[0].as_posix() if roots else None,
+                       "roots": [r.as_posix() for r in roots], "mixed": len(roots) > 1,
+                       "different": bool(via_other), "items": via_other}}
 
 
 def cmd_install(ws: Workspace, args):
@@ -2250,6 +2400,11 @@ def cmd_install(ws: Workspace, args):
             print(f"  缺少：{label}")
         for label in status["outdated"]:
             print(f"  舊版：{label}")
+        if status["source"]["different"] or status["source"]["mixed"]:
+            print(f"  安裝來源：{'、'.join(status['source']['roots'])}（目前執行的是 {status['source']['expected']}）；"
+                  + ("hook 指向不只一個 Agora 位置；" if status["source"]["mixed"] else "")
+                  + ("內容是目前版本，只有 Agora 位置不同。" if status["state"] == "installed" else "")
+                  + "要統一請固定用同一種方式安裝（面板或終端機）。")
         if status["state"] != "installed":
             print("執行 agora install 安裝或更新。")
         return
@@ -2550,7 +2705,10 @@ def main(argv=None):
         p = sub.add_parser(name, help="把工作分派給某一方在背景執行" + ("（assign 的別名）" if name == "relay" else ""))
         p.add_argument("thread")
         p.add_argument("--from", dest="sender", required=True, choices=who)
-        p.add_argument("--to", help="接手方（預設：勾選的其他 AI 中，這次等級對應額度池剩餘 % 最高的一方）")
+        p.add_argument("--to", help="指定接手方（預設省略：額度篩選後依比例輪流）")
+        p.add_argument("--dispatch-id", help="派工識別碼；同工作單以相同 ID 重試不重計，未給時建立新 ID")
+        p.add_argument("--reason", help="--to 必填的指定理由；零權重時須記錄使用者明確指定")
+        p.add_argument("--user-override", action="store_true", help="聲明使用者已明確指定零權重 AI 實作，須搭配 --reason")
         p.add_argument("--tier", choices=config.TIER_LEVELS,
                        help="等級：依專案設定（agora parties --tier）選模型；沒給時用標準等級，但不覆蓋討論串明確指定的模型")
         p.add_argument("--model", help="這次分派直接指定模型（不能和 --tier 同用）")
@@ -2662,6 +2820,7 @@ def main(argv=None):
 
     p = sub.add_parser("_work", help=argparse.SUPPRESS)
     p.add_argument("thread")
+    p.add_argument("--dispatch-id")
     p.set_defaults(func=cmd_work)
 
     p = sub.add_parser("list", help="列出討論串")

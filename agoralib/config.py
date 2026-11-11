@@ -18,7 +18,8 @@ add_dirs 是 Codex 接手工作（workspace-write）時額外可寫的目錄，�
 
 parties 沒寫到的 AI 視為啟用、模型與推理強度沿用各 CLI 自己的預設。
 討論串可以另外指定模型（new --model），優先於這裡的設定。
-share 是自動挑選接手方時的工作分配比例（預設 1，0 表示不自動分派給它），見 shares.py。
+share 是成功自動派工件數的權重（預設 1），按比例輪流，不保證 token 比例；0 只討論、主持、交接與審查，
+不自行或透過子代理實作，使用者明確指定才可覆寫。額度只當資格篩選，見 shares.py。
 subagents 是被 Agora 呼叫時能否啟動自己的內建子代理（預設 true）：Claude Code 禁用 Task 工具；
 Antigravity 由 install 裝的 PreToolUse hook 擋下 invoke_subagent 等工具；Codex 目前無法強制關閉，只在提示中要求。
 sandbox 只有 Codex 能設定，是接手工作時的沙箱（預設 workspace-write）；討論與總結一律 read-only。

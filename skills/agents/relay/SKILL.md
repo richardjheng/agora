@@ -20,16 +20,14 @@ description: 額度快用完時把工作交接給還有額度的 AI、回來後�
    - 如何驗證（要跑的測試指令）
 3. 交接（若目前沒有相關討論串，先 `python D:/github/agora/agora.py new "主題"`）：
    ```powershell
-   python D:/github/agora/agora.py assign <thread> --from <你> --to <AI> --trigger relay --file <交接單路徑>
+   python D:/github/agora/agora.py assign <thread> --from <你> --trigger relay --file <交接單路徑>
    ```
-   `--to` 用 ⚠️ 提醒裡指名的接手方（已依此專案的工作分配比例與額度挑好）；沒有提醒時可省略 `--to`，
-   Agora 會在啟用的 AI 中依分配比例挑選。
+   分派預設不寫 `--to`，交由 Agora 進行額度篩選後依比例輪流挑選合格接手方；若有特殊理由指定 `--to <AI>`，須加 `--reason "<理由>"`，零權重接手方另需 `--user-override`。
 4. 你無法自己排程喚醒，所以要告訴 Richard：交接給誰、討論串路徑、你的額度幾點重置，請他屆時叫你依本 skill 的 C 段收回。然後停止工作。
 
 ## B. 所有 AI 都不足
 
-- 若有其他 AI 比你早重置：照 A 段交接（接手程序會等接手方重置後才開始）。
-- 否則：把目前進度寫進討論串（`python D:/github/agora/agora.py send <thread> --from <你> --to none --file <進度檔>`），告訴 Richard 你的重置時間，然後停止。
+- 沒有合格接手方時 agora 會回報退出；告知使用者目前狀況，把目前進度寫進討論串（`python D:/github/agora/agora.py send <thread> --from <你> --to none --file <進度檔>`），告訴 Richard 你的重置時間，然後停止。
 
 ## C. 回來後收回
 

@@ -18,18 +18,16 @@ description: 額度快用完時把工作交接給還有額度的 AI（Antigravit
    - 如何驗證（要跑的測試指令）
 3. 交接（若目前沒有相關討論串，先 `new` 一個）：
    ```bash
-   python D:/github/agora/agora.py assign <thread> --from claude --to <AI> --trigger relay --file <交接單路徑>
+   python D:/github/agora/agora.py assign <thread> --from claude --trigger relay --file <交接單路徑>
    ```
-   `--to` 用 ⚠️ 提醒裡指名的接手方（已依此專案的工作分配比例與額度挑好）；沒有提醒時可省略 `--to`，
-   Agora 會在啟用的 AI 中依分配比例挑選。
+   分派預設不寫 `--to`，交由 Agora 進行額度篩選後依比例輪流挑選合格接手方；若有特殊理由指定 `--to <AI>`，須加 `--reason "<理由>"`，零權重接手方另需 `--user-override`。
 4. 安排自己在重置後喚醒：用 CronCreate 建立一次性排程，時間設在 Claude 重置時間後 3 分鐘，prompt 寫：
    `額度已重置：依 relay skill 的 C 段收回 <thread> 的工作並繼續。`
 5. 告訴使用者：交接給誰、討論串路徑、預計幾點回來。然後結束這一輪，不要再呼叫其他工具。
 
 ## B. 所有 AI 都不足
 
-- 若有其他 AI 比 Claude 早重置：照 A 段交接給它（`--to` 指定；接手程序會等它重置後才開始），並排程自己的喚醒。
-- 否則：把目前進度寫進討論串（`send <thread> --from claude --to none`），排程自己的喚醒，然後停止。
+- 沒有合格接手方時 agora 會回報退出；告知使用者目前狀況，把目前進度寫進討論串（`send <thread> --from claude --to none`），排程自己的喚醒，然後停止。
 
 ## C. 喚醒後收回
 

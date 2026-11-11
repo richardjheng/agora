@@ -408,11 +408,30 @@ class TestSnapshot(unittest.TestCase):
 
 
 class TestLive(unittest.TestCase):
+    def temporary_directory(self):
+        from contextlib import contextmanager
+
+        @contextmanager
+        def directory():
+            tmp = tempfile.TemporaryDirectory()
+            try:
+                yield tmp.name
+            finally:
+                for attempt in range(6):
+                    try:
+                        tmp.cleanup()
+                        break
+                    except PermissionError as e:
+                        if getattr(e, "winerror", None) not in (32, 33) or attempt == 5:
+                            raise
+                        time.sleep(0.1)
+        return directory()
+
     def make_live(self, tmp):
         return parties.Live(Path(tmp) / "live" / "discussion.md", "Claude Code", Path(tmp))
 
     def test_claude_events(self):
-        with tempfile.TemporaryDirectory() as tmp, patch("sys.stderr", io.StringIO()) as err:
+        with self.temporary_directory() as tmp, patch("sys.stderr", io.StringIO()) as err:
             live = self.make_live(tmp)
             delta = lambda t: {"type": "stream_event", "event": {"type": "content_block_delta",  # noqa: E731
                                                                   "delta": {"type": "text_delta", "text": t}}}
@@ -429,7 +448,7 @@ class TestLive(unittest.TestCase):
             self.assertFalse(live.path.exists())
 
     def test_codex_and_antigravity_events(self):
-        with tempfile.TemporaryDirectory() as tmp, patch("sys.stderr", io.StringIO()):
+        with self.temporary_directory() as tmp, patch("sys.stderr", io.StringIO()):
             live = self.make_live(tmp)
             parties.codex_event(live, {"type": "item.started", "item": {
                 "type": "command_execution",
@@ -447,17 +466,18 @@ class TestLive(unittest.TestCase):
         script = "import json,sys,time\nfor i in range(3): print(json.dumps({'n': i}), flush=True)\n" \
                  "time.sleep(float(sys.argv[1]))\n"
         seen = []
-        with tempfile.TemporaryDirectory() as tmp:
+        with self.temporary_directory() as tmp:
             events, _ = parties._run([sys.executable, "-c", script, "0"], Path(tmp), "", 30, seen.append)
             self.assertEqual([e["n"] for e in events], [0, 1, 2])
             self.assertEqual(seen, events)
-            start = time.time()
-            with self.assertRaises(subprocess.TimeoutExpired):   # 逾時 = timeout + 60 秒，這裡是 1 秒
+            start = time.monotonic()
+            with self.assertRaises(subprocess.TimeoutExpired) as caught:   # 逾時 = timeout + 60 秒，這裡是 1 秒
                 parties._run([sys.executable, "-c", script, "30"], Path(tmp), "", -59, None)
-            self.assertLess(time.time() - start, 15)
+            self.assertLess(time.monotonic() - start, 15)
+            self.assertEqual([json.loads(line)["n"] for line in caught.exception.output.splitlines()], [0, 1, 2])
 
     def test_stop_discards_partial_reply(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with self.temporary_directory() as tmp:
             ws = cli.Workspace(Path(tmp))
             thread = ws.threads / "t1"
             thread.mkdir(parents=True)
@@ -764,17 +784,18 @@ class TestHookAdvice(unittest.TestCase):
     def usage(self, pct, reset_in=3600):
         return {"remaining_pct": pct, "resets_at": time.time() + reset_in, "updated_at": time.time()}
 
-    def test_low_self_hands_to_party_with_most_quota(self):
+    def test_low_self_delegates_selection_to_assign(self):
         level, text = quota_hook.advice("claude", {"claude": self.usage(3), "antigravity": self.usage(40),
                                                    "codex": self.usage(80)})
         self.assertTrue(level.startswith("self-"))
-        self.assertIn("交接給 Codex", text)
+        self.assertIn("依比例輪流", text)
+        self.assertNotIn("--to codex", text)
 
-    def test_all_low_hands_to_earliest_reset_only_if_earlier(self):
+    def test_all_low_exits_without_waiting_for_reset(self):
         level, text = quota_hook.advice("claude", {"claude": self.usage(3, 7200), "antigravity": self.usage(2, 600),
                                                    "codex": self.usage(1, 9000)})
         self.assertTrue(level.startswith("all-"))
-        self.assertIn("Antigravity 最早重置", text)
+        self.assertIn("不等待重置", text)
 
     def test_healthy_self_no_advice(self):
         self.assertEqual(quota_hook.advice("claude", {"claude": self.usage(50), "codex": self.usage(1)}), (None, None))
@@ -849,34 +870,34 @@ class TestTiers(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             ws = self.setup(tmp)
             s = state_with(["claude", "codex", "antigravity"])
-            pools = {("antigravity", "gemini-4-argon-high"): 30, ("antigravity", "gemini-3.8-flash-high"): 99,
+            pools = {("antigravity", "gemini-4-argon-high"): 2, ("antigravity", "gemini-3.8-flash-high"): 99,
                      ("codex", None): 60}
             with patch.object(cli, "party_usage", side_effect=lambda p, m=None: pct(pools[(p, m)])), \
                     patch("sys.stdout", io.StringIO()):
                 worker, plan, decision = cli.pick_worker(ws, "claude", ["claude", "codex", "antigravity"], s, "heavy")
-                self.assertEqual((worker, decision["selection"]), ("codex", "auto"))   # 重度看 Argon 30%，不是 Flash 99%
+                self.assertEqual((worker, decision["selection"]), ("codex", "auto"))   # Argon 不合格，不能拿 Flash 99% 代替
                 worker, plan, _ = cli.pick_worker(ws, "claude", ["claude", "codex", "antigravity"], s, "light")
                 self.assertEqual((worker, plan["model"]), ("antigravity", "gemini-3.8-flash-high"))
-            self.assertEqual(decision["candidates"]["antigravity"]["remaining_pct"], 30)
+            self.assertEqual(decision["candidates"]["antigravity"]["remaining_pct"], 2)
 
-    def test_all_low_waits_for_earliest_reset_or_stops_when_unknown(self):
+    def test_all_low_exits_even_when_reset_is_known(self):
         with tempfile.TemporaryDirectory() as tmp:
             ws = self.setup(tmp)
             s = state_with(["claude", "codex", "antigravity"])
             usage = {"codex": pct(2, 7200), "antigravity": pct(3, 600)}
-            with patch.object(cli, "party_usage", side_effect=lambda p, m=None: usage[p]), patch("sys.stdout", io.StringIO()):
-                worker, _, decision = cli.pick_worker(ws, "claude", ["claude", "codex", "antigravity"], s, "heavy")
-            self.assertEqual((worker, decision["waiting"]), ("antigravity", True))
+            with patch.object(cli, "party_usage", side_effect=lambda p, m=None: usage[p]), self.assertRaises(SystemExit) as ctx:
+                cli.pick_worker(ws, "claude", ["claude", "codex", "antigravity"], s, "heavy")
+            self.assertIn("不等待重置", str(ctx.exception.code))
             unknown = {"codex": {**pct(2), "resets_at": None}, "antigravity": None}
             with patch.object(cli, "party_usage", side_effect=lambda p, m=None: unknown[p]), \
                     self.assertRaises(SystemExit) as ctx:
                 cli.pick_worker(ws, "claude", ["claude", "codex", "antigravity"], s, "heavy")
-            self.assertIn("不知道何時重置", str(ctx.exception.code))
+            self.assertIn("已退出", str(ctx.exception.code))
 
     def assign(self, ws, **kw):
         args = {"thread": "t1", "sender": "claude", "to": None, "message": "做事", "file": None, "session": None,
                 "from_summary": False, "yes": False, "tier": None, "model": None, "effort": None, "subagents": None,
-                "trigger": None, **kw}
+                "trigger": None, "reason": "測試：使用者指定接手方" if kw.get("to") else None, **kw}
         with patch.object(cli.jobs, "spawn", return_value=123), patch.object(cli.jobs, "pid_started", return_value=None), \
                 patch.object(cli.snapshot, "create", return_value={}), patch("sys.stdout", io.StringIO()), \
                 patch.object(cli, "party_usage", return_value=pct(80)):
@@ -1586,19 +1607,21 @@ class TestPartySettings(unittest.TestCase):
                 parties = quota_hook.project_parties()
         self.assertEqual(parties, ["claude", "antigravity"])
         usages = {p: x for p, x in {"claude": u(3), "antigravity": u(40), "codex": u(90)}.items() if p in parties}
-        self.assertIn("交接給 Antigravity", quota_hook.advice("claude", usages)[1])
+        self.assertIn("assign 預設不寫 --to", quota_hook.advice("claude", usages)[1])
+        usages["antigravity"] = u(2)
+        self.assertIn("沒有合格接手方", quota_hook.advice("claude", usages)[1])
 
 
 class TestShares(unittest.TestCase):
     def ok(self, pct=50):
         return {"remaining_pct": pct, "resets_at": time.time() + 3600, "updated_at": time.time()}
 
-    def test_picks_most_remaining_quota(self):
-        """挑剩餘 % 最高的一方；分配比例只當 0 = 不自動分派，不影響排序"""
+    def test_picks_by_weight_with_quota_only_as_eligibility(self):
+        """較低額度但較高權重的合格者先選；正權重參與輪詢。"""
         weights = {"claude": 5, "codex": 3, "antigravity": 1}
         usages = {"claude": self.ok(40), "codex": self.ok(60), "antigravity": self.ok(95)}
-        self.assertEqual(shares.pick(weights, weights, {}, usages), "antigravity")
-        self.assertEqual(shares.pick(weights, {**weights, "antigravity": 0}, {}, usages), "codex")
+        self.assertEqual(shares.pick(weights, weights, {}, usages), "claude")
+        self.assertEqual(shares.pick(weights, {**weights, "antigravity": 0}, {}, usages), "claude")
         self.assertIsNone(shares.pick(["claude"], weights, {}, {"claude": None}))   # 額度未知不當作滿額
 
     def test_skips_zero_share_and_low_quota(self):
@@ -1632,12 +1655,12 @@ class TestShares(unittest.TestCase):
             shares.log_path(root).write_text("\n".join(bad_lines) + "\n", encoding="utf-8")
             self.assertEqual(shares.recent_work(root), {"codex": 1})
 
-    def test_hook_hands_off_to_most_remaining_quota(self):
+    def test_hook_does_not_select_or_consume_dispatch_schedule(self):
         usages = {"claude": self.ok(3), "antigravity": self.ok(90), "codex": self.ok(40)}
         _, text = quota_hook.advice("claude", usages, {"antigravity": 1, "codex": 3}, {"antigravity": 0, "codex": 1})
-        self.assertIn("交接給 Antigravity", text)
+        self.assertIn("assign 預設不寫 --to", text)
         _, text = quota_hook.advice("claude", usages, {"antigravity": 0, "codex": 3})
-        self.assertIn("交接給 Codex", text)
+        self.assertIn("依比例輪流", text)
 
     def test_hook_with_no_eligible_partner_stops(self):
         level, text = quota_hook.advice("claude", {"claude": self.ok(3), "codex": self.ok(90)}, {"codex": 0})
@@ -1745,8 +1768,11 @@ class TestPrune(unittest.TestCase):
 
 
 class TestJobs(unittest.TestCase):
+    def temporary_directory(self):
+        return TestLive.temporary_directory(self)
+
     def test_run_records_exit_status(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with self.temporary_directory() as tmp:
             thread = Path(tmp)
             with self.assertRaises(SystemExit):
                 jobs.run(thread, lambda: None)
@@ -1759,7 +1785,7 @@ class TestJobs(unittest.TestCase):
             self.assertEqual((jobs.read(thread)["status"], jobs.read(thread)["exit"]), ("failed", 1))
 
     def test_dead_running_job_becomes_interrupted(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with self.temporary_directory() as tmp:
             thread = Path(tmp)
             jobs.update(thread, status="running", pid=99999999, started_ts=time.time() - 3600)
             self.assertIsNone(jobs.active(thread))
@@ -1768,7 +1794,7 @@ class TestJobs(unittest.TestCase):
             self.assertIsNotNone(jobs.active(thread))
 
     def test_follow_relays_output_and_exit_code(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with self.temporary_directory() as tmp:
             thread = Path(tmp)
             (thread / "job.log").write_text("═══ Codex ═══\n收到\n", encoding="utf-8")
             (thread / "job.err").write_text("…等待 Codex 回覆\n", encoding="utf-8")
@@ -1783,17 +1809,21 @@ class TestJobs(unittest.TestCase):
     def test_background_process_survives_caller_tree_kill(self):
         if not sys.platform.startswith("win"):
             self.skipTest("Windows 專用")
-        with tempfile.TemporaryDirectory() as tmp:
+        with self.temporary_directory() as tmp:
             out = Path(tmp) / "out.txt"
             pid = jobs.spawn([sys.executable, "-c", "import time; time.sleep(30)"], Path(tmp), out, out)
+            started = jobs.pid_started(pid)
             try:
                 self.assertTrue(jobs.pid_alive(pid))
-                started = jobs.pid_started(pid)
                 self.assertTrue(jobs.alive({"pid": pid, "pid_started": started}))
                 # PID 被別的程序重複使用：建立時間對不上就視為已結束
                 self.assertFalse(jobs.alive({"pid": pid, "pid_started": started - 100}))
             finally:
-                jobs.kill_tree(pid)
+                detail = jobs.kill_tree(pid)
+                deadline = time.monotonic() + 2
+                while jobs.pid_alive(pid, started) and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                self.assertFalse(jobs.pid_alive(pid, started), detail)
 
     CONSOLE_PROBE = """
 import ctypes, json, os, subprocess, sys
@@ -1817,7 +1847,7 @@ else:
 """
 
     def _console_probe(self, launch) -> dict:
-        with tempfile.TemporaryDirectory() as tmp:
+        with self.temporary_directory() as tmp:
             script, result = Path(tmp) / "probe.py", Path(tmp) / "result.json"
             script.write_text(self.CONSOLE_PROBE, encoding="utf-8")
             pid = launch(script, result, tmp)
@@ -1832,6 +1862,9 @@ else:
                     if not (pid and jobs.pid_alive(pid)):
                         break
                     time.sleep(0.1)
+                if pid and jobs.pid_alive(pid):
+                    detail = jobs.kill_tree(pid)
+                    self.assertFalse(jobs.pid_alive(pid), detail)
 
     def test_background_children_share_hidden_console(self):
         """背景程序呼叫的主控台程式要沿用它的隱藏主控台；DETACHED_PROCESS 時會各開一個新視窗（Windows Terminal 的新分頁）"""
@@ -2051,12 +2084,12 @@ class TestLock(unittest.TestCase):
 class TestVersion(unittest.TestCase):
     def test_version_defined_and_cli_flag(self):
         from agoralib import __version__
-        self.assertEqual(__version__, "0.2.20")
+        self.assertEqual(__version__, "0.2.21")
         out = io.StringIO()
         with patch("sys.stdout", out), self.assertRaises(SystemExit) as cm:
             cli.main(["--version"])
         self.assertEqual(cm.exception.code, 0)
-        self.assertIn("0.2.20", out.getvalue())
+        self.assertIn("0.2.21", out.getvalue())
 
 
 class TestQuotaWindows(unittest.TestCase):

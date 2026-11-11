@@ -252,6 +252,12 @@ def describe_tool(name: str, params: dict, workspace: Path) -> str:
     return f"{name} {value[:100] + ('…' if len(value) > 100 else '')}".strip()
 
 
+class _RunTimeout(subprocess.TimeoutExpired):
+    def __str__(self):
+        detail = super().__str__()
+        return detail + (f"\n{self.stderr[-1500:]}" if self.stderr else "")
+
+
 def _run(cmd: list, workspace: Path, stdin_text: Optional[str], timeout: int,
          on_event: Optional[Callable[[dict], None]] = None, extra_env: Optional[dict] = None) -> Tuple[list, str]:
     """執行 CLI，逐行解析 JSON 事件（on_event 即時處理）；逾時會終止整棵程序樹"""
@@ -262,7 +268,11 @@ def _run(cmd: list, workspace: Path, stdin_text: Optional[str], timeout: int,
     proc = subprocess.Popen(cmd, cwd=workspace, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", env=env,
                             **quota.NO_WINDOW)
+    import queue
+    from agoralib.jobs import kill_tree
+
     errors: list = []
+    output = queue.Queue()
 
     def feed():
         try:
@@ -271,24 +281,42 @@ def _run(cmd: list, workspace: Path, stdin_text: Optional[str], timeout: int,
         except OSError:
             pass
 
-    expired = threading.Event()
+    def read_stdout():
+        try:
+            for line in proc.stdout:
+                output.put(line)
+        finally:
+            proc.stdout.close()
+            output.put(None)
 
-    def kill():
-        expired.set()
-        if sys.platform.startswith("win"):
-            subprocess.run(["taskkill", "/pid", str(proc.pid), "/T", "/F"], capture_output=True, **quota.NO_WINDOW)
-        else:
-            proc.kill()
+    def read_stderr():
+        try:
+            for line in proc.stderr:
+                errors.append(line)
+        finally:
+            proc.stderr.close()
 
     workers = [threading.Thread(target=feed, daemon=True),
-               threading.Thread(target=lambda: errors.append(proc.stderr.read()), daemon=True)]
+               threading.Thread(target=read_stderr, daemon=True),
+               threading.Thread(target=read_stdout, daemon=True)]
     for w in workers:
         w.start()
-    timer = threading.Timer(timeout + 60, kill)
-    timer.start()
-    events, lines = [], []
+    events, lines, diagnostics = [], [], []
+    deadline = time.monotonic() + max(0, timeout + 60)
+    stdout_done, expired = False, False
     try:
-        for line in proc.stdout:
+        while not (stdout_done and not workers[1].is_alive() and proc.poll() is not None):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                expired = True
+                break
+            try:
+                line = output.get(timeout=min(remaining, 0.1))
+            except queue.Empty:
+                continue
+            if line is None:
+                stdout_done = True
+                continue
             lines.append(line)
             try:
                 event = json.loads(line)
@@ -300,17 +328,25 @@ def _run(cmd: list, workspace: Path, stdin_text: Optional[str], timeout: int,
                     on_event(event)
                 except Exception:
                     pass   # 即時顯示只是輔助，出錯不影響回覆
-        proc.wait()
     finally:
-        timer.cancel()
-    for w in workers:
-        w.join(timeout=10)
-    proc.stdout.close()
-    if not workers[1].is_alive():   # 孫程序仍握著 stderr 時還在讀，此時關閉會卡住，交給 daemon 執行緒
-        proc.stderr.close()
-    if expired.is_set():
-        raise subprocess.TimeoutExpired(cmd, timeout + 60)
-    stdout, stderr = "".join(lines), "".join(errors)
+        if expired or proc.poll() is None:
+            detail = kill_tree(proc.pid, proc)
+            if detail:
+                diagnostics.append(detail)
+        # 孫程序若仍握著 pipe，只限時等 reader；不可從這裡 close 取得它持有的鎖。
+        cleanup_deadline = time.monotonic() + 2
+        for w in workers:
+            w.join(timeout=max(0, cleanup_deadline - time.monotonic()))
+        try:
+            proc.wait(timeout=max(0, cleanup_deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            diagnostics.append("終止失敗：根程序仍未結束")
+        if any(w.is_alive() for w in workers):
+            diagnostics.append("終止失敗：輸入／輸出仍被程序占用，已停止等待")
+    stdout = "".join(lines)
+    stderr = "".join(errors) + ("\n" + "\n".join(diagnostics) if diagnostics else "")
+    if expired:
+        raise _RunTimeout(cmd, timeout + 60, output=stdout, stderr=stderr)
     if not events:
         try:
             events = [json.loads(stdout)]
