@@ -10,6 +10,7 @@ const { syncCore, readBuild } = require("./core");
 const { findPython, missingPythonMessage } = require("./python");
 const updates = require("./update");
 const { coreMatches } = require("./versions");
+const { relayModelLabel, tierLabel } = require("./modellabel");
 
 const PARTIES = ["claude", "antigravity", "codex"];
 const EXTENSION_VERSION = require("./package.json").version;
@@ -240,6 +241,7 @@ class ThreadsProvider {
     tip.appendMarkdown(`參與者：${Object.keys(state.parties).map((p) => NAMES[p] || p).join("、")}\n\n`);
     tip.appendMarkdown(`建立：${state.created}`);
     if (last) tip.appendMarkdown(`\n\n最後發言：${NAMES[last.speaker] || last.speaker}（${last.time}）`);
+    if (relay) tip.appendText(`\n\n等級 ${tierLabel(relay.tier)} · ${relayModelLabel(relay)}`);
     item.tooltip = tip;
     item.id = thread.id;
     item.command = { command: "agora.openTranscript", title: "開啟逐字稿", arguments: [thread] };
@@ -311,7 +313,8 @@ function notifyFinished(item) {
     const denied = deniedSummary(relay);
     warn = relay.status !== "done" || !!denied;
     text = `${NAMES[item.worker]} 接手「${thread.state.topic}」的工作：${RELAY_LABELS[relay.status] || relay.status}`
-      + (relay.blocked_reason ? `（${relay.blocked_reason}）` : "") + "。";
+      + (relay.blocked_reason ? `（${relay.blocked_reason}）` : "")
+      + ` · 等級 ${tierLabel(relay.tier)} · ${relayModelLabel(relay)}。`;
     if (denied) {
       text += ` ⚠️ ${denied}` + (relay.status === "done" ? "，之後卻宣告完成，請查證結果的來源。" : "。");
     }
@@ -1015,6 +1018,7 @@ function activate(context) {
     activityBar.tooltip = "Agora 進行中（關閉視窗也會繼續）\n" + items.map((x) => x.type === "discussion"
       ? `💬 ${x.topic}：${x.current ? `${NAMES[x.current]} 回覆中（${minutesSince(x.since)}）` : "啟動中"}`
       : `🛠 ${x.topic}：${NAMES[x.worker]} 接手${RELAY_LABELS[x.status] || x.status}，已跑 ${x.rounds} 輪`
+        + ` · 等級 ${tierLabel(x.tier)} · ${relayModelLabel(x)}`
         + (x.denied_summary ? `（⚠️ ${x.denied_summary}）` : "")).join("\n");
     activityBar.show();
   });

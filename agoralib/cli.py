@@ -236,9 +236,31 @@ def stats_meta(entry: Optional[dict]) -> str:
     return f"子代理 {sub['started']}" + (f"（{extra}）" if extra else "")
 
 
+def model_label(requested: Optional[str], reported: Optional[str]) -> str:
+    """顯示用的模型標示（逐字稿、status、面板共用同一規則；面板的 JS 版在 vscode/modellabel.js）：
+    回報與請求相同 → 模型 X；請求是 CLI 預設 → 模型 X（CLI 預設）；不同 → 請求 A → 回報 B；
+    沒有回報 → 請求 A（未回報）／CLI 預設（未回報）。不猜測，模型清單快取的預設值只算請求依據"""
+    requested, reported = requested or None, reported or None
+    if reported:
+        if not requested:
+            return f"模型 {reported}（CLI 預設）"
+        return f"模型 {reported}" if requested == reported else f"請求 {requested} → 回報 {reported}"
+    return f"請求 {requested}（未回報）" if requested else "CLI 預設（未回報）"
+
+
+def call_meta(opts: dict, stats: Optional[dict], extra: str = "") -> str:
+    """逐字稿標題：模型標示、推理強度（另外標示）、CLI 的其他資訊（時間、token 等）"""
+    parts = [model_label(opts.get("model"), (stats or {}).get("model"))]
+    if opts.get("effort"):
+        parts.append(f"推理強度 {opts['effort']}")
+    return ", ".join(parts + ([extra] if extra else []))
+
+
 def add_message(thread: Path, state: dict, speaker: str, text: str, via_cli: bool = False, meta: str = "",
-                stats: Optional[dict] = None):
+                stats: Optional[dict] = None, requested: Optional[dict] = None):
     message = {"speaker": speaker, "text": text.strip(), "time": now_str(), "via_cli": via_cli}
+    if requested is not None:   # 呼叫前請求的模型與推理強度（CLI 預設為 None）；實際回報在 stats.model
+        message.update(model_requested=requested.get("model") or None, effort_requested=requested.get("effort") or None)
     if stats:   # 這次呼叫的用量紀錄（shares.record_call），之後可以統計
         message["stats"] = {k: v for k, v in stats.items() if k not in ("time", "thread")}
         meta = ", ".join(x for x in (meta, stats_meta(stats)) if x)
@@ -423,8 +445,8 @@ def invoke(ws: Workspace, thread: Path, party: str, upto: Optional[int] = None) 
         prompt, session = build_prompt(ws, state, party, upto), info["session_id"]
         seen = len(state["messages"]) if upto is None else max(info["seen"], upto)
         opts = call_opts(ws, state, party)
-    model = "、".join(opts[f] for f in config.FIELDS if opts.get(f))
-    print(f"…等待 {NAMES[party]}{f'（{model}）' if model else ''} 回覆", file=sys.stderr, flush=True)
+    asked = "、".join(x for x in (opts.get("model") or "CLI 預設模型", opts.get("effort")) if x)
+    print(f"…等待 {NAMES[party]}（{asked}）回覆", file=sys.stderr, flush=True)
     jobs.set_current(party)
     before = git_status(ws.root)
     sessions = []   # 這次開過的對話（包含失敗的），寫回 state 時一併記下
@@ -467,8 +489,8 @@ def invoke(ws: Workspace, thread: Path, party: str, upto: Optional[int] = None) 
     def record(fresh):
         info = fresh["parties"].setdefault(party, new_party())
         info["session_id"] = session_id
-        add_message(thread, fresh, party, reply, via_cli=True, meta=", ".join(x for x in (model, meta) if x),
-                    stats=usage_entry)
+        add_message(thread, fresh, party, reply, via_cli=True, meta=call_meta(opts, usage_entry, meta),
+                    stats=usage_entry, requested=opts)
         info["seen"] = seen   # 它自己的回覆在 build_prompt 會略過；呼叫期間別人加的訊息下次才轉給它
     save(record)
     if before != after:
@@ -735,7 +757,8 @@ def cmd_summarize(ws: Workspace, args):
     with thread_lock(thread):
         state = load_state(thread)
         remember_session(state, party, session_id, opts=opts)
-        add_message(thread, state, party, f"【討論總結】\n{reply}", meta=f"總結（新對話）, {meta}", stats=usage_entry)
+        add_message(thread, state, party, f"【討論總結】\n{reply}", meta=f"總結（新對話）, {call_meta(opts, usage_entry, meta)}",
+                    stats=usage_entry, requested=opts)
         # 涵蓋到總結本身；總結期間別人加的訊息不算涵蓋，之後依此總結分派時會提示過期
         state["summary"] = {"by": party, "time": now_str(), "messages": len(messages) + 1,
                             "files": referenced_files(ws.root, order), "error": error}
@@ -833,8 +856,8 @@ def plan_model(ws: Workspace, state: dict, party: str, tier: Optional[str], mode
     explicit = (state["parties"].get(party) or {}).get("model")
     level = tier or (None if explicit else "standard")
     spec = tiers.get(level) if level else None
-    if spec:   # --effort 只覆蓋推理強度，模型仍依等級
-        return resolve_default(party, {"model": spec["model"], "effort": effort or spec.get("effort"),
+    if spec:   # --effort 只覆蓋推理強度，模型仍依等級；level 是實際套用的等級（沒給 --tier 但套用標準等級時為 standard）
+        return resolve_default(party, {"model": spec["model"], "effort": effort or spec.get("effort"), "level": level,
                                        "fallback": spec.get("fallback"), "source": f"{config.TIER_LABELS[level]}等級"})
     return resolve_default(party, {"model": base.get("model"), "effort": effort or base.get("effort"),
                                    "source": "討論串設定" if explicit else "專案設定" if base.get("model") else "CLI 預設"})
@@ -1013,7 +1036,9 @@ def cmd_assign(ws: Workspace, args):
                           "session_id": args.session, "external_session": args.session,
                           "handoff": text.strip(), "started": now_str(), "started_ts": time.time(),
                           "updated": now_str(), "baseline": baseline, "frozen": True,
-                          "tier": None if args.session else tier, "model": plan.get("model"), "effort": plan.get("effort"),
+                          "tier": plan.get("level"), "tier_requested": tier,
+                          "model": plan.get("model"), "effort": plan.get("effort"), "last_model_reported": None,
+                          "last_model_requested": None, "last_effort_requested": None,
                           "model_source": plan.get("source"), "fallback_used": bool(plan.get("fallback_used")),
                           "model_known": bool(plan.get("model_known")),
                           "subagents": subagents, "selection": decision["selection"],
@@ -1022,11 +1047,11 @@ def cmd_assign(ws: Workspace, args):
     try:
         shares.append(ws.root, {"kind": "dispatch", "party": worker, "thread": thread.name, "from": owner,
                                 "selection": decision["selection"], "trigger": getattr(args, "trigger", None) or "manual",
-                                "tier": tier, "model": plan.get("model"), "effort": plan.get("effort"),
+                                "tier": plan.get("level"), "tier_requested": tier, "model": plan.get("model"), "effort": plan.get("effort"),
                                 "fallback_used": bool(plan.get("fallback_used")), "candidates": decision["candidates"]})
     except OSError:
         pass
-    level = f"{config.TIER_LABELS[tier]}等級" if tier else plan.get("source")
+    level = f"{config.TIER_LABELS[plan['level']]}等級" if plan.get("level") else plan.get("source")
     add_system_note(thread, f"📋 {'自動挑選' if decision['selection'] == 'auto' else '指定'} {NAMES[worker]}"
                             f"（{level}：{plan.get('model') or 'CLI 預設模型'}"
                             + (f"、{plan['effort']}" if plan.get("effort") else "")
@@ -1354,12 +1379,16 @@ def cmd_work(ws: Workspace, args):
         opts["_stats"] = {}
         # 接手方執行的 agora build / check 用這輪開始時的指令，這輪中途改設定檔也不會被執行
         opts["env"] = {LOCKED_ENV: json.dumps({k: cfg.get(k) for k in LOCKED_KEYS}, ensure_ascii=False)}
+        # 呼叫前固定本輪請求；結束時與回報一起保存，執行中仍顯示上一輪完整的請求／回報。
+        requested = {"model": opts.get("model") or None, "effort": opts.get("effort") or None}
+        last_requested = {"last_model_requested": requested["model"], "last_effort_requested": requested["effort"]}
         try:
             reply, session_id, meta = call_party(worker, prompt, relay.get("session_id"), opts,
                                                  True, ws.root, WORK_TIMEOUT, thread, live=live)
         except (CallError, subprocess.TimeoutExpired, FileNotFoundError) as e:
             live.close()
             remember_failed_call(thread, shares.record_call(ws.root, worker, thread.name, "work", opts["_stats"], False))
+            update_relay(thread, **last_requested, last_model_reported=opts["_stats"].get("model") or None)
             guard_config(ws.root, config_before, thread, worker)
             guard_files(ws.root, files_before, thread, worker, round_ts)
             exhausted = isinstance(e, CallError) and e.quota_exhausted
@@ -1419,9 +1448,12 @@ def cmd_work(ws: Workspace, args):
 
         with thread_lock(thread, wait=WORKER_LOCK_WAIT):
             state = load_state(thread)
-            add_message(thread, state, worker, reply, via_cli=True, meta=f"接手第 {relay['rounds'] + 1} 輪, {meta}",
-                        stats=usage_entry)
-            state["relay"].update(session_id=session_id, rounds=relay["rounds"] + 1, updated=now_str())
+            add_message(thread, state, worker, reply, via_cli=True,
+                        meta=f"接手第 {relay['rounds'] + 1} 輪, {call_meta(requested, usage_entry, meta)}",
+                        stats=usage_entry, requested=requested)
+            # 最近一輪 CLI 回報的模型：每輪都更新，沒回報就是 None（不沿用上一輪，也不退回第一次的 model_reported）
+            state["relay"].update(session_id=session_id, rounds=relay["rounds"] + 1, updated=now_str(),
+                                  **last_requested, last_model_reported=usage_entry.get("model") or None)
             if usage_entry.get("model") and not state["relay"].get("model_reported"):
                 state["relay"]["model_reported"] = usage_entry["model"]   # CLI 回報的實際模型
                 if state["relay"].get("frozen") and not state["relay"].get("model"):
@@ -1472,6 +1504,28 @@ def wait_relay(thread: Path, seconds: Optional[int]):
         time.sleep(max(1, min(15, deadline - time.time())))
 
 
+def relay_model_fields(relay: dict) -> dict:
+    """目前設定與最近結束一輪的請求／回報；舊資料缺欄位時為 None，不重建歷史。"""
+    return {k: relay.get(k) for k in ("tier", "tier_requested", "model", "effort", "model_source",
+                                    "last_model_requested", "last_effort_requested", "last_model_reported")}
+
+
+def relay_model_line(relay: dict) -> str:
+    level = config.TIER_LABELS.get(relay.get("tier")) or "未指定"
+    if relay.get("tier_requested") and relay.get("tier") != relay.get("tier_requested"):
+        level += f"（指定 {config.TIER_LABELS.get(relay['tier_requested'], relay['tier_requested'])}，沒有設定）"
+    current = relay.get("model") or "CLI 預設模型"
+    if relay.get("effort"):
+        current += f"（推理強度 {relay['effort']}）"
+    recent = model_label(relay.get("last_model_requested"), relay.get("last_model_reported"))
+    if relay.get("last_effort_requested"):
+        recent += f"（推理強度 {relay['last_effort_requested']}）"
+    if not relay.get("rounds") and not any(relay.get(k) for k in
+            ("last_model_requested", "last_effort_requested", "last_model_reported")):
+        recent = "尚無完成的輪次"
+    return "｜".join((f"等級：{level}", f"目前請求：{current}", f"最近完成一輪：{recent}"))
+
+
 def relay_exit_code(relay: Optional[dict], alive: bool) -> int:
     """0＝已結束且完成（done）；1＝已結束但失敗、中斷、停止等；2＝仍在進行（等待逾時）"""
     if alive:
@@ -1504,13 +1558,14 @@ def cmd_status(ws: Workspace, args):
                           "blocked_reason": relay.get("blocked_reason"),
                           "denied": relay.get("denied") or [], "denied_summary": denial_summary(relay),
                           "warning": unverified_warning(relay), "last_progress": blocks[-1].strip() if blocks else None,
-                          "exit_code": code}, ensure_ascii=False, indent=2))
+                          **relay_model_fields(relay), "exit_code": code}, ensure_ascii=False, indent=2))
     else:
         if timed_out:
             print(f"⏳ 等待 {args.wait} 秒逾時，接手方仍在進行（狀態：{relay['status']}）")
         waiting = f"，等到 {quota.fmt_time(relay['waiting_until'])}" if relay.get("waiting_until") else ""
         print(f"接手方：{NAMES[relay['worker']]}｜狀態：{relay['status']}{waiting}｜已跑 {relay.get('rounds', 0)} 輪｜"
               f"背景程序：{'執行中' if alive else '已結束'}｜更新：{relay.get('updated')}")
+        print(relay_model_line(relay))
         if relay.get("status") == "blocked":
             print(f"⛔ 需要人工處理：{NAMES[relay['worker']]} {relay.get('blocked_reason') or ''}".rstrip())
         if relay.get("error") and not alive:
@@ -1898,7 +1953,8 @@ def activity(ws: Workspace) -> List[dict]:
                               "worker": relay["worker"], "status": relay["status"], "rounds": relay.get("rounds", 0),
                               "waiting_until": relay.get("waiting_until"), "started": relay.get("started"),
                               "pid": relay.get("pid"), "live": str(live) if live.exists() else None,
-                              "denied": len(relay.get("denied") or []), "denied_summary": denial_summary(relay)})
+                              "denied": len(relay.get("denied") or []), "denied_summary": denial_summary(relay),
+                              **relay_model_fields(relay)})
             else:
                 update_relay(thread, status="interrupted")
     return items

@@ -201,6 +201,36 @@ skills 建議的流程：決策、設計、取捨類問題用中立開場（不�
   ```
 - **VSCode 面板**：每個 AI 卡片提供「工作分派等級」區塊，三列分別下拉選擇模型與推理強度（有 efforts 時顯示），選「沿用目前模型」表示清除；可展開設定替代模型（fallback）。
 
+### 怎麼看用的是哪個模型
+
+AI 回覆時使用的模型依三種情況決定與記錄：
+
+1. **對話框本身**：你在各 AI 原生對話框（Claude Code / Antigravity / Codex）直接發言時，由各對話框自身的介面或設定決定。
+2. **Agora 討論**（`send`、`reply`、`auto`）：依討論串建立時指定的 `--model` 或專案設定（`agora parties`）向 CLI 請求；各輪回覆時若 CLI 回報了實際模型，會記錄在該則訊息。
+3. **工作分派**（`assign`、`work`）：依指定等級（`--tier`）對應設定或 `--model` 在分派時凍結請求模型與等級；接手方每輪執行時獨立記錄該輪 CLI 回報的實際模型。
+
+#### 標示規則
+
+模型標示規則（`model_label(requested, reported)`，空字串視為 None）：
+
+| 請求模型（requested） | 回報模型（reported） | 顯示結果 | 說明 |
+|---|---|---|---|
+| `"opus"` | `"opus"` | `模型 opus` | 請求與回報完全一致 |
+| `None` | `"gpt-6-astra"` | `模型 gpt-6-astra（CLI 預設）` | 未指定請求模型，CLI 回報了預設模型 |
+| `"opus"` | `"claude-opus-5-5"` | `請求 opus → 回報 claude-opus-5-5` | 請求別名或系列，CLI 回報了具體版本 |
+| `"gemini-4-argon-high"` | `None` | `請求 gemini-4-argon-high（未回報）` | 有指定請求模型，但 CLI 未回報實際模型 |
+| `None` | `None` | `CLI 預設（未回報）` | 未指定請求模型，且 CLI 未回報 |
+| `""` | `""` | `CLI 預設（未回報）` | 空字串視同 None |
+
+> 推理強度與等級不放進此字串，另外標示。等級顯示名稱：`light`＝輕量、`standard`＝標準、`heavy`＝重度；未指定或未套用任何等級時顯示「未指定」。
+
+#### 在哪裡看
+
+- **逐字稿標題（`transcript.md`）**：每則訊息的次標題會附帶模型標示（例如 `_(模型 opus, 推理強度 high)_` 或 `_(請求 gemini-4-argon-high（未回報）)_`）。
+- **`agora status`**：終端顯示接手方等級、最近一輪的模型標示與推理強度；`--json` 與 `agora activity --json` 包含 `tier`、`tier_requested`、`model`、`effort`、`model_source`、`last_model_reported`。
+- **VSCode 面板與狀態列**：面板中的卡片與分派項目提供 tooltip 提示目前等級、請求與回報模型；VSCode 狀態列也會在滑鼠懸停時顯示詳細模型資訊。
+
+
 ### 工作分配比例與自動挑選
 
 `share`（預設 1）：`0` 表示不自動分派給它；其他值只是 **token 用量的參考目標**（`agora parties` 與面板顯示「token 目標 % · 近 7 天實際 %」），不影響挑選。`assign` 沒指定 `--to` 時，交由 Agora 自動挑選接手方：

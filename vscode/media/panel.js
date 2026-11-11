@@ -378,6 +378,8 @@
       }
       if (state.errors.parties) children.push(el("div", { class: "error" }, state.errors.parties));
       if (state.parties) {
+        children.push(el("p", { class: "muted small" },
+          "這裡的模型與等級只影響 Agora 發起的討論與分派；你直接在對話框對話時，模型請看各 AI 自己的介面。"));
         children.push(...state.order.map(partyCard));
       } else if (!state.errors.parties) {
         children.push(el("p", { class: "muted" }, "載入中…"));
