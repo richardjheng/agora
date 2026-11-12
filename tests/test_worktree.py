@@ -15,6 +15,32 @@ from unittest.mock import patch
 from agoralib import cli, config, parties, prune, snapshot, worktree
 
 
+class TestGitEnvironment(unittest.TestCase):
+    def test_scoped_trust_preserves_existing_options_without_changing_parent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            control, task = Path(tmp) / "control", Path(tmp) / "task"
+            original = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.quotepath", "GIT_CONFIG_VALUE_0": "false"}
+            result = worktree.git_environment(original, (control, task))
+            self.assertEqual(original["GIT_CONFIG_COUNT"], "1")
+            self.assertEqual(result["GIT_CONFIG_COUNT"], "3")
+            self.assertEqual(result["GIT_CONFIG_VALUE_0"], "false")
+            self.assertEqual({result["GIT_CONFIG_VALUE_1"], result["GIT_CONFIG_VALUE_2"]},
+                             {control.resolve().as_posix(), task.resolve().as_posix()})
+            self.assertEqual(worktree.git_environment(result, (control, task)), result)
+
+    def test_git_trust_is_only_injected_for_task_or_controller(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            control, task, other = Path(tmp) / "control", Path(tmp) / "task", Path(tmp) / "other"
+            env = {worktree.CONTROL_ENV: str(control), worktree.WORK_ENV: str(task)}
+            with patch.dict(os.environ, env, clear=True), patch.object(worktree.subprocess, "run") as run:
+                run.return_value = subprocess.CompletedProcess([], 0, "ok", "")
+                worktree.git(control, "status")
+                self.assertEqual(run.call_args.kwargs["env"]["GIT_CONFIG_COUNT"], "2")
+                worktree.git(other, "status")
+                self.assertNotIn("GIT_CONFIG_COUNT", run.call_args.kwargs["env"])
+                self.assertNotIn("GIT_CONFIG_COUNT", os.environ)
+
+
 class WorktreeTests(unittest.TestCase):
     def setUp(self):
         env = patch.dict(os.environ)

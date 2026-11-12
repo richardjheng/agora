@@ -29,9 +29,30 @@ class WorktreeError(RuntimeError):
     pass
 
 
+def git_environment(env, roots):
+    """Trust only the task's two repositories in child processes, never globally."""
+    env = dict(env)
+    count = int(env.get("GIT_CONFIG_COUNT", "0"))
+    existing = {env.get(f"GIT_CONFIG_VALUE_{i}") for i in range(count)
+                if env.get(f"GIT_CONFIG_KEY_{i}") == "safe.directory"}
+    for root in roots:
+        path = Path(root).resolve().as_posix()
+        if path not in existing:
+            env[f"GIT_CONFIG_KEY_{count}"] = "safe.directory"
+            env[f"GIT_CONFIG_VALUE_{count}"] = path
+            existing.add(path)
+            count += 1
+    env["GIT_CONFIG_COUNT"] = str(count)
+    return env
+
+
 def git(root, *args):
+    env = dict(os.environ)
+    task_roots = [env.get(CONTROL_ENV), env.get(WORK_ENV)]
+    if all(task_roots) and Path(root).resolve() in [Path(p).resolve() for p in task_roots]:
+        env = git_environment(env, task_roots)
     proc = subprocess.run(["git", *args], cwd=root, capture_output=True, text=True, encoding="utf-8",
-                          errors="replace", timeout=300, **quota.NO_WINDOW)
+                          errors="replace", timeout=300, env=env, **quota.NO_WINDOW)
     if proc.returncode:
         raise WorktreeError(f"git {' '.join(args[:2])}: {(proc.stderr or proc.stdout).strip()[:500]}")
     return proc.stdout if "-z" in args else proc.stdout.strip()
@@ -140,7 +161,7 @@ def environment(meta):
                PATH=str(python_path(target).parent) + os.pathsep + env.get("PATH", ""),
                AGORA_WORKSPACE=str(target), **{CONTROL_ENV: meta["control_root"], WORK_ENV: str(target),
                                               DISPATCH_ENV: meta["dispatch_id"], MANIFEST_ENV: meta["manifest"]})
-    return env
+    return git_environment(env, (meta["control_root"], target))
 
 
 def setup_environment(meta):

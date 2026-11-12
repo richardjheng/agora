@@ -28,7 +28,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from agoralib import __version__, config, jobs, models, prune, quota, routing, shares, snapshot, worktree
+from agoralib import __version__, completions, config, jobs, models, prune, quota, routing, shares, snapshot, worktree
 from agoralib.parties import (AGORA_ROOT as AGORA_ROOT_DIR, AI_PARTIES, CALLERS, HUMAN, NAMES,
                               LOCKED_ENV, NESTED_ENV, CallError, Live, agora_cmd, canonical,
                               STREAM_INTERRUPTED, no_space_path, quote_path, AGY_SUBAGENT_TOOLS)
@@ -811,6 +811,7 @@ def update_relay(thread: Path, **fields) -> dict:
         state = load_state(thread)
         state.setdefault("relay", {}).update(fields, updated=now_str())
         save_state(thread, state)
+        completions.archive(thread, "relay", state["relay"], state.get("topic", ""))
         return state["relay"]
 
 
@@ -1003,6 +1004,7 @@ def recover_assignments(ws: Workspace):
                 if relay.get("dispatch_id") == entry["dispatch_id"] and not relay.get("dispatch_created"):
                     relay.update(status="failed", error="派工建立中斷，未提交，不計件。")
                     save_state(thread, state)
+                    completions.archive(thread, "relay", relay, state.get("topic", ""))
     return data
 
 
@@ -1102,6 +1104,10 @@ def _cmd_assign_locked(ws: Workspace, args):
         state = load_state(thread)
         state["parties"].setdefault(worker, new_party())
         add_message(thread, state, owner, f"【工作分派 → {NAMES[worker]}】\n{text}")
+        previous = state.get("relay") or {}
+        if previous.get("status") in RELAY_ACTIVE:
+            previous = {**previous, "status": "interrupted"}  # old worker was confirmed dead above
+        completions.archive(thread, "relay", previous, state.get("topic", ""))
         # 模型在分派時凍結：之後各輪都用這裡記的，專案設定中途改了也不會悄悄換模型（model 為 None 表示 CLI 預設）
         state["relay"] = {"from": owner, "worker": worker, "status": "starting", "rounds": 0,
                           **{k: task.get(k) for k in worktree.FIELDS},
@@ -2119,6 +2125,36 @@ def cmd_parties(ws: Workspace, args):
                                                                     if u["subagents_unobserved"] else ""))
 
 
+def cmd_watch(ws: Workspace, args):
+    """Wait for any workspace result, including results completed before this call."""
+    timeout = args.timeout
+    if timeout is not None and timeout < 0:
+        sys.exit("--timeout 必須大於或等於 0。")
+    deadline = None if timeout is None else time.monotonic() + timeout
+    while True:
+        def emit(items):
+            for item in items:
+                print(completions.describe(item), flush=True)
+        try:
+            count, active = completions.deliver(ws.control_root, emit)
+        except TimeoutError:
+            count, active = 0, True  # another reporter currently owns delivery
+        except (OSError, ValueError) as exc:
+            sys.exit(f"無法讀寫完成回報紀錄：{exc}")
+        if count:
+            if active:
+                print("仍有進行中的分派／討論；回報後請繼續執行 agora watch。")
+            return
+        if not active:
+            print("目前沒有進行中的分派／討論，也沒有尚未回報的完成項目。")
+            return
+        remaining = None if deadline is None else deadline - time.monotonic()
+        if remaining is not None and remaining <= 0:
+            print("等待逾時，尚無新的完成項目；背景工作仍繼續。")
+            sys.exit(2)
+        time.sleep(0.5 if remaining is None else min(0.5, remaining))
+
+
 def cmd_wait(ws: Workspace, args):
     """接上背景進行中的討論，顯示它的輸出直到結束"""
     thread = ws.resolve_thread(args.thread)
@@ -2435,7 +2471,10 @@ def legacy_agents_section(root: Path, owned: bool = False) -> Tuple[str, Optiona
 def render_template(plan: dict, *parts: str) -> str:
     """skills 範本換成實際的指令與位置"""
     content = (plan.get("template_root", plan["root"]) / "skills" / Path(*parts)).read_text(encoding="utf-8")
-    return content.replace(f"python {SKILL_ROOT}/agora.py", plan["cmd"]).replace(SKILL_ROOT, plan["root"].as_posix())
+    # One pass: a worktree command may itself contain SKILL_ROOT as its prefix.
+    command = f"python {SKILL_ROOT}/agora.py"
+    return re.sub(re.escape(command) + "|" + re.escape(SKILL_ROOT),
+                  lambda match: plan["cmd"] if match.group() == command else plan["root"].as_posix(), content)
 
 
 def _hook_commands(path: Path, collect) -> List[str]:
@@ -2914,6 +2953,10 @@ def main(argv=None):
     p.add_argument("--refresh", action="store_true", help="忽略快取重新查詢")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_models)
+
+    p = sub.add_parser("watch", help="等待工作區任何分派或討論結束，回報尚未回報的結果")
+    p.add_argument("--timeout", type=int, metavar="秒數", help="最多等待幾秒；逾時 exit 2，完成或無工作 exit 0")
+    p.set_defaults(func=cmd_watch)
 
     p = sub.add_parser("wait", help="接上背景進行中的討論，顯示輸出直到結束")
     p.add_argument("thread")

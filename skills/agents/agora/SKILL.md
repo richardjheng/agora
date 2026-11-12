@@ -7,7 +7,7 @@ description: 透過 Agora 與其他 AI（Claude Code、Antigravity、Codex）進
 
 工具：`python D:/github/agora/agora.py`（說明：D:/github/agora/README.md）。討論串在工作區的 `.agora/threads/<id>/`，
 `transcript.md` 是給使用者看的逐字稿。
-討論在背景程序執行，等待被中斷時仍會繼續，之後用 `python D:/github/agora/agora.py wait <id>` 接上，`activity` 查看所有進行中的討論與分派。
+討論在背景程序執行，等待被中斷時仍會繼續，之後用 `python D:/github/agora/agora.py wait <id>` 接上，`activity` 查看所有進行中的討論與分派，`watch` 監控任一分派或討論結束。
 若你是被 Agora 呼叫來回覆的（環境變數 AGORA_INVOKED=1），直接回覆即可，不要再執行討論、分派或 route 指令。
 
 ## 你的身分
@@ -30,9 +30,9 @@ description: 透過 Agora 與其他 AI（Claude Code、Antigravity、Codex）進
      ```powershell
      $T = python D:/github/agora/agora.py new "主題"
      python D:/github/agora/agora.py assign $T --from <你> --to <它> --reason "使用者只勾選該 AI" --allow "<允許修改的路徑或 glob>" --file 工作單.md
-     python D:/github/agora/agora.py status $T --wait 900
+     python D:/github/agora/agora.py watch                      # 一律用 run_in_background（或等效機制）執行；任一任務結束即返回
      ```
-     完成後讀 progress.md、審查 git diff、跑 `python D:/github/agora/agora.py check`，依審查原則向使用者呈現它做了什麼與審查發現的問題。
+     完成後讀 progress.md、審查 git diff、跑 `python D:/github/agora/agora.py check`，依審查原則向使用者呈現它做了什麼與審查發現的問題，並說明下一步；若還有其他進行中的任務，對剩下的繼續 watch。
      有問題時再分派給它修，不要自己改。
    - 問題、分析、說明（不改檔）：`python D:/github/agora/agora.py send $T --from <你> --to <它> --file 訊息.md`，
      把它的回覆完整呈現給使用者；你查證後發現的錯誤另外標明是你的註記。
@@ -81,8 +81,13 @@ description: 透過 Agora 與其他 AI（Claude Code、Antigravity、Codex）進
 python D:/github/agora/agora.py assign $T --from <你> --tier standard --allow "<允許修改的路徑或 glob>" --file 工作單.md
 python D:/github/agora/agora.py summarize $T --by claude      # 或：先總結，再用總結的工作單分派
 python D:/github/agora/agora.py assign $T --from <你> --tier standard --allow "<允許修改的路徑或 glob>" --from-summary
-python D:/github/agora/agora.py status $T --wait 900
+python D:/github/agora/agora.py watch                          # 同時有分派或背景討論時，一律用 run_in_background（或等效機制）執行
 ```
+
+### 背景通知與回報機制（主要機制＋保險）
+- **主要機制（watch）**：同時有分派或背景討論時，一律用 `run_in_background`（或該 CLI 的等效機制，如背景工作／終端指令）執行 `python D:/github/agora/agora.py watch`（等到任一分派或討論結束即返回 exit 0）。收到結束通知後，立即向使用者回報結論、branch／commit 結果與下一步，再對剩下的背景項目繼續 watch。
+- **保險機制（hook 補報）**：CLI 沒有背景通知能力時（或未及時收到通知），hook（Codex 的 `UserPromptSubmit`、Antigravity 的 `PreInvocation`）會在下一次使用者互動或提示注入時，附上「上次回報後已結束的分派／討論」一行摘要並標記已回報；屆時依補報內容向使用者回報。被 Agora 呼叫的 CLI（`AGORA_INVOKED=1`）不附。
+- **限制說明**：接手 CLI 在背景執行，對話視窗不能憑空冒出訊息；主要機制（watch 背景監控喚醒）＋保險（hook 補報）是確保所有背景任務結束皆能回報到對話視窗的關鍵機制。
 
 ### 分派對象（--to）
 - **預設不寫 `--to`**：交給 Agora 依各方的自動派工比例（加權輪流）與額度資格自動挑選接手方。
@@ -115,6 +120,6 @@ python D:/github/agora/agora.py status $T --wait 900
 ## 規則
 
 - 用 `--from <你>` 發言。討論期間不改程式碼。
-- **主動回報與完成通知**：發起背景討論、總結或分派時，**必須設好完成通知**（例如 `python D:/github/agora/agora.py wait <id>`、`python D:/github/agora/agora.py status <id> --wait 900`）；結束後主動向使用者回報結論、共識、分歧與下一步，不等使用者問。說了「完成後會給你看」就一定要做到。
+- **主動回報與完成通知**：發起背景討論、總結或分派時，**必須設好完成通知**：同時有分派或背景討論時，一律用 `run_in_background`（或該 CLI 等效機制）執行 `python D:/github/agora/agora.py watch`（亦可用 `wait <id>` 或 `status <id> --wait` 針對單一任務）；收到結束就向使用者回報結論、共識、分歧與下一步，再對剩下的繼續 watch。CLI 沒有背景通知能力時，依 hook 的補報在下一次互動回報。這是主要機制＋保險，不能讓對話視窗憑空冒出訊息。說了「完成後會給你看」就一定要做到。
 - **子代理非強制隔離**：子代理在同一 worktree 執行，由父代理整合驗證；文件與說明不宣稱子代理有強制隔離或獨立 worktree。
 - 其他 AI 的說法一律先查證。

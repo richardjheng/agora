@@ -1560,6 +1560,27 @@ class TestInstall(unittest.TestCase):
                 self.assertEqual(plan["cmd"], plan["legacy"])
                 self.assertIn(f"{plan['legacy']} new", cli.render_template(plan, "agents", "agora", "SKILL.md"))
 
+    def test_render_template_does_not_replace_inserted_command_or_root_again(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            template_root = Path(tmp)
+            template = template_root / "skills" / "template.md"
+            template.parent.mkdir()
+            template.write_text(
+                f"python {cli.SKILL_ROOT}/agora.py watch\n"
+                f"README: {cli.SKILL_ROOT}/README.md\n"
+                f"python {cli.SKILL_ROOT}/agora.py check\n",
+                encoding="utf-8")
+            for location in (f"{cli.SKILL_ROOT}/.agora/worktrees/task",
+                             f"{cli.SKILL_ROOT}-copy", "C:/Other Location/agora"):
+                root = Path(location)
+                for command in ("agora", f'python "{root.as_posix()}/agora.py"'):
+                    with self.subTest(root=location, command=command):
+                        plan = {"root": root, "cmd": command, "template_root": template_root}
+                        self.assertEqual(cli.render_template(plan, "template.md"),
+                                         f"{command} watch\n"
+                                         f"README: {root.as_posix()}/README.md\n"
+                                         f"{command} check\n")
+
     def test_worker_cannot_run_install(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {parties.NESTED_ENV: "1"}):
             with self.assertRaises(SystemExit):
@@ -1895,7 +1916,9 @@ else:
         root = str(Path(__file__).resolve().parents[1])
 
         def launch(script, result, tmp):   # 等它跑完，不需要回傳 PID
-            subprocess.run([sys.executable, str(script), "no_window", str(result), root],
+            # The Windows venv launcher starts another interpreter, which can
+            # allocate a console. Probe DETACHED_PROCESS on the interpreter itself.
+            subprocess.run([getattr(sys, "_base_executable", sys.executable), str(script), "no_window", str(result), root],
                            creationflags=0x00000008,   # DETACHED_PROCESS
                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
         data = self._console_probe(launch)
@@ -2092,12 +2115,12 @@ class TestLock(unittest.TestCase):
 class TestVersion(unittest.TestCase):
     def test_version_defined_and_cli_flag(self):
         from agoralib import __version__
-        self.assertEqual(__version__, "0.2.22")
+        self.assertEqual(__version__, "0.2.23")
         out = io.StringIO()
         with patch("sys.stdout", out), self.assertRaises(SystemExit) as cm:
             cli.main(["--version"])
         self.assertEqual(cm.exception.code, 0)
-        self.assertIn("0.2.22", out.getvalue())
+        self.assertIn("0.2.23", out.getvalue())
 
 
 class TestQuotaWindows(unittest.TestCase):

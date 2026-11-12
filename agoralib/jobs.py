@@ -15,6 +15,7 @@ import os
 import subprocess
 import sys
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
@@ -320,6 +321,14 @@ def update(thread: Path, **fields) -> dict:
     tmp = thread / "job.json.tmp"
     tmp.write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(job_path(thread))
+    # Lazy import: completions also uses process-liveness helpers from this module.
+    from agoralib import completions
+    if job.get("status") in completions.TERMINAL:
+        try:
+            state = completions.read_object(thread / "state.json")
+        except (OSError, ValueError):
+            state = {}
+        completions.archive(thread, "discussion", job, state.get("topic", ""))
     return job
 
 
@@ -337,8 +346,14 @@ def active(thread: Path) -> Optional[dict]:
 
 
 def start(thread: Path, kind: str, argv: list, cwd: Path) -> dict:
-    update(thread, kind=kind, status="starting", pid=None, current=None, since=None, exit=None,
-           started=now_str(), started_ts=time.time(), finished=None)
+    from agoralib import completions
+    try:
+        state = completions.read_object(thread / "state.json")
+    except (OSError, ValueError):
+        state = {}
+    completions.archive(thread, "discussion", read(thread), state.get("topic", ""))
+    update(thread, kind=kind, job_id=uuid.uuid4().hex, status="starting", pid=None, current=None, since=None, exit=None,
+           started=now_str(), started_ts=time.time(), finished=None, error=None)
     try:   # PID 由背景程序自己寫入（run），避免和它同時改 job.json
         spawn(argv, cwd, thread / "job.log", thread / "job.err", env={JOB_ENV: str(thread)})
     except Exception as e:

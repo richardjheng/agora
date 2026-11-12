@@ -11,7 +11,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from agoralib import cli, config, parties, quota, quota_hook, routing, shares
+from agoralib import cli, completions, config, parties, quota, quota_hook, routing, shares
 
 
 def make_thread(root, name):
@@ -110,6 +110,20 @@ class TestDispatch(unittest.TestCase):
         assign(ws, args)
         self.assertEqual(cli.load_state(thread)["relay"]["worker"], "codex")
         self.assertEqual(self.counts()["codex"]["dispatch_auto"], 1)
+
+    def test_new_assignment_archives_unreported_previous_result(self):
+        for status in ("done", "running"):
+            ws, thread = self.make("old-" + status)
+            state = cli.load_state(thread)
+            state["relay"] = {"status": status, "dispatch_id": "previous-" + status,
+                              "worker": "codex", "pid": 99999999, "branch": "agora/previous"}
+            cli.save_state(thread, state)
+            assign(ws, args_for(thread.name, dispatch_id="next-" + status))
+        output = []
+        completions.deliver(self.root, output.extend)
+        previous = {item["dispatch_id"]: item for item in output if item.get("dispatch_id", "").startswith("previous-")}
+        self.assertEqual(previous["previous-done"]["status"], "done")
+        self.assertEqual(previous["previous-running"]["status"], "interrupted")
 
     def test_explicit_dispatch_does_not_advance_automatic_schedule(self):
         ws, _ = self.make("explicit")

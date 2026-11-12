@@ -20,7 +20,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from agoralib import config, quota, routing, shares  # noqa: E402
+from agoralib import completions, config, quota, routing, shares  # noqa: E402
 
 STATE_FILE = quota.AGORA_HOME / "hook_state.json"
 NAMES = quota.LABELS
@@ -64,6 +64,9 @@ def advice(me: str, usages: dict, weights: dict | None = None, work: dict | None
 
 def project_root() -> Path | None:
     start = os.getenv("CLAUDE_PROJECT_DIR") or os.getenv("AGORA_WORKSPACE") or os.getcwd()
+    if (os.getenv("AGORA_WORKTREE") and os.getenv("AGORA_CONTROL_ROOT")
+            and Path(start).resolve() == Path(os.environ["AGORA_WORKTREE"]).resolve()):
+        return Path(os.environ["AGORA_CONTROL_ROOT"]).resolve()
     return config.find_root(Path(start).resolve())
 
 
@@ -116,27 +119,41 @@ def main():
         state[key] = level
         save_state(state)
 
-    if mode in ("claude-prompt", "codex-prompt"):
-        route = routing_line(me, str(payload.get("prompt") or ""))
-        lines = [status] + ([text] if text else []) + ([route] if route else [])
-        out = {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": "\n".join(lines)}}
-    elif mode == "claude-tool":
-        out = {}
-        if text and not already:
-            out = {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": f"{status}\n{text}"}}
-    else:  # agy-pre
-        first = payload.get("invocationNum", 1) <= 1
-        msgs = []
-        if first:
-            msgs.append(status)
-        if text and (first or not already):
-            msgs.append(text)
-        route = routing_line(me) if first else None
-        if route:
-            msgs.append(route)
-        out = {"injectSteps": [{"ephemeralMessage": "\n".join(msgs)}]} if msgs else {}
+    emitted = False
 
-    sys.stdout.buffer.write(json.dumps(out, ensure_ascii=False).encode("utf-8"))
+    def emit(items):
+        nonlocal emitted
+        notice = ("【Agora】上次回報後已結束的分派／討論："
+                  + "；".join(completions.describe(item) for item in items)) if items else None
+        if mode in ("claude-prompt", "codex-prompt"):
+            route = routing_line(me, str(payload.get("prompt") or ""))
+            lines = [status] + [line for line in (text, route, notice) if line]
+            out = {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": "\n".join(lines)}}
+        elif mode == "claude-tool":
+            msgs = ([status, text] if text and not already else []) + ([notice] if notice else [])
+            out = {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": "\n".join(msgs)}} if msgs else {}
+        else:  # agy-pre: completion reports apply on every invocation, not just the first
+            first = payload.get("invocationNum", 1) <= 1
+            msgs = [status] if first else []
+            if text and (first or not already):
+                msgs.append(text)
+            route = routing_line(me) if first else None
+            msgs += [line for line in (route, notice) if line]
+            out = {"injectSteps": [{"ephemeralMessage": "\n".join(msgs)}]} if msgs else {}
+        sys.stdout.buffer.write(json.dumps(out, ensure_ascii=False).encode("utf-8"))
+        sys.stdout.buffer.flush()
+        emitted = True
+
+    if root and not os.getenv("AGORA_INVOKED"):
+        try:
+            completions.deliver(root, emit)
+        except (OSError, ValueError, TimeoutError) as exc:
+            # Keep the ordinary hook usable; never discard an unreadable ledger.
+            print(f"Agora 完成補報暫不可用：{exc}", file=sys.stderr)
+            if not emitted:
+                emit([])
+    else:
+        emit([])
 
 
 if __name__ == "__main__":
