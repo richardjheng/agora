@@ -28,7 +28,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from agoralib import __version__, config, jobs, models, prune, quota, routing, shares, snapshot
+from agoralib import __version__, config, jobs, models, prune, quota, routing, shares, snapshot, worktree
 from agoralib.parties import (AGORA_ROOT as AGORA_ROOT_DIR, AI_PARTIES, CALLERS, HUMAN, NAMES,
                               LOCKED_ENV, NESTED_ENV, CallError, Live, agora_cmd, canonical,
                               STREAM_INTERRUPTED, no_space_path, quote_path, AGY_SUBAGENT_TOOLS)
@@ -130,6 +130,8 @@ CONTINUE_PROMPT = """\
 def resolve_workspace(arg: Optional[str]) -> Path:
     if arg:
         return Path(arg).resolve()
+    if os.getenv(worktree.WORK_ENV):
+        return Path(os.environ[worktree.WORK_ENV]).resolve()
     if os.getenv("AGORA_WORKSPACE"):
         return Path(os.environ["AGORA_WORKSPACE"]).resolve()
     try:
@@ -145,14 +147,17 @@ def resolve_workspace(arg: Optional[str]) -> Path:
 class Workspace:
     def __init__(self, root: Path):
         self.root = root
-        self.home = root / ".agora"
+        self.control_root = (Path(os.environ[worktree.CONTROL_ENV]).resolve()
+                             if os.getenv(worktree.WORK_ENV) and os.getenv(worktree.CONTROL_ENV)
+                             and root.resolve() == Path(os.environ[worktree.WORK_ENV]).resolve() else root)
+        self.home = self.control_root / ".agora"
         self.threads = self.home / "threads"
 
     def config(self) -> dict:
-        return config.load(self.root)
+        return config.load(self.control_root)
 
     def enabled(self) -> List[str]:
-        return config.enabled(self.root)
+        return config.enabled(self.control_root)
 
     def resolve_thread(self, ref: str) -> Path:
         threads = sorted(p for p in self.threads.glob("*") if (p / "state.json").exists()) \
@@ -809,7 +814,7 @@ def update_relay(thread: Path, **fields) -> dict:
         return state["relay"]
 
 
-RELAY_ACTIVE = ("starting", "running", "waiting")
+RELAY_ACTIVE = ("starting", "running", "waiting", "checking")
 START_GRACE = 60   # 剛分派、背景程序還沒記下 PID 的空檔（同 jobs.active 對討論工作的處理）
 
 
@@ -826,7 +831,7 @@ def relay_alive(relay: dict) -> bool:
     """分派的背景程序是否仍在進行。assign 先寫入 starting、啟動背景程序後才記下 PID，
     這段空檔（starting 未滿 START_GRACE 秒）一律視為進行中，避免同時執行的其他指令把它判成 interrupted"""
     if relay.get("status") not in RELAY_ACTIVE:
-        return False
+        return jobs.alive(relay)
     if relay["status"] == "starting" and time.time() - relay_started_ts(relay) < START_GRACE:
         return True
     return jobs.alive(relay)
@@ -1030,7 +1035,7 @@ def _cmd_assign_locked(ws: Workspace, args):
     request = {"thread": thread.name, "from": owner, "text": text, "to": canonical(args.to) if args.to else None,
                "session": args.session, "tier": tier, "model": model_arg, "effort": effort_arg,
                "subagents": getattr(args, "subagents", None), "trigger": getattr(args, "trigger", None),
-               "reason": reason, "user_override": override}
+               "reason": reason, "user_override": override, "allowed_paths": getattr(args, "allow", None)}
     import hashlib
     fingerprint = hashlib.sha256(json.dumps(request, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
     previous = shares.dispatch_state(ws.root)["dispatches"].get(dispatch_id)
@@ -1040,7 +1045,7 @@ def _cmd_assign_locked(ws: Workspace, args):
         print(f"派工 {dispatch_id} 已成功建立（{NAMES[previous['party']]}），本次不重新執行或計件。")
         return
     old = state.get("relay") or {}
-    if relay_alive(old):
+    if relay_alive(old) or jobs.alive(old):
         sys.exit(f"此討論串已有進行中的分派（{NAMES[old['worker']]}），請先 recall。")
     if args.to:
         worker = require_enabled(ws, canonical(args.to))
@@ -1059,30 +1064,36 @@ def _cmd_assign_locked(ws: Workspace, args):
     else:
         worker, plan, decision = pick_worker(ws, owner, ws.enabled(), state, tier, model_arg, effort_arg)
     subagents_arg = getattr(args, "subagents", None)
-    subagents = None if subagents_arg is None else subagents_arg == "on"
+    subagents = subagents_arg == "on"
     mark = quota.blocked(worker)
     if mark:
         print(f"⚠️ {NAMES[worker]} 在 {quota.fmt_time(mark.get('at'))} 被標記為無法使用（{mark.get('reason')}）；"
               f"若問題還在，接手會立即停止並顯示原因。")
     paths = relay_paths(thread)
+    try:
+        task = worktree.prepare(ws.root, dispatch_id, getattr(args, "allow", None), thread)
+    except (worktree.WorktreeError, OSError, subprocess.SubprocessError) as exc:
+        sys.exit(f"無法建立隔離分派：{exc}；已建立的資源保留，不自動覆蓋或刪除。")
+    task["commands"] = {k: ws.config().get(k) for k in LOCKED_KEYS}
+    task.update(worker=worker, started=now_str())
+    worktree.save(task)
+    if task["source_dirty"]:
+        print("⚠️ 來源有未 commit 修改；新 worktree 從固定 HEAD 建立，不包含這些修改，原修改保留。")
     paths["control"].write_text(json.dumps({"stop_requested": False}), encoding="utf-8")
     if not paths["progress"].exists():
         paths["progress"].write_text(f"# 工作進度：{state['topic']}\n", encoding="utf-8")
     with open(paths["progress"], "a", encoding="utf-8") as f:
         f.write(f"\n## {now_str()} · {NAMES[owner]} 分派給 {NAMES[worker]}\n\n{text.strip()}\n")
 
-    # 分派基準：之後用 agora changes 比對分派期間的變更（不影響使用者的 index 與工作區）
-    try:
-        baseline = snapshot.create(ws.root, thread.name)
-    except (snapshot.SnapshotError, OSError, subprocess.SubprocessError) as e:
-        baseline = {"error": str(e)}
+    baseline = {"commit": task["base_sha"], "ref": task["branch"]}
 
     entry_record = {"kind": "dispatch", "dispatch_id": dispatch_id, "request_hash": fingerprint,
                     "time": time.time(), "party": worker, "thread": thread.name, "from": owner,
                     "selection": decision["selection"], "trigger": getattr(args, "trigger", None) or "manual",
                     "tier": plan.get("level"), "tier_requested": tier, "model": plan.get("model"), "effort": plan.get("effort"),
                     "fallback_used": bool(plan.get("fallback_used")), "candidates": decision["candidates"],
-                    "reason": reason, "user_override": override}
+                    "reason": reason, "user_override": override,
+                    **{k: task.get(k) for k in worktree.FIELDS}}
     dispatch_data = shares.dispatch_state(ws.root)
     dispatch_data["pending"] = {"entry": entry_record,
                                 "schedule": decision.get("schedule", dispatch_data.get("schedule") or {})}
@@ -1093,6 +1104,8 @@ def _cmd_assign_locked(ws: Workspace, args):
         add_message(thread, state, owner, f"【工作分派 → {NAMES[worker]}】\n{text}")
         # 模型在分派時凍結：之後各輪都用這裡記的，專案設定中途改了也不會悄悄換模型（model 為 None 表示 CLI 預設）
         state["relay"] = {"from": owner, "worker": worker, "status": "starting", "rounds": 0,
+                          **{k: task.get(k) for k in worktree.FIELDS},
+                          "allowed_paths": task["allowed_paths"],
                           "dispatch_id": dispatch_id, "dispatch_created": False,
                           "reason": reason, "user_override": override,
                           "session_id": args.session, "external_session": args.session,
@@ -1139,11 +1152,24 @@ def cmd_changes(ws: Workspace, args):
     """分派期間的變更：相對於 assign 當下的工作區快照（期間任何人的修改都會列出）"""
     thread = ws.resolve_thread(args.thread)
     relay = load_state(thread).get("relay") or {}
+    dispatch_id = getattr(args, "dispatch_id", None)
+    if dispatch_id:
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", dispatch_id):
+            sys.exit("無效的 dispatch ID")
+        try:
+            relay = json.loads((thread / "dispatches" / dispatch_id / "manifest.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            sys.exit(f"找不到分派紀錄：{exc}")
+        if relay.get("dispatch_id") != dispatch_id or relay.get("control_root") != str(ws.root.resolve()):
+            sys.exit("分派紀錄與工作區不符")
     base = relay.get("baseline") or {}
+    if relay.get("worktree"):
+        base = {"commit": relay["base_sha"], "ref": relay["branch"]}
     if not base.get("commit"):
         sys.exit("此討論串的分派沒有記錄基準" + (f"：{base['error']}" if base.get("error") else "（尚未分派，或是舊版的分派）。"))
     try:
-        files = snapshot.changes(ws.root, base["commit"])
+        files = (snapshot.branch_changes(ws.root, relay["base_sha"], relay["branch"])
+                 if relay.get("worktree") else snapshot.changes(ws.root, base["commit"]))
     except (snapshot.SnapshotError, OSError, subprocess.SubprocessError) as e:
         sys.exit(str(e))
     writes = agora_writes(ws.root, relay_started_ts(relay))
@@ -1151,17 +1177,19 @@ def cmd_changes(ws: Workspace, args):
         f["agora_update"] = f["status"] != "D" and written_by_agora(ws.root, f["path"], writes)
     if args.json:
         print(json.dumps({"baseline": base["commit"], "ref": base.get("ref"), "since": relay.get("started"),
+                          **{k: relay.get(k) for k in worktree.FIELDS},
                           "worker": relay.get("worker"), "status": relay.get("status"), "files": files},
                          ensure_ascii=False, indent=2))
         return
-    print(f"分派期間的變更（{relay.get('started')} 起，{NAMES.get(relay.get('worker'), '接手方')} 接手；"
-          f"期間任何人的修改都會列出）：")
+    print(f"分派變更（{relay['base_sha']}...{relay['branch']}；僅已提交成果）：" if relay.get("worktree")
+          else f"分派期間的變更（{relay.get('started')} 起；期間任何人的修改都會列出）：")
     if not files:
         print("  沒有變更。")
     for f in files:
         print(f"  {snapshot.STATUS.get(f['status'], f['status'])}  {f['path']}" + ("（Agora 自動更新）" if f["agora_update"] else ""))
     if files:
-        print(f"\n查看內容：git diff {base['commit'][:12]} -- <檔案>（未追蹤的新檔不在 git diff 內）")
+        print(f"\n查看內容：git diff {relay['base_sha']}...{relay['branch']}" if relay.get("worktree")
+              else f"\n查看內容：git diff {base['commit'][:12]} -- <檔案>（未追蹤的新檔不在 git diff 內）")
 
 
 def append_progress(thread: Path, title: str, body: str = ""):
@@ -1394,6 +1422,26 @@ def cmd_work(ws: Workspace, args):
                 return   # 建立中斷或已被新工作取代，絕不執行未提交的分派
     worker, owner = relay["worker"], relay["from"]
     log = lambda msg: print(f"[{now_str()}] {msg}", flush=True)  # noqa: E731
+    task = None
+    work_root = ws.root
+    if relay.get("worktree"):
+        try:
+            task = worktree.load(relay)
+            worktree.recover_commit(task)
+            work_root = worktree.validate(task)
+            if task.get("commit_sha"):
+                task = worktree.finalize(task, run_task_check)
+                update_relay(thread, status="done", **{k: task.get(k) for k in worktree.FIELDS})
+                append_progress(thread, "恢復已完成的提交", task["commit_sha"] + "；不重複呼叫 AI 或提交。")
+                return
+            if task.get("environment_status") == "pending":
+                worktree.setup_environment(task)
+            worktree.verify_environment(task)
+            update_relay(thread, environment_status=task["environment_status"])
+        except (worktree.WorktreeError, OSError, subprocess.SubprocessError) as exc:
+            update_relay(thread, status="failed", error=str(exc), environment_status="failed")
+            append_progress(thread, "隔離環境建立或驗證失敗", str(exc) + "；資源保留，不降級驗證。")
+            return
 
     # 輪數上限只算真正跑完的輪；等額度、被拒重試不算（等待有時間間隔，被拒重試另有上限，不會空轉）
     denial_retries, quota_retries, denial_note, rounds = 0, 0, "", relay.get("rounds", 0)
@@ -1424,12 +1472,12 @@ def cmd_work(ws: Workspace, args):
             continue
 
         relay = update_relay(thread, status="running", waiting_until=None, round_started=time.time())
-        fmt = dict(me=NAMES[worker], owner=NAMES[owner], human=NAMES[HUMAN], workspace=ws.root, file_rule=FILE_RULES.get(worker, FILE_RULE),
+        fmt = dict(me=NAMES[worker], owner=NAMES[owner], human=NAMES[HUMAN], workspace=work_root, file_rule=FILE_RULES.get(worker, FILE_RULE),
                    tier_line=(f"{config.TIER_LABELS.get(relay.get('tier'), '未指定')}（{relay.get('model') or 'CLI 預設模型'}）"
                               if relay.get("frozen") else "未指定"),
                    progress=paths["progress"], control=paths["control"], threshold=quota.THRESHOLD_PCT,
                    agora=agora_cmd())
-        cfg = ws.config()
+        cfg = task["commands"] if task else ws.config()
         has_build = bool(cfg.get("build"))
         fmt.update(build_cmd=f"`{fmt['agora']} build`（建置專案）、" if has_build else "",
                    finish_cmds=(f"`{fmt['agora']} build` 與 `{fmt['agora']} check`" if has_build
@@ -1441,6 +1489,14 @@ def cmd_work(ws: Workspace, args):
         else:
             prompt = WORK_PREAMBLE.format(**fmt) + relay["handoff"]
         prompt += "\n\n" + routing.DISPATCH_GUIDE
+        if task:
+            prompt += (f"\n\n分派 ID：{task['dispatch_id']}；branch：{task['branch']}；base SHA：{task['base_sha']}。"
+                       f"\n只可修改：{', '.join(task['allowed_paths'])}。控制設定維持在 {task['control_root']}/.agora。"
+                       f"\n宣告完成前，用檔案工具把提交說明（任務目的與測試範圍）寫到 {task['commit_message']}。"
+                       "\n請停止所有子工作後再宣告完成；Agora 會執行 check，成功後代為 commit；失敗保留成果且不提交。")
+        if relay.get("subagents") is True:
+            prompt += ("\n能獨立進行的子工作（大量搜尋、讀檔、互不重疊的修改）用子代理並行，小工作自己做。"
+                       "寫入子工作須分配互不重疊的檔案，由父代理整合驗證；子代理共用此 worktree，這不是強制隔離。")
         if config.shares(ws.root)[worker] == 0:
             prompt += "\n" + routing.ZERO_SHARE_ROLE
             if relay.get("user_override"):
@@ -1450,11 +1506,11 @@ def cmd_work(ws: Workspace, args):
                 return
         denial_note = ""
         state = load_state(thread)
-        before = git_status(ws.root)
+        before = git_status(work_root)
         log(f"第 {relay['rounds'] + 1} 輪：呼叫 {NAMES[worker]}")
-        live = Live(live_path(thread, "work"), f"{NAMES[worker]}（接手）", ws.root)
+        live = Live(live_path(thread, "work"), f"{NAMES[worker]}（接手）", work_root)
         config_before = read_config_text(ws.root)
-        files_before, round_ts = protected_files(ws.root), time.time()
+        files_before, round_ts = protected_files(work_root), time.time()
         opts = call_opts(ws, state, worker)
         if relay.get("frozen"):   # 分派時凍結的模型與子代理設定（cmd_assign）；舊版的分派沒有，沿用每輪讀設定
             opts.update(model=relay.get("model"), effort=relay.get("effort"))
@@ -1463,18 +1519,24 @@ def cmd_work(ws: Workspace, args):
         opts["_stats"] = {}
         # 接手方執行的 agora build / check 用這輪開始時的指令，這輪中途改設定檔也不會被執行
         opts["env"] = {LOCKED_ENV: json.dumps({k: cfg.get(k) for k in LOCKED_KEYS}, ensure_ascii=False)}
+        opts["subagents"] = relay.get("subagents") is True
+        if task:
+            opts["env"].update(worktree.environment(task))
+            opts["env"][LOCKED_ENV] = json.dumps({k: cfg.get(k) for k in LOCKED_KEYS}, ensure_ascii=False)
+            opts["add_dirs"] = [str(thread)]
+            opts["control_dir"] = str(thread)
         # 呼叫前固定本輪請求；結束時與回報一起保存，執行中仍顯示上一輪完整的請求／回報。
         requested = {"model": opts.get("model") or None, "effort": opts.get("effort") or None}
         last_requested = {"last_model_requested": requested["model"], "last_effort_requested": requested["effort"]}
         try:
             reply, session_id, meta = call_party(worker, prompt, relay.get("session_id"), opts,
-                                                 True, ws.root, WORK_TIMEOUT, thread, live=live)
+                                                 True, work_root, WORK_TIMEOUT, thread, live=live)
         except (CallError, subprocess.TimeoutExpired, FileNotFoundError) as e:
             live.close()
             remember_failed_call(thread, shares.record_call(ws.root, worker, thread.name, "work", opts["_stats"], False))
             update_relay(thread, **last_requested, last_model_reported=opts["_stats"].get("model") or None)
             guard_config(ws.root, config_before, thread, worker)
-            guard_files(ws.root, files_before, thread, worker, round_ts)
+            guard_files(work_root, files_before, thread, worker, round_ts)
             exhausted = isinstance(e, CallError) and e.quota_exhausted
             log(f"呼叫失敗（額度={exhausted}）：{e}")
             add_system_note(thread, f"⚠️ {NAMES[worker]} 接手時呼叫失敗：{str(e)[:500]}")
@@ -1530,8 +1592,8 @@ def cmd_work(ws: Workspace, args):
             return
         live.close()
         guard_config(ws.root, config_before, thread, worker)
-        guard_files(ws.root, files_before, thread, worker, round_ts)
-        changed = git_status(ws.root)
+        guard_files(work_root, files_before, thread, worker, round_ts)
+        changed = git_status(work_root)
         usage_entry = shares.record_call(ws.root, worker, thread.name, "work", opts["_stats"], True)
 
         with thread_lock(thread, wait=WORKER_LOCK_WAIT):
@@ -1567,6 +1629,26 @@ def cmd_work(ws: Workspace, args):
             append_progress(thread, "需要升級", msg)
             return
         if has_marker(reply, "【工作完成】"):
+            if task:
+                if stop_requested(thread):
+                    update_relay(thread, status="stopped")
+                    return
+                update_relay(thread, status="checking")
+                try:
+                    # A successful CLI return must include confirmed process exit.
+                    if "終止失敗" in meta:
+                        raise worktree.WorktreeError("程序退出未確認，不能提交")
+                    task = worktree.finalize(task, run_task_check, lambda: not stop_requested(thread))
+                    update_relay(thread, **{k: task.get(k) for k in worktree.FIELDS})
+                    append_progress(thread, "Agora 驗證與提交", json.dumps(
+                        {k: task.get(k) for k in worktree.FIELDS}, ensure_ascii=False))
+                except (worktree.WorktreeError, snapshot.SnapshotError, OSError, subprocess.SubprocessError) as exc:
+                    task.update(commit_status="failed", error=str(exc))
+                    worktree.save(task)
+                    update_relay(thread, status="stopped" if stop_requested(thread) else "failed", error=str(exc),
+                                 **{k: task.get(k) for k in worktree.FIELDS})
+                    append_progress(thread, "驗證或提交未完成，成果保留", str(exc))
+                    return
             relay = update_relay(thread, status="done")
             warning = unverified_warning(relay)
             if warning:
@@ -1595,7 +1677,7 @@ def wait_relay(thread: Path, seconds: Optional[int]):
 def relay_model_fields(relay: dict) -> dict:
     """目前設定與最近結束一輪的請求／回報；舊資料缺欄位時為 None，不重建歷史。"""
     return {k: relay.get(k) for k in ("tier", "tier_requested", "model", "effort", "model_source",
-                                    "last_model_requested", "last_effort_requested", "last_model_reported")}
+                                    "last_model_requested", "last_effort_requested", "last_model_reported", *worktree.FIELDS)}
 
 
 def relay_model_line(relay: dict) -> str:
@@ -1654,6 +1736,9 @@ def cmd_status(ws: Workspace, args):
         print(f"接手方：{NAMES[relay['worker']]}｜狀態：{relay['status']}{waiting}｜已跑 {relay.get('rounds', 0)} 輪｜"
               f"背景程序：{'執行中' if alive else '已結束'}｜更新：{relay.get('updated')}")
         print(relay_model_line(relay))
+        if relay.get("worktree"):
+            print(f"分派：{relay.get('dispatch_id')}｜branch：{relay.get('branch')}｜worktree：{relay['worktree']}")
+            print(f"提交：{relay.get('commit_status')}｜{relay.get('commit_sha') or '尚無 commit'}")
         if relay.get("status") == "blocked":
             print(f"⛔ 需要人工處理：{NAMES[relay['worker']]} {relay.get('blocked_reason') or ''}".rstrip())
         if relay.get("error") and not alive:
@@ -1671,6 +1756,8 @@ def recall_eta(relay: dict) -> str:
     """接手方大約何時會停下：等額度時每分鐘檢查一次；執行中要等這一輪結束"""
     if relay["status"] == "waiting":
         return "在等待額度，約 1 分鐘內停止"
+    if relay["status"] == "checking":
+        return "正在驗證，驗證結束後會確認停止要求，停止時保留成果且不提交"
     if relay["status"] == "running":
         minutes = int((time.time() - (relay.get("round_started") or relay_started_ts(relay))) / 60)
         return f"正在執行第 {relay.get('rounds', 0) + 1} 輪（已執行 {minutes} 分鐘），會在這一輪結束後停止"
@@ -1681,7 +1768,7 @@ def cmd_recall(ws: Workspace, args):
     guard_nested()
     thread = ws.resolve_thread(args.thread)
     relay = current_relay(thread)
-    if not relay or not relay_alive(relay):
+    if not relay or relay.get("status") not in RELAY_ACTIVE or not relay_alive(relay):
         print("目前沒有進行中的接手" + (f"（狀態：{relay['status']}）" if relay else "") + "，不需要收回。")
         return
     relay_paths(thread)["control"].write_text(json.dumps({"stop_requested": True, "at": now_str()}), encoding="utf-8")
@@ -1797,15 +1884,42 @@ def command_label(spec) -> str:
 def command_config(ws: Workspace) -> dict:
     """build / check 指令的來源：接手工作時用 Agora 帶入的這輪開始時的設定（接手方改設定檔也不影響），否則讀設定檔"""
     locked = os.getenv(LOCKED_ENV)
-    if locked is None:
-        return ws.config()
     try:
-        data = json.loads(locked)
+        data = ws.config() if locked is None else json.loads(locked)
     except json.JSONDecodeError:
         data = None
     if not isinstance(data, dict):
         sys.exit(f"無法讀取 Agora 帶入的建置與驗證指令（{LOCKED_ENV}）。")
-    return data
+    task = active_task(ws)
+    return worktree.rebase_command(data, task) if task else data
+
+
+def active_task(ws: Workspace):
+    manifest = os.getenv(worktree.MANIFEST_ENV)
+    if not manifest:
+        return None
+    try:
+        meta = json.loads(Path(manifest).read_text(encoding="utf-8"))
+        if meta["dispatch_id"] != os.getenv(worktree.DISPATCH_ENV) or Path(meta["worktree"]).resolve() != ws.root.resolve():
+            raise worktree.WorktreeError("驗證工作區與 dispatch 不符")
+        worktree.verify_environment(meta)
+        return meta
+    except (OSError, ValueError, KeyError, worktree.WorktreeError) as exc:
+        sys.exit(f"隔離環境驗證失敗：{exc}")
+
+
+def run_task_check(meta):
+    env = worktree.environment(meta)
+    env[LOCKED_ENV] = json.dumps(meta["commands"], ensure_ascii=False)
+    command = [str(worktree.python_path(Path(meta["worktree"]))), str(AGORA_ROOT_DIR / "agora.py"),
+               "--workspace", meta["worktree"], "check"]
+    proc = subprocess.run(command, cwd=meta["worktree"], env=env, capture_output=True, text=True,
+                          encoding="utf-8", errors="replace", **quota.NO_WINDOW)
+    output = proc.stdout + proc.stderr
+    record = Path(meta["manifest"]).parent / "check.log"
+    record.write_text(output, encoding="utf-8")
+    return {"exit_code": proc.returncode, "command": command, "log": str(record), "time": now_str(),
+            "output_tail": output[-3000:]}
 
 
 def cmd_build(ws: Workspace, args):
@@ -1824,18 +1938,34 @@ def cmd_build(ws: Workspace, args):
 
 def cmd_check(ws: Workspace, args):
     """工作區驗證：語法檢查 git 追蹤的 .py，再執行 .agora/config.json 的 check 指令
-    （沒設定時自動偵測，見 default_check）。建置另用 agora build"""
+    （沒設定時自動偵測，見 default_check）。建置另用 agora build。
+    --task：在分派的 worktree 用 run_task_check 驗證（任務自己的 .venv、凍結的指令、明確 --workspace）"""
+    if getattr(args, "task", None):
+        relay = load_state(ws.resolve_thread(args.task)).get("relay") or {}
+        if not relay.get("worktree"):
+            sys.exit("這個討論串的分派不是隔離 worktree 分派，請直接在工作區執行 agora check。")
+        try:
+            meta = worktree.load(relay)
+        except worktree.WorktreeError as e:
+            sys.exit(str(e))
+        result = run_task_check(meta)
+        print(result["output_tail"])
+        print(f"任務驗證（{meta['worktree']}）：exit={result['exit_code']}｜完整紀錄：{result['log']}")
+        sys.exit(0 if result["exit_code"] == 0 else 1)
     check = command_config(ws).get("check")
     source = ("分派當輪的設定" if os.getenv(LOCKED_ENV) is not None else ".agora/config.json") if check else None
     if not check:
+        if os.getenv(worktree.MANIFEST_ENV) and uses_pytest(ws.root) and not has_module(str(project_python(ws.root)), "pytest"):
+            sys.exit("分派環境缺少 pytest，拒絕降級為 unittest。")
         check, source = default_check(ws.root)
     if check:   # 第一行：實際執行的指令與 Python，方便判斷環境問題
         python = command_python(check)
         print(f"驗證指令：{command_label(check)}（Python：{python or '指令未直接指定'}；來源：{source}）")
-    files = subprocess.run(["git", "ls-files", "*.py"], cwd=ws.root, capture_output=True, text=True,
-                           encoding="utf-8", **quota.NO_WINDOW).stdout.split()
-    files += subprocess.run(["git", "ls-files", "--others", "--exclude-standard", "*.py"], cwd=ws.root,
-                            capture_output=True, text=True, encoding="utf-8", **quota.NO_WINDOW).stdout.split()
+    files = subprocess.run(["git", "ls-files", "-z", "*.py"], cwd=ws.root, capture_output=True, text=True,
+                           encoding="utf-8", **quota.NO_WINDOW).stdout.split("\0")
+    files += subprocess.run(["git", "ls-files", "--others", "--exclude-standard", "--exclude=.venv/", "-z", "*.py"], cwd=ws.root,
+                            capture_output=True, text=True, encoding="utf-8", **quota.NO_WINDOW).stdout.split("\0")
+    files = [f for f in files if f and not any(p in (".venv", "venv") for p in Path(f).parts)]
     errors = []
     for f in files:   # 只檢查語法、不寫 __pycache__（唯讀沙箱裡也能執行）
         try:
@@ -1850,7 +1980,7 @@ def cmd_check(ws: Workspace, args):
         print(e)
     if not check:
         print(f"未設定 check 指令，也沒有 tests/ 資料夾，略過測試（{source}）。")
-        sys.exit(1 if errors else 0)
+        sys.exit(1 if errors or os.getenv(worktree.MANIFEST_ENV) else 0)
     try:
         proc = run_configured_command(check, ws.root)
     except ValueError as e:
@@ -2707,13 +2837,14 @@ def main(argv=None):
         p.add_argument("--from", dest="sender", required=True, choices=who)
         p.add_argument("--to", help="指定接手方（預設省略：額度篩選後依比例輪流）")
         p.add_argument("--dispatch-id", help="派工識別碼；同工作單以相同 ID 重試不重計，未給時建立新 ID")
+        p.add_argument("--allow", action="append", help="允許修改的相對路徑或 glob（必填，可重複；提交前核對）")
         p.add_argument("--reason", help="--to 必填的指定理由；零權重時須記錄使用者明確指定")
         p.add_argument("--user-override", action="store_true", help="聲明使用者已明確指定零權重 AI 實作，須搭配 --reason")
         p.add_argument("--tier", choices=config.TIER_LEVELS,
                        help="等級：依專案設定（agora parties --tier）選模型；沒給時用標準等級，但不覆蓋討論串明確指定的模型")
         p.add_argument("--model", help="這次分派直接指定模型（不能和 --tier 同用）")
         p.add_argument("--effort", help="這次分派的推理強度")
-        p.add_argument("--subagents", choices=("on", "off"), help="這次分派是否允許內建子代理（預設依專案設定）")
+        p.add_argument("--subagents", choices=("on", "off"), help="這次分派是否允許內建子代理（預設 off，僅顯式 on 啟用）")
         p.add_argument("--trigger", choices=("manual", "relay"), help="觸發情境（額度交接用 relay；預設 manual）")
         p.add_argument("--session", help="接續接手方先前的對話 ID")
         p.add_argument("--from-summary", action="store_true", help="用討論串總結（summarize）的工作單分派")
@@ -2733,8 +2864,9 @@ def main(argv=None):
         p.add_argument("--json", action="store_true")
         p.set_defaults(func=cmd_status)
 
-    p = sub.add_parser("changes", help="分派期間的變更（相對於分派當下的工作區快照）")
+    p = sub.add_parser("changes", help="分派變更（固定 base SHA...branch；舊分派沿用快照）")
     p.add_argument("thread")
+    p.add_argument("--dispatch-id", help="查看指定分派；預設最近一次")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_changes)
 
@@ -2748,6 +2880,8 @@ def main(argv=None):
     p.set_defaults(func=cmd_build)
 
     p = sub.add_parser("check", help="工作區驗證（語法檢查＋.agora/config.json 的 check 指令；建置另用 build）")
+    p.add_argument("--task", metavar="討論串",
+                   help="審查用：在該分派的 worktree 以它自己的 .venv 與分派時凍結的測試指令驗證（與 Agora 代做 commit 時相同）")
     p.set_defaults(func=cmd_check)
 
     p = sub.add_parser("quota", help="三方剩餘額度")

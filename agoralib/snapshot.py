@@ -94,6 +94,14 @@ def changes(root: Path, baseline: str) -> List[Dict[str, str]]:
     return [{"status": parts[i][0], "path": parts[i + 1]} for i in range(0, len(parts) - 1, 2)]
 
 
+def branch_changes(root: Path, baseline: str, branch: str) -> List[Dict[str, str]]:
+    """Committed dispatch results only, reviewed against the fixed fork point."""
+    out = _git(root, "diff", "--name-status", "--no-renames", "-z", f"{baseline}...{branch}",
+               "--", ".", *secret_pathspecs())
+    parts = [p for p in out.split("\0") if p]
+    return [{"status": parts[i][0], "path": parts[i + 1]} for i in range(0, len(parts) - 1, 2)]
+
+
 def delete(root: Path, name: str):
     """刪除 refs/agora/<name>（清理討論串時）；不存在或不是 git repo 時略過"""
     ref = REF_PREFIX + name

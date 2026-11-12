@@ -355,9 +355,9 @@
   }
 
   const SUBAGENT_HINTS = {
-    claude: "被 Agora 呼叫時能否用 Task 派出 Claude Code 的內建子代理（general-purpose、Explore 等）。預設關閉（評估中），關閉時直接禁用該工具。",
-    antigravity: "被 Agora 呼叫時能否用 invoke_subagent 等工具派出 Antigravity 的子代理。預設關閉（評估中），關閉時由專案裡的 hook 擋下（需已安裝或更新到此專案）。",
-    codex: "被 Agora 呼叫時能否用 spawn_agent 派出 Codex 的子代理。預設關閉（評估中）。Codex 目前無法強制關閉：關閉時只在提示中要求不要使用，若仍使用會標記在逐字稿。",
+    claude: "被 Agora 呼叫時能否用 Task 派出 Claude Code 的內建子代理（general-purpose、Explore 等）。預設關閉（評估中），關閉時直接禁用該工具。開啟時子代理在同一 worktree 執行，這不是強制隔離。",
+    antigravity: "被 Agora 呼叫時能否用 invoke_subagent 等工具派出 Antigravity 的子代理。預設關閉（評估中），關閉時由專案裡的 hook 擋下（需已安裝或更新到此專案）。開啟時子代理在同一 worktree 執行，這不是強制隔離。",
+    codex: "被 Agora 呼叫時能否用 spawn_agent 派出 Codex 的子代理。預設關閉（評估中）。Codex 目前無法強制關閉：關閉時只在提示中要求不要使用，若仍使用會標記在逐字稿。開啟時子代理在同一 worktree 執行，這不是強制隔離。",
   };
   const SUBAGENT_OFF = { claude: "已禁用", antigravity: "由 hook 擋下", codex: "只能提示，無法強制" };
 
@@ -400,7 +400,8 @@
         + "取消勾選後不再請它回覆；已在背景進行的分派工作不會換人，用「新增討論串」時指定參與者的討論串也不會自動加入。"
         + "設定存在 .agora/config.json；未參與的 AI 不會被呼叫，也不會成為接手方。"
         + "各 AI 可依工作等級（輕量／標準／重度）設定對應的模型與替代模型（fallback）；分派時依比例輪流，額度只作為資格篩選。"
-        + "內建子代理預設關閉（評估中），被呼叫時盡量由主模型完成。"
+        + "分派工作時建立獨立 branch（agora/<分派 ID>）與 git worktree，接手方完成後由 Agora 核對並代做 commit（不自動 push/merge）。"
+        + "內建子代理預設關閉（評估中），被呼叫時盡量由主模型完成；開啟時在同一 worktree 執行，由父代理整合驗證，這不是強制隔離。"
         + "自動派工比例為 0 表示只負責討論、主持、交接與審查（不自己實作），大於 0 為自動派工件數的加權比例（依比例輪流，不保證 token 比例）；指定接手方仍須符合額度資格，零權重接手方需使用者明確覆寫。"));
     }
     children.push(versionLine(state.versions || {}));

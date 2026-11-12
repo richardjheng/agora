@@ -18,7 +18,7 @@ description: 額度快用完時把工作交接給還有額度的 AI（Antigravit
    - 如何驗證（要跑的測試指令）
 3. 交接（若目前沒有相關討論串，先 `new` 一個）：
    ```bash
-   python D:/github/agora/agora.py assign <thread> --from claude --trigger relay --file <交接單路徑>
+   python D:/github/agora/agora.py assign <thread> --from claude --trigger relay --allow "<交接範圍的路徑或 glob>" --file <交接單路徑>
    ```
    分派預設不寫 `--to`，交由 Agora 進行額度篩選後依比例輪流挑選合格接手方；若有特殊理由指定 `--to <AI>`，須加 `--reason "<理由>"`，零權重接手方另需 `--user-override`。
 4. 安排自己在重置後喚醒：用 CronCreate 建立一次性排程，時間設在 Claude 重置時間後 3 分鐘，prompt 寫：
@@ -33,13 +33,13 @@ description: 額度快用完時把工作交接給還有額度的 AI（Antigravit
 
 1. `python D:/github/agora/agora.py recall <thread>`
 2. `python D:/github/agora/agora.py status <thread> --wait 900`（Bash timeout 設 960000），等接手方停在檢查點。
-3. 讀 `.agora/threads/<thread>/progress.md` 和 `git diff`，**逐項查證**接手方的改動：
+3. 讀 `.agora/threads/<thread>/progress.md` 和 `git diff`（比對 base SHA...branch，只含已 commit 的成果）；提前收回時接手方可能還沒 commit，另外在任務 worktree 執行 `git status` 與 `git diff` 查看未提交與未追蹤的修改，**逐項查證**接手方的改動：
    - 有沒有超出交接範圍
    - 測試是否通過
-4. 向使用者簡短回報接手期間的進度與發現的問題，再從進度檔的「下一步」繼續原本的工作。
+4. 向使用者簡短回報接手期間的進度與發現的問題，主動說明結論與下一步，再從進度檔的「下一步」繼續原本的工作。
 
 ## 注意
 
-- 接手方的界線寫在 `D:/github/agora/agoralib/cli.py` 的 WORK_PREAMBLE：只改工作單範圍、不 commit/push、不碰 .env、不做影響外部系統的動作。
-- 狀態 `failed`：讀 `.agora/threads/<thread>/worker.log` 找原因，回報使用者。
+- 接手方的界線寫在 `D:/github/agora/agoralib/cli.py` 的 WORK_PREAMBLE：在獨立 worktree 內只改工作單範圍、不自行 commit/push/merge、不碰 .env、不做影響外部系統的動作；完成後由 Agora 代做 commit。
+- 狀態 `failed`：讀 `.agora/threads/<thread>/worker.log` 找原因，主動回報使用者。
 - 不要用 relay 處理實盤交易或任何不可逆的操作。

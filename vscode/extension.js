@@ -228,7 +228,11 @@ class ThreadsProvider {
     parts.push(`${messages.length} 則`);
     if (relay) {
       const denied = (relay.denied || []).length;
-      parts.push(`${NAMES[relay.worker]} ${RELAY_LABELS[relay.status] || relay.status}${denied ? `（⚠ ${denied} 次工具被拒）` : ""}`);
+      let relayDesc = `${NAMES[relay.worker]} ${RELAY_LABELS[relay.status] || relay.status}${denied ? `（⚠ ${denied} 次工具被拒）` : ""}`;
+      if (relay.branch) relayDesc += ` · ${relay.branch}`;
+      const cInfo = relayCommitInfo(relay);
+      if (cInfo && cInfo.sha) relayDesc += ` · commit ${cInfo.sha}`;
+      parts.push(relayDesc);
     }
     if (state.keep) parts.push("保留");
     item.description = parts.join(" · ");
@@ -241,7 +245,14 @@ class ThreadsProvider {
     tip.appendMarkdown(`參與者：${Object.keys(state.parties).map((p) => NAMES[p] || p).join("、")}\n\n`);
     tip.appendMarkdown(`建立：${state.created}`);
     if (last) tip.appendMarkdown(`\n\n最後發言：${NAMES[last.speaker] || last.speaker}（${last.time}）`);
-    if (relay) tip.appendText(`\n\n等級 ${tierLabel(relay.tier)} · ${relayModelLabel(relay)}`);
+    if (relay) {
+      tip.appendText(`\n\n等級 ${tierLabel(relay.tier)} · ${relayModelLabel(relay)}`);
+      if (relay.branch) tip.appendText(`\n分支：${relay.branch}`);
+      const wt = relay.worktree || relay.worktree_path;
+      if (wt) tip.appendText(`\nWorktree：${wt}`);
+      const cInfo = relayCommitInfo(relay);
+      if (cInfo) tip.appendText(`\nCommit：${cInfo.text}`);
+    }
     item.tooltip = tip;
     item.id = thread.id;
     item.command = { command: "agora.openTranscript", title: "開啟逐字稿", arguments: [thread] };
@@ -285,6 +296,24 @@ class Activity {
   }
 }
 
+/** 解析 relay 的 commit 相關欄位（commit / commit_sha / commit_result / commit_status / check_result） */
+function relayCommitInfo(relay) {
+  if (!relay) return null;
+  const c = relay.commit || relay.commit_sha || relay.commit_result;
+  const status = relay.commit_status ? `[${relay.commit_status}]` : "";
+  const check = relay.check_result ? (typeof relay.check_result === "object" ? (relay.check_result.exit_code === 0 ? "check 通過" : "check 失敗") : `check: ${relay.check_result}`) : "";
+  if (!c && !status && !check) return null;
+  if (c && typeof c === "object") {
+    const sha = c.sha ? String(c.sha).slice(0, 7) : "";
+    const msg = c.message ? `（${c.message}）` : "";
+    const chk = c.check_passed !== undefined ? (c.check_passed ? "check 通過" : "check 失敗") : check;
+    return { sha, text: [sha, status, msg, chk].filter(Boolean).join(" ") || "已提交", raw: c };
+  }
+  const s = c ? String(c) : "";
+  const sha = s.slice(0, 7);
+  return { sha, text: [sha, status, check].filter(Boolean).join(" ") || status, raw: c };
+}
+
 /** 「本次接手有 N 次工具被拒：read_url ×2」；沒有被拒時回傳空字串（與 cli.denial_summary 相同） */
 function deniedSummary(relay) {
   const denied = relay.denied || [];
@@ -312,9 +341,12 @@ function notifyFinished(item) {
     const relay = thread.state.relay || {};
     const denied = deniedSummary(relay);
     warn = relay.status !== "done" || !!denied;
+    const branchInfo = relay.branch ? ` · 分支 ${relay.branch}` : "";
+    const cInfo = relayCommitInfo(relay);
+    const commitInfo = cInfo && cInfo.sha ? ` · commit ${cInfo.sha}` : "";
     text = `${NAMES[item.worker]} 接手「${thread.state.topic}」的工作：${RELAY_LABELS[relay.status] || relay.status}`
       + (relay.blocked_reason ? `（${relay.blocked_reason}）` : "")
-      + ` · 等級 ${tierLabel(relay.tier)} · ${relayModelLabel(relay)}。`;
+      + ` · 等級 ${tierLabel(relay.tier)} · ${relayModelLabel(relay)}${branchInfo}${commitInfo}。`;
     if (denied) {
       text += ` ⚠️ ${denied}` + (relay.status === "done" ? "，之後卻宣告完成，請查證結果的來源。" : "。");
     }
@@ -1168,10 +1200,23 @@ function activate(context) {
           label: NAMES[p], description: model.quota ? quotaText(model.quota[p]) : "", to: p,
         })),
       ],
-      { placeHolder: "把工作交給誰？接手方會在背景執行，只能修改工作區內的檔案、不能 commit" },
+      { placeHolder: "把工作交給誰？接手方在自己的 branch／worktree 背景執行，完成後由 Agora commit，不 push、不 merge" },
     );
     if (!worker) return;
-    const args = ["assign", thread.id, "--from", "human", ...(worker.to ? ["--to", worker.to] : [])];
+    // 分派會建立獨立 branch／worktree，必須列出允許修改的範圍（agora assign --allow，可多個）
+    const allow = await vscode.window.showInputBox({
+      prompt: "允許接手方修改的範圍（相對路徑或 glob，多個用空白分隔，例如 src/** tests/**）",
+      ignoreFocusOut: true, validateInput: (v) => (v.trim() ? undefined : "至少要列一個範圍"),
+    });
+    if (!allow) return;
+    let reason = [];
+    if (worker.to) {
+      const r = await vscode.window.showInputBox({ prompt: `指定 ${NAMES[worker.to]} 的理由（--reason 必填）`, ignoreFocusOut: true });
+      if (!r || !r.trim()) return;
+      reason = ["--reason", r.trim()];
+    }
+    const args = ["assign", thread.id, "--from", "human", ...(worker.to ? ["--to", worker.to, ...reason] : []),
+      ...allow.trim().split(/\s+/).flatMap((a) => ["--allow", a])];
     let out;
     if (fromSummary) {
       try {
@@ -1238,7 +1283,9 @@ function activate(context) {
     if (!picked) return;
     const f = picked.file;
     const left = baselineUri(data.baseline, f.path, f.status === "A");
-    const right = f.status === "D" ? baselineUri(data.baseline, f.path, true) : vscode.Uri.file(path.join(workspaceRoot(), f.path));
+    // 隔離分派（worktree）：右側讀任務 branch 已提交的內容，不是主工作區（尚未 merge 時主工作區是舊內容或沒有新檔）
+    const right = f.status === "D" ? baselineUri(data.baseline, f.path, true)
+      : data.worktree && data.ref ? baselineUri(data.ref, f.path, false) : vscode.Uri.file(path.join(workspaceRoot(), f.path));
     await vscode.commands.executeCommand("vscode.diff", left, right, `${f.path}（分派基準 ↔ 目前）`);
   });
 

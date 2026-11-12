@@ -262,9 +262,13 @@ def _run(cmd: list, workspace: Path, stdin_text: Optional[str], timeout: int,
          on_event: Optional[Callable[[dict], None]] = None, extra_env: Optional[dict] = None) -> Tuple[list, str]:
     """執行 CLI，逐行解析 JSON 事件（on_event 即時處理）；逾時會終止整棵程序樹"""
     env = dict(os.environ)
+    if (extra_env or {}).get("AGORA_WORKTREE"):
+        env.pop("PYTHONPATH", None)
+        env.pop("PYTHONHOME", None)
     env.pop("AGORA_JOB", None)   # AI 執行的 agora 指令（quota、check）不是背景討論程序
     env.pop(LOCKED_ENV, None)    # 只有接手工作時由呼叫端明確帶入
-    env.update({NESTED_ENV: "1", **(extra_env or {})})
+    env.update(extra_env or {})
+    env[NESTED_ENV] = "1"
     proc = subprocess.Popen(cmd, cwd=workspace, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", env=env,
                             **quota.NO_WINDOW)
@@ -588,6 +592,8 @@ def stream_interrupted(result: dict, reply: str) -> bool:
 def call_antigravity(prompt: str, session_id: Optional[str], opts: dict, work: bool, workspace: Path,
                      timeout: int, scratch: Path, live: Optional[Live] = None) -> Tuple[str, str, str]:
     stats = _CallStats(opts, "antigravity")
+    if not opts.get("subagents", True):
+        prompt = NO_SUBAGENT_NOTE + prompt
     overflow = None
     try:
         if len(prompt) > 20000:  # Windows 命令列上限約 32k；agy 只能從參數收訊息
@@ -595,6 +601,8 @@ def call_antigravity(prompt: str, session_id: Optional[str], opts: dict, work: b
             overflow.write_text(prompt, encoding="utf-8")
             prompt = f"這則訊息較長，完整內容在 {overflow}，請先讀取該檔再照內容回覆。"
         cmd = [find_agy(), "-p", prompt, "--output-format", "stream-json", "--print-timeout", f"{timeout}s"]
+        if work and opts.get("control_dir"):
+            cmd += ["--add-dir", opts["control_dir"]]
         if work:
             # 只有接手工作時開放改檔：accept-edits 允許寫工作區內的檔案，工作區外仍會被拒絕。
             # 不在全域權限加 write_file，否則同一個工作區的討論也能改檔。
@@ -660,6 +668,8 @@ def call_claude(prompt: str, session_id: Optional[str], opts: dict, work: bool, 
                 timeout: int, scratch: Path, live: Optional[Live] = None) -> Tuple[str, str, str]:
     stats = _CallStats(opts, "claude")
     cmd = [quota.find_claude(), "-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages"]
+    if work and opts.get("control_dir"):
+        cmd += ["--add-dir", opts["control_dir"]]
     if work:
         # 可改檔；Bash 只開放 Agora 的固定指令與唯讀 git，其餘在非互動模式下會被拒絕
         cmd += ["--permission-mode", "acceptEdits",

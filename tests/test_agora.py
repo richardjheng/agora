@@ -24,6 +24,11 @@ quota.BLOCKED_FILE = _TEST_HOME / "blocked.json"
 cli.INSTALL_WRITES = _TEST_HOME / "install_writes.jsonl"
 os.environ.pop(parties.NESTED_ENV, None)
 os.environ.pop(parties.LOCKED_ENV, None)
+# The suite also runs inside an Agora task. Its temporary projects must not
+# inherit the outer task's manifest or controller when testing CLI commands.
+for name in ("AGORA_WORKSPACE", cli.worktree.CONTROL_ENV, cli.worktree.WORK_ENV,
+             cli.worktree.DISPATCH_ENV, cli.worktree.MANIFEST_ENV):
+    os.environ.pop(name, None)
 
 
 def state_with(parties, messages=()):
@@ -900,6 +905,9 @@ class TestTiers(unittest.TestCase):
                 "trigger": None, "reason": "測試：使用者指定接手方" if kw.get("to") else None, **kw}
         with patch.object(cli.jobs, "spawn", return_value=123), patch.object(cli.jobs, "pid_started", return_value=None), \
                 patch.object(cli.snapshot, "create", return_value={}), patch("sys.stdout", io.StringIO()), \
+                patch.object(cli.worktree, "prepare", side_effect=lambda root, key, allowed, thread: {
+                    "dispatch_id": key, "source_dirty": False, "base_sha": "base", "branch": f"agora/{key}",
+                    "allowed_paths": ["**"]}), patch.object(cli.worktree, "save"), \
                 patch.object(cli, "party_usage", return_value=pct(80)):
             os.environ.pop(cli.NESTED_ENV, None)
             cli.cmd_assign(ws, type("Args", (), args)())
@@ -2003,11 +2011,11 @@ class TestRelayStatus(unittest.TestCase):
             os.environ.pop(parties.NESTED_ENV, None)
             ws, thread = self.make(tmp, status="running", pid=os.getpid(), pid_started=jobs.pid_started(os.getpid()))
             # 接手方在等待期間停下
-            code, out = self.recall(ws, wait=600, on_sleep=lambda s: cli.update_relay(thread, status="stopped"))
+            code, out = self.recall(ws, wait=600, on_sleep=lambda s: cli.update_relay(thread, status="stopped", pid=None))
             self.assertEqual(code, 0)
             self.assertIn("接手方已停止（狀態：stopped）", out)
 
-            cli.update_relay(thread, status="running")
+            cli.update_relay(thread, status="running", pid=os.getpid(), pid_started=jobs.pid_started(os.getpid()))
             code, out = self.recall(ws, wait=1)
             self.assertEqual(code, 2)
             self.assertIn("⏳ 等待 1 秒逾時，接手方仍在進行（狀態：running）", out)
@@ -2084,12 +2092,12 @@ class TestLock(unittest.TestCase):
 class TestVersion(unittest.TestCase):
     def test_version_defined_and_cli_flag(self):
         from agoralib import __version__
-        self.assertEqual(__version__, "0.2.21")
+        self.assertEqual(__version__, "0.2.22")
         out = io.StringIO()
         with patch("sys.stdout", out), self.assertRaises(SystemExit) as cm:
             cli.main(["--version"])
         self.assertEqual(cm.exception.code, 0)
-        self.assertIn("0.2.21", out.getvalue())
+        self.assertIn("0.2.22", out.getvalue())
 
 
 class TestQuotaWindows(unittest.TestCase):

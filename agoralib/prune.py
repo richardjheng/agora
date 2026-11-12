@@ -23,7 +23,7 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from agoralib import quota, snapshot
+from agoralib import jobs, quota, snapshot
 
 FINISHED_RELAY = ("done",)
 AGY_HOME = Path.home() / ".gemini" / "antigravity-cli"
@@ -63,6 +63,10 @@ def why_keep(thread: Path, state: dict, days: Optional[float]) -> Optional[str]:
     if state.get("keep"):
         return "已標記保留"
     relay = state.get("relay")
+    if relay and jobs.alive(relay):
+        return "分派程序尚未退出"
+    if relay and relay.get("worktree"):
+        return "保留隔離分派成果與控制紀錄；merge／清理須另行指派"
     if relay and relay.get("status") not in FINISHED_RELAY:
         return f"分派的工作尚未完成（{relay.get('status')}）"
     if (thread / ".lock").exists():
@@ -152,6 +156,11 @@ DELETERS = {"codex": delete_codex, "claude": delete_claude, "antigravity": delet
 
 def delete_thread(thread: Path, info: dict, with_sessions: bool) -> Dict[str, list]:
     done, errors = [], []
+    # Recheck at deletion time: the scan result may already be stale.
+    state = json.loads((thread / "state.json").read_text(encoding="utf-8"))
+    reason = why_keep(thread, state, None)
+    if reason:
+        return {"done": [], "errors": [reason]}
     if with_sessions:
         for s in info["sessions"]:
             party = s.get("party")

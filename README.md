@@ -9,7 +9,9 @@
 - 每個 AI 都透過自己的非互動 CLI 被呼叫：`claude -p`、`agy -p`、`codex exec`。
 - 一個**討論串**對每個 AI 各保留一段對話；有人發言時，工具把對方還沒看過的訊息一次轉過去。
 - 討論串存在**目標專案**的 `.agora/threads/<id>/`：`transcript.md` 給人看，`state.json` 給程式用。
-- **分派工作**時，接手方在背景執行：每完成一小步就寫 `progress.md`、檢查是否被叫停、檢查自己的額度；額度用完會等重置後繼續。
+- **分派工作**時，接手方在獨立建立的 branch（`agora/<分派 ID>`）與 git worktree（位於 `.agora/worktrees/<分派 ID>`）中執行：程式碼修改與建置輸出留在各自 worktree，各 worktree 建立獨立 `.venv` 並驗證程式碼載入來源；控制資料（進度檔 `progress.md`、`control.json`、`.agora/` 設定）維持在主工作區。每完成一小步就寫 `progress.md`、檢查是否被叫停、檢查自己的額度；額度用完會等重置後繼續。
+- **由 Agora 代為 commit**：接手方完成後將 commit 訊息寫成檔案，宣告完成後由 Agora 核對分派、branch、檔案範圍並執行實際 `agora check`，附上真實結果後代為 commit。本期不自動 push / merge，成果保留由使用者另行指派 merge。
+- **主動回報與完成通知規則**：發起背景討論、總結或分派時，必須設好完成通知（例如 `agora wait`、`agora status --wait`），結束後主動向使用者回報結論與下一步，不等使用者問；說了「完成後會給你看」就一定要做到。
 - 回覆進行中的內容（文字、讀檔與執行指令等動作）即時寫到討論串的 `live/discussion.md`、`live/work.md`，動作也會顯示在終端；完成後才正式寫進逐字稿並刪除暫存檔，中途停止的回覆不會寫入。
 - 討論時若某一方用了不被允許的工具或終端指令而整輪中斷，會提醒它改用讀檔工具、接續同一段對話重試一次；仍失敗時記進逐字稿，並繼續請其他 AI 回覆。
 - 接手方的工具被拒時（見[工具被拒](#工具被拒)），Agora 依被拒的種類告訴它該怎麼做，並把被拒的動作記下來；之後若仍宣告完成，`status` 會提醒分派方查證來源。
@@ -87,9 +89,9 @@ $A send <id> --from claude --blind --file q.md      # 獨立作答：各方看�
 $A send <id> --from human --message "..."           # 使用者插話（只記錄，下次轉給 AI）
 $A reply <id> --party antigravity                   # 不發言，直接請某方回覆
 $A auto <id> --rounds 6 [--order codex,claude]      # AI 依序自動發言（各方都表示【已達成共識】時提前結束）
-$A assign <id> --from claude [--tier standard] [--to codex --reason "指定理由"] --file 工作單.md   # 分派工作（--to 留空則依比例輪流挑選）
+$A assign <id> --from claude [--tier standard] [--to codex --reason "指定理由"] --allow "src/**" [--allow ...] --file 工作單.md   # 分派工作（--to 留空則依比例輪流挑選）
 $A summarize <id> --by claude                       # 用新對話讀完整逐字稿，產出共識、取捨、異議與工作單（summary.md）
-$A assign <id> --from human --from-summary [--yes]  # 用總結的工作單分派；總結過期時要 --yes 確認
+$A assign <id> --from human --from-summary --allow "src/**" [--yes]  # 用總結的工作單分派；總結過期時要 --yes 確認
 $A status <id> [--wait 900] [--json]                # 分派狀態與最新進度（見下方 exit code）
 $A changes <id> [--json]                            # 分派期間的變更（相對於分派當下的工作區快照）
 $A recall <id> [--wait [秒數]]                       # 請接手方停止；--wait 等到真的停止（預設最多 600 秒）
@@ -120,7 +122,8 @@ $A keep <id> [--off]                                # 標記保留，prune 不�
 | 2 | 等待逾時，接手方仍在進行；輸出第一行是「⏳ 等待 N 秒逾時，接手方仍在進行（狀態：running）」 |
 
 沒加 `--wait` 時只報告狀態，exit code 一律是 0。`--json` 輸出
-`{status, worker, alive, rounds, timed_out, waiting_until, updated, started, error, denied, denied_summary, warning, last_progress, exit_code}`。
+`{status, worker, alive, rounds, branch, worktree, commit, timed_out, waiting_until, updated, started, error, denied, denied_summary, warning, last_progress, exit_code}`。
+VSCode 面板分派狀態與終端皆會顯示獨立 branch、worktree 位置與 commit 結果。
 
 - 剛 `assign` 的工作在背景程序記下 PID 前（狀態 `starting` 未滿 60 秒）一律視為進行中，`status`、`activity` 與其他同時執行的指令不會把它判成中斷。
   assign 必須先寫入狀態再啟動背景程序（背景程序一啟動就讀取它），所以用這段緩衝，而不是先啟動再寫入。
@@ -185,6 +188,8 @@ skills 建議的流程：決策、設計、取捨類問題用中立開場（不�
 | Codex | `spawn_agent` 等 | 目前版本無法強制關閉（關掉 `multi_agent` 功能後仍可使用），只在提示中要求不要使用；若仍使用，逐字稿的附註會標記 |
 
 - 評估階段：預設關閉以評估各 AI 內建子代理在背景自主工作時的穩定性、可觀察性與額度消耗，避免難以追蹤的子呼叫；面板勾選文字標記為「允許使用內建子代理（預設關閉，評估中）」。
+- **並行指引**：子代理預設關閉；僅在顯式 `assign --subagents on` 時，才在分派說明中加入「能獨立進行的子工作（大量搜尋、讀檔、互不重疊的修改）用子代理並行，小工作自己做」。寫入子工作分配互不重疊的檔案，由父代理負責整合驗證。
+- **子代理在同一 worktree 執行（非強制隔離）**：文件與系統提示明確說明，**子代理在父任務的同一 worktree 內執行，這不是強制隔離**，也不保證子代理各有獨立 worktree 或權限隔離。
 
 ### 等級設定與模型選擇
 
@@ -306,8 +311,19 @@ VSCode 面板各 AI 卡片底端與 `agora parties --json`（頂層 `usage` 欄�
 | Antigravity | 沒有寫檔權限 | `--mode accept-edits`（只能寫工作區）；指令依 `~/.gemini/antigravity-cli/settings.json` 的 `permissions.allow`（完整比對） |
 | Codex | `-s read-only`（不受沙箱設定影響） | `-s workspace-write`（預設，`add_dirs` 的目錄另外可寫）；可用 `agora parties --sandbox codex=danger-full-access` 改為完整存取 |
 
-- 分派時用暫時的 git index 替工作區拍快照，存在 `refs/agora/<討論串>`（不動使用者的 index 與工作區；被忽略的檔案與 `.env`、金鑰不進快照），`changes` 與 VSCode 的「檢視分派期間的變更」以它為基準；清理討論串時一併刪除。期間任何人的修改都會列出。
-- 接手方的書面界線：只改工作單範圍、不 commit/push、不碰 `.env`、不做影響外部系統的動作；每輪前後比對 `git status` 並記在逐字稿。
+- **Branch 與 Worktree 實體隔離**：
+  - 分派時檢查來源 branch：若處於 detached HEAD 則停止分派；有未 commit 修改時予以提醒（新 worktree 從記錄的 HEAD/base SHA 建立，不會帶入來源未 commit 的修改）。記錄來源 branch 與 base SHA。
+  - 每次分派建立 `agora/<分派 ID>` branch 與獨立 git worktree（位於 `.agora/worktrees/<分派 ID>`，同 AI 多任務各一份）；若同名資源已存在則停止，不覆蓋。
+- **工作目錄與控制資料分離**：
+  - 接手 CLI 的工作目錄設為對應 worktree，程式碼與建置輸出留在各自 worktree。
+  - 控制資料（進度檔 `progress.md`、`control.json`、`.agora/` 設定）維持在主工作區，集中管理不分散。
+  - 各 worktree 建立獨立 `.venv` 並安裝依賴，偵測 editable install 與 `PYTHONPATH` 是否指回主目錄，確認 `agora check` 載入的是該 worktree 的程式碼。
+- **由 Agora 代為 Commit**：
+  - 接手方的書面界線：只改工作單範圍、不自行 commit/push/merge、不碰 `.env`、不做影響外部系統的動作。
+  - 接手方把 commit 訊息（任務目的、測試範圍）寫成檔案；宣告完成後由 Agora 核對分派、branch、檔案範圍，執行實際 `agora check`，附上真實結果後代為 commit。
+  - 本期完成後只 commit，不自動 push / merge，成果保留由使用者另行指派 merge。
+- **固定基準審查**：`agora changes` 與審查比對基準改為固定 `base SHA...branch`，避免基準漂移。
+- **確認程序結束才可清理**：未 merge 的成果、branch 與 worktree 均妥善保留，停止或中斷時不會提前清理。
 - hook 與會自動執行指令的設定（`.claude/settings*.json`、`.agents/hooks.json`、`.codex/config.toml`、`.codex/hooks.json`、`.vscode/tasks.json`、git hooks）改了等於繞過指令白名單：Claude 接手時直接禁止編輯 `.claude/`、`.agents/`、`.codex/`、`.git/` 與 `.vscode/tasks.json`；每輪結束時這些檔案被新增、修改或刪除都會還原，並記在逐字稿。
 - `.agora/config.json` 的 `build`、`check`、`add_dirs` 與沙箱設定決定接手方能執行的指令與能寫的範圍：接手方執行的 `agora build`／`check` 用該輪開始時的指令（以環境變數 `AGORA_LOCKED_COMMANDS` 帶入），中途改設定檔也不會被執行；被改動的設定在該輪結束時還原，並記在逐字稿。
 - 被 Agora 呼叫的 CLI 帶 `AGORA_INVOKED=1`，無法再呼叫 Agora，避免互相無限呼叫。

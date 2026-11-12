@@ -47,6 +47,9 @@ def assign(ws, args, crash=None, fail_spawn=False, usages=None, output=None):
             patch.object(cli.quota, "blocked", return_value=None), \
             patch.object(cli.models, "CACHE", ws.root / "models.json"), \
             patch.object(cli.snapshot, "create", return_value={}), \
+            patch.object(cli.worktree, "prepare", side_effect=lambda root, key, allowed, thread: {
+                "dispatch_id": key, "source_dirty": False, "base_sha": "base", "branch": f"agora/{key}",
+                "allowed_paths": ["**"]}), patch.object(cli.worktree, "save"), \
             patch.object(cli.jobs, "spawn", side_effect=OSError("測試啟動失敗") if fail_spawn else None,
                          return_value=99999999) as spawn, \
             patch.object(cli.jobs, "pid_started", return_value=None), \

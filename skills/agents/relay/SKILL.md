@@ -20,7 +20,7 @@ description: 額度快用完時把工作交接給還有額度的 AI、回來後�
    - 如何驗證（要跑的測試指令）
 3. 交接（若目前沒有相關討論串，先 `python D:/github/agora/agora.py new "主題"`）：
    ```powershell
-   python D:/github/agora/agora.py assign <thread> --from <你> --trigger relay --file <交接單路徑>
+   python D:/github/agora/agora.py assign <thread> --from <你> --trigger relay --allow "<交接範圍的路徑或 glob>" --file <交接單路徑>
    ```
    分派預設不寫 `--to`，交由 Agora 進行額度篩選後依比例輪流挑選合格接手方；若有特殊理由指定 `--to <AI>`，須加 `--reason "<理由>"`，零權重接手方另需 `--user-override`。
 4. 你無法自己排程喚醒，所以要告訴 Richard：交接給誰、討論串路徑、你的額度幾點重置，請他屆時叫你依本 skill 的 C 段收回。然後停止工作。
@@ -33,12 +33,12 @@ description: 額度快用完時把工作交接給還有額度的 AI、回來後�
 
 1. `python D:/github/agora/agora.py recall <thread>`
 2. `python D:/github/agora/agora.py status <thread> --wait 900`，等接手方停在檢查點。
-3. 讀 `.agora/threads/<thread>/progress.md` 和 `git diff`，**逐項查證**接手方的改動：
+3. 讀 `.agora/threads/<thread>/progress.md` 和 `git diff`（比對 base SHA...branch，只含已 commit 的成果）；提前收回時接手方可能還沒 commit，另外在任務 worktree 執行 `git status` 與 `git diff` 查看未提交與未追蹤的修改，**逐項查證**接手方的改動：
    - 有沒有超出交接範圍
    - 測試是否通過
-4. 向 Richard 簡短回報接手期間的進度與問題，再從進度檔的「下一步」繼續。
+4. 向 Richard 簡短回報接手期間的進度與問題，主動說明結論與下一步，再從進度檔的「下一步」繼續。
 
 ## 注意
 
-- 接手方的界線：只改交接範圍、不 commit/push、不碰 .env、不跑 main.py 或下單。
-- 狀態 `failed`：讀 `.agora/threads/<thread>/worker.log` 找原因，回報 Richard。
+- 接手方的界線：在獨立 worktree 內只改交接範圍、不自行 commit/push/merge、不碰 .env、不跑 main.py 或下單；完成後由 Agora 代做 commit。
+- 狀態 `failed`：讀 `.agora/threads/<thread>/worker.log` 找原因，主動回報 Richard。

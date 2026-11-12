@@ -25,7 +25,7 @@ description: 透過 Agora 與 Antigravity（Gemini）、Codex 進行多輪技術
    - 要改檔案的工作（因使用者只勾選該 AI，指定 `--to $X --reason "使用者只勾選該 AI"`）：
      ```bash
      T=$(python D:/github/agora/agora.py new "主題")
-     python D:/github/agora/agora.py assign "$T" --from claude --to $X --reason "使用者只勾選該 AI" --file 工作單.md
+     python D:/github/agora/agora.py assign "$T" --from claude --to $X --reason "使用者只勾選該 AI" --allow "<允許修改的路徑或 glob>" --file 工作單.md
      python D:/github/agora/agora.py status "$T" --wait 900     # 可用 run_in_background
      ```
      完成後讀 progress.md、審查 git diff、跑 `python D:/github/agora/agora.py check`，依審查原則向使用者呈現它做了什麼與審查發現的問題。
@@ -74,9 +74,9 @@ description: 透過 Agora 與 Antigravity（Gemini）、Codex 進行多輪技術
 討論出分工後，把工作單（範圍、不能碰的檔案、驗收方式、等級選擇理由）寫成檔案再分派，或先 `summarize` 再用總結的工作單：
 
 ```bash
-python D:/github/agora/agora.py assign "$T" --from claude --tier standard --file 工作單.md
+python D:/github/agora/agora.py assign "$T" --from claude --tier standard --allow "<允許修改的路徑或 glob>" --file 工作單.md
 python D:/github/agora/agora.py summarize "$T" --by codex      # 或：先總結
-python D:/github/agora/agora.py assign "$T" --from claude --tier standard --from-summary
+python D:/github/agora/agora.py assign "$T" --from claude --tier standard --allow "<允許修改的路徑或 glob>" --from-summary
 python D:/github/agora/agora.py status "$T" --wait 900          # 等它完成（可用 run_in_background）
 ```
 
@@ -84,6 +84,12 @@ python D:/github/agora/agora.py status "$T" --wait 900          # 等它完成�
 - **預設不寫 `--to`**：交給 Agora 依各方的自動派工比例（加權輪流）與額度資格自動挑選接手方。
 - **有理由才寫 `--to <AI>`**（例如使用者明確指定、專長契合）：必須加 `--reason "<理由>"` 記錄指派原因（例如 `--to codex --reason "使用者指定"`）。
 - **零權重 AI 實作覆寫**：若被指定的接手方分配比例為 0，另需加上 `--user-override`（僅在使用者明確指定時才使用；例如 `--to claude --reason "使用者指定" --user-override`）。
+
+### 分支與 Worktree 隔離流程
+- **獨立 Branch 與 Worktree**：每次分派會建立獨立 `agora/<分派 ID>` branch 與獨立 git worktree（位於 `.agora/worktrees/<分派 ID>`；同 AI 多任務各一份）。接手 CLI 的工作目錄設為該 worktree，進度檔、control.json 與 `.agora/` 設定維持在主工作區。
+- **獨立環境與建置**：每個 worktree 各建 `.venv`，建置輸出留在該 worktree。
+- **由 Agora 代做 Commit**：接手方完成後將 commit 訊息（任務目的、測試範圍）寫成檔案，宣告完成後由 Agora 核對分派、branch 與檔案範圍，執行實際 `agora check`，附上真實結果後代為 commit。接手方不要自行 git commit。不自動 push / merge，成果保留由使用者另行指派 merge。
+- **子代理非強制隔離**：子代理預設關閉；僅在顯式 `--subagents on` 時加入並行指引。**子代理在同一 worktree 執行**，由父代理負責整合驗證；這不是強制隔離，也不承諾子代理有獨立 worktree。
 
 ### 等級選擇準則（--tier）
 使用 `assign --tier light|standard|heavy`，並在工作單寫明選擇理由；不確定時用 `standard`：
@@ -96,8 +102,8 @@ python D:/github/agora/agora.py status "$T" --wait 900          # 等它完成�
 - **若你是接手方**：接手工作時依上述準則評估，若判斷指派的模型等級不足以安全完成任務，不要勉強猜測；在進度檔寫明理由，回覆最後一行寫「【需要升級】」後結束。
 
 ### 審查原則
-接手方在背景執行，只能在範圍內改檔、不能 commit。完成後依下列原則審查：
-1. **先看 diff 與測試**：逐項審查接手方的 `git diff`，確認未超出工作單範圍，並執行 `python D:/github/agora/agora.py check` 驗證。
+接手方在獨立 worktree 執行，只能在範圍內改檔，完成後由 Agora 核對並代做 commit。完成後依下列原則審查：
+1. **先看 diff 與測試**：逐項審查接手方的變更（以 `git diff <base_sha>...<branch>` 固定基準比對），確認未超出工作單範圍，並在主工作區執行 `python D:/github/agora/agora.py check --task <討論串>`；Agora 會在任務 worktree，以它的 .venv 與分派時凍結的測試指令驗證（不要先切進 worktree 再執行）。
 2. **必要時定點查證上下文**：對關鍵邏輯改動進行定點上下文查證，避免漫無目的全局搜尋。
 3. **深入除錯交回實作者**：審查若發現問題，先釐清現象後再分派給接手方修復，不要自己動手改或替它深入除錯。
 4. **適時建議開新對話**：大段工作完成並 commit 後，適時建議使用者開新對話（此為建議，不保證節省 token，但可避免單一長對話消耗過大）。
@@ -105,5 +111,7 @@ python D:/github/agora/agora.py status "$T" --wait 900          # 等它完成�
 ## 規則
 
 - 你代表這個互動中的 Claude Code，用 `--from claude` 發言。不要用 `auto` 代替自己思考，除非你沒被勾選（主持）或使用者要求「讓它們自己討論」。
-- 討論期間不改程式碼；結束後向使用者回報：共識、分歧（各方理由）、互評發現的盲點、建議的下一步、transcript.md 路徑。
-- 其他 AI 的說法一律先查證；它們也可能改到範圍外，審查時要看 git diff。
+- 討論期間不改程式碼。
+- **主動回報與完成通知**：發起背景討論、總結或分派時，**必須設好完成通知**（例如 `python D:/github/agora/agora.py wait <id>`、`python D:/github/agora/agora.py status <id> --wait 900`）；結束後主動向使用者回報結論、共識、分歧（各方理由）、互評發現的盲點、建議的下一步與 transcript.md 路徑，不等使用者問。說了「完成後會給你看」就一定要做到。
+- **子代理非強制隔離**：子代理在同一 worktree 執行，由父代理整合驗證；文件與說明不宣稱子代理有強制隔離或獨立 worktree。
+- 其他 AI 的說法一律先查證；審查時以固定基準 git diff 確認變更範圍。
