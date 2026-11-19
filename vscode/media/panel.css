@@ -6,6 +6,7 @@ body {
 }
 
 .card {
+  min-width: 0;
   border: 1px solid var(--vscode-widget-border, var(--vscode-panel-border));
   border-radius: 6px;
   padding: 8px 10px;
@@ -38,7 +39,7 @@ body {
 
 .row {
   display: grid;
-  grid-template-columns: 4.5em 1fr;
+  grid-template-columns: 4.5em minmax(0, 1fr);
   align-items: center;
   gap: 6px;
 }
@@ -67,6 +68,48 @@ select {
   flex-direction: column;
   gap: 4px;
 }
+
+.quota-detail {
+  padding: 6px 8px;
+  border: 1px solid var(--vscode-widget-border, transparent);
+  border-radius: 4px;
+  min-width: 0;
+}
+.quota-detail.active {
+  border-color: var(--vscode-focusBorder);
+  background: var(--vscode-editor-inactiveSelectionBackground);
+}
+.quota-heading {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+}
+.quota-heading .quota-label {
+  font-size: 0.9em;
+  min-width: 0;
+  flex-shrink: 1;
+  overflow-wrap: anywhere;
+}
+.quota-current { font-size: 0.8em; color: var(--vscode-textLink-foreground); }
+.quota-value { margin-left: auto; white-space: nowrap; }
+.quota-value.low { color: var(--vscode-errorForeground); }
+.quota-meter {
+  display: block;
+  appearance: none;
+  width: 100%;
+  height: 5px;
+  margin: 5px 0;
+  border: 0;
+}
+.quota-meter::-webkit-progress-bar {
+  background: var(--vscode-editorWidget-background, #555);
+  border-radius: 3px;
+}
+.quota-meter::-webkit-progress-value { border-radius: 3px; }
+.quota-meter.ok::-webkit-progress-value { background: var(--vscode-charts-green, #3fb950); }
+.quota-meter.mid::-webkit-progress-value { background: var(--vscode-charts-yellow, #d29922); }
+.quota-meter.low::-webkit-progress-value { background: var(--vscode-charts-red, #f85149); }
 
 .quota {
   display: flex;
@@ -224,13 +267,13 @@ input.share {
 
 .tier-main {
   display: grid;
-  grid-template-columns: 2.8em 1fr auto;
+  grid-template-columns: 2.8em minmax(0, 1fr) auto;
   align-items: center;
   gap: 6px;
 }
 
 .tier-main.no-effort {
-  grid-template-columns: 2.8em 1fr;
+  grid-template-columns: 2.8em minmax(0, 1fr);
 }
 
 .tier-label {
@@ -256,7 +299,7 @@ input.share {
 
 .tier-fallback-content {
   display: grid;
-  grid-template-columns: 1fr auto;
+  grid-template-columns: minmax(0, 1fr) auto;
   gap: 6px;
   align-items: center;
   padding: 4px 0 2px;

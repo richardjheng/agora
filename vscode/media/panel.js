@@ -27,52 +27,36 @@
     return d.toDateString() === new Date().toDateString() ? time : `${d.getMonth() + 1}/${d.getDate()} ${time}`;
   }
 
-  function singleQuotaRow(pctVal, resetTs, label, threshold, fullLabel, extraTitle) {
-    const pct = Math.max(0, Math.min(100, pctVal));
+  function singleQuotaRow(row, threshold) {
+    const known = typeof row.remaining_pct === "number" && Number.isFinite(row.remaining_pct);
+    const pct = known ? Math.max(0, Math.min(100, row.remaining_pct)) : 0;
     const level = pct < threshold ? "low" : pct < 25 ? "mid" : "ok";
-    const fill = el("div", { class: `fill ${level}` });
-    fill.style.width = `${pct}%`;
-    const resetStr = fmtReset(resetTs);
-    const titleLabel = fullLabel || label;
-    const labelPrefix = titleLabel ? `${titleLabel}：` : "";
-    const title = `${labelPrefix}剩餘 ${pct.toFixed(1)}%，${resetStr} 重置${extraTitle || ""}`;
-    return el("div", { class: "quota", title },
-      label ? el("span", { class: "quota-label" }, label) : null,
-      el("div", { class: "bar" }, fill),
-      el("span", { class: "quota-text" }, `${Math.round(pct)}% · ${resetStr} 重置`));
+    const meter = el("progress", { class: `quota-meter ${level}`, max: 100,
+      value: known ? pct : null, "aria-label": `${row.label}剩餘額度` });
+    const title = `${row.label}：剩餘 ${AgoraQuota.percent(row.remaining_pct)}`;
+    return el("div", { class: `quota-detail${row.active ? " active" : ""}`, title },
+      el("div", { class: "quota-heading" },
+        el("span", { class: "quota-label" }, row.label),
+        row.active ? el("span", { class: "quota-current" }, "目前模型") : null,
+        el("strong", { class: `quota-value ${known && pct < threshold ? "low" : ""}` }, AgoraQuota.percent(row.remaining_pct))),
+      known ? meter : null,
+      el("div", { class: "muted small" }, row.resets_at ? `${fmtReset(row.resets_at)} 重置` : "重置時間未提供"));
   }
 
   function quotaBar(u, threshold) {
     if (!u) return el("div", { class: "quota muted" }, state.quota ? "額度：無資料" : "額度：查詢中…");
+    const group = el("div", { class: "quota-group" },
+      el("div", { class: "usage-title" }, "帳號剩餘額度"));
     if (u.blocked) {
-      return el("div", { class: "quota blocked", title: u.blocked.message || u.blocked.reason },
-        `⛔ 無法使用（${u.blocked.reason}，${fmtReset(u.blocked.at)} 偵測）`);
+      group.appendChild(el("div", { class: "quota blocked", title: u.blocked.message || u.blocked.reason },
+        `⛔ 無法使用（${u.blocked.reason}，${fmtReset(u.blocked.at)} 偵測）`));
+    } else {
+      for (const row of AgoraQuota.rows(u)) group.appendChild(singleQuotaRow(row, threshold));
     }
-    const group = quotaRows(u, threshold);
-    if (u.updated_at && Date.now() / 1000 - u.updated_at > 2 * 3600) {   // 與 quota.STALE_AFTER 相同
-      group.appendChild(el("div", { class: "quota muted" }, `資料 ${Math.floor((Date.now() / 1000 - u.updated_at) / 3600)} 小時前更新，可能過期`));
-    }
+    const stale = u.updated_at && Date.now() / 1000 - u.updated_at > 2 * 3600;
+    group.appendChild(el("div", { class: `small ${stale ? "error" : "muted"}` },
+      u.updated_at ? `額度更新：${fmtReset(u.updated_at)}${stale ? " · 可能過期" : ""}` : "額度更新時間未知"));
     return group;
-  }
-
-  function quotaRows(u, threshold) {
-    const winKeys = u.windows ? Object.keys(u.windows) : [];
-    const poolSummary = u.pools
-      ? Object.entries(u.pools).map(([k, v]) => `${v.label || k} ${Math.round(v.remaining_pct)}%`).join("、")
-      : "";
-    const extraTitle = poolSummary ? `（額度池：${poolSummary}）` : "";
-    if (winKeys.length > 1) {
-      const rows = winKeys.map((k) => {
-        const w = u.windows[k];
-        const full = (w.full_label || w.label || k) + (u.pools && w.active ? "（目前模型）" : "");
-        return singleQuotaRow(w.remaining_pct, w.resets_at, w.label || k, threshold, full, extraTitle);
-      });
-      return el("div", { class: "quota-group" }, ...rows);
-    }
-    const label = (winKeys.length === 1 && u.windows[winKeys[0]].label) || (u.window_label && u.window ? u.window_label : null);
-    const full = (winKeys.length === 1 && u.windows[winKeys[0]].full_label) || u.label || label;
-    const row = singleQuotaRow(u.remaining_pct, u.resets_at, label, threshold, full, extraTitle);
-    return el("div", { class: "quota-group" }, row);
   }
 
   function select(options, value, onChange, disabled) {
@@ -306,9 +290,10 @@
       const subMissing = u.subagents_unobserved ? `（另有 ${u.subagents_unobserved} 次未觀測）` : "";
       const subLine = `子代理：啟動 ${u.subagents_started_7d || 0} 次${subMissing}`;
 
-      usageSection = el("div", { class: "usage-block", title: "近 7 天用量統計" },
-        el("div", { class: "usage-title" }, "近 7 天用量"),
+      usageSection = el("div", { class: "usage-block", title: "僅統計此專案經 Agora 呼叫時觀測到的用量" },
+        el("div", { class: "usage-title" }, "此專案近 7 天用量"),
         el("div", { class: "usage-row" }, tokenLine),
+        el("div", { class: "muted" }, "僅含 Agora 觀測紀錄；非帳號總用量。"),
         el("div", { class: "usage-row" }, roundLine),
         el("div", { class: "usage-row" }, subLine));
     }
@@ -324,6 +309,7 @@
         disabled ? el("span", { class: "badge" }, "未參與") : null),
       quotaBar(quota, (state.quota && state.quota.threshold_pct) || 5),
       el("label", { class: "row" }, el("span", { class: "label" }, "模型"), modelSelect),
+      el("div", { class: "muted small" }, `模型清單：${models.length} 項 · ${state.catalog && state.catalog.fetched_at ? fmtReset(state.catalog.fetched_at) + " 更新" : "更新時間未知"}`),
       effortRow,
       tiersSection,
       shareRow,
@@ -393,6 +379,7 @@
       if (state.errors.quota) children.push(el("div", { class: "error" }, `額度：${state.errors.quota}`));
       children.push(el("div", { class: "actions" },
         el("button", { onclick: () => vscode.postMessage({ type: "newThread" }) }, "新增討論串"),
+        el("button", { onclick: () => vscode.postMessage({ type: "refreshModelsAndQuota" }) }, "更新模型與額度"),
         el("button", { class: "secondary", onclick: () => vscode.postMessage({ type: "refreshQuota" }) }, "更新額度"),
         el("button", { class: "secondary", onclick: () => vscode.postMessage({ type: "refreshModels" }) }, "更新模型清單")));
       children.push(el("p", { class: "muted small" },

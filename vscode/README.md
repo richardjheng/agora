@@ -22,6 +22,8 @@
 
 ## 安裝
 
+v0.2.24：額度面板直接列出所有 AGY 模型額度池，標示目前模型、剩餘百分比小數與更新時間。按「更新模型與額度」可重新取得清單；「此專案近 7 天用量」僅包含 Agora 觀測紀錄，不代表帳號總用量。
+
 只需要 Python 3.9 以上與這個擴充套件：
 
 第一次安裝：下載並安裝 [GitHub Releases](https://github.com/richardjheng/agora/releases) 最新的 `.vsix`（Antigravity 等 VSCode 分支把 `code` 換成它們自己的指令）。

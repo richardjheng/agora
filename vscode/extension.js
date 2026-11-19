@@ -10,6 +10,7 @@ const { syncCore, readBuild } = require("./core");
 const { findPython, missingPythonMessage } = require("./python");
 const updates = require("./update");
 const { coreMatches } = require("./versions");
+const quotaDisplay = require("./media/quota-display");
 const { relayModelLabel, tierLabel } = require("./modellabel");
 
 const PARTIES = ["claude", "antigravity", "codex"];
@@ -588,33 +589,10 @@ function quotaBody(u, multiline) {
   };
 
   if (u.blocked) return `無法使用（${u.blocked.reason}，${fmt(u.blocked.at)} 偵測）`;
-  const winKeys = u.windows ? Object.keys(u.windows) : [];
-  if (winKeys.length > 1) {
-    if (multiline) {
-      const details = winKeys.map((k) => {
-        const w = u.windows[k];
-        return `  • ${w.label || k}：剩 ${Math.round(w.remaining_pct)}%（${fmt(w.resets_at)} 重置）`;
-      }).join("\n");
-      const tag = u.window_label || u.window || "最緊";
-      return `剩 ${Math.round(u.remaining_pct)}%（${tag}，${fmt(u.resets_at)} 重置）\n${details}`;
-    }
-    const summary = winKeys.map((k) => {
-      const w = u.windows[k];
-      return `${w.label || k} ${Math.round(w.remaining_pct)}%`;
-    }).join(" · ");
-    return `剩 ${Math.round(u.remaining_pct)}%（${summary}）`;
-  }
-
-  const winLabel = (winKeys.length === 1 && u.windows[winKeys[0]].label) || (u.window_label && u.window ? u.window_label : null);
-  const winTag = winLabel ? `${winLabel}，` : "";
-  let base = `剩 ${Math.round(u.remaining_pct)}%（${winTag}${fmt(u.resets_at)} 重置）`;
-  if (multiline && u.pools) {
-    const others = Object.entries(u.pools)
-      .map(([k, v]) => `  • ${v.label || k}：剩 ${Math.round(v.remaining_pct)}%（${fmt(v.resets_at)} 重置）`)
-      .join("\n");
-    if (others) base += `\n${others}`;
-  }
-  return base;
+  const rows = quotaDisplay.rows(u);
+  const details = rows.map((w) => `${w.label}${w.active ? "（目前模型）" : ""}：剩 ${quotaDisplay.percent(w.remaining_pct)}（${fmt(w.resets_at)} 重置）`);
+  const updated = u.updated_at ? `資料更新：${fmt(u.updated_at)}` : "資料更新時間未知";
+  return multiline ? [...details, updated].join("\n") : details.join(" · ");
 }
 
 class PartiesView {
@@ -628,6 +606,7 @@ class PartiesView {
     const media = vscode.Uri.file(path.join(extensionPath, "media"));
     view.webview.options = { enableScripts: true, localResourceRoots: [media] };
     const nonce = Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+    const quotaJs = view.webview.asWebviewUri(vscode.Uri.joinPath(media, "quota-display.js"));
     const js = view.webview.asWebviewUri(vscode.Uri.joinPath(media, "panel.js"));
     const css = view.webview.asWebviewUri(vscode.Uri.joinPath(media, "panel.css"));
     view.webview.html = `<!DOCTYPE html>
@@ -635,7 +614,7 @@ class PartiesView {
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${view.webview.cspSource}; script-src 'nonce-${nonce}';">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link rel="stylesheet" href="${css}"></head>
-<body><div id="app">載入中…</div><script nonce="${nonce}" src="${js}"></script></body></html>`;
+<body><div id="app">載入中…</div><script nonce="${nonce}" src="${quotaJs}"></script><script nonce="${nonce}" src="${js}"></script></body></html>`;
     view.webview.onDidReceiveMessage((msg) => this.onMessage(msg).catch(showError));
     view.onDidChangeVisibility(() => view.visible && this.post());
   }
@@ -697,6 +676,10 @@ class PartiesView {
         }
         break;
       }
+      case "refreshModelsAndQuota":
+        await m.loadQuota(true);
+        await m.loadCatalog(true);
+        break;
       case "refreshModels":
         await m.loadCatalog(true);
         break;
@@ -1068,7 +1051,7 @@ function activate(context) {
     const threshold = model.quota.threshold_pct || 5;
     statusBar.text = "$(organization) " + enabled.map((p) => {
       const u = model.quota[p];
-      const pct = !u ? "?" : u.blocked ? "✕" : `${Math.round(u.remaining_pct)}%`;
+      const pct = !u ? "?" : u.blocked ? "✕" : quotaDisplay.percent(u.remaining_pct);
       return `${SHORT[p]} ${pct}`;
     }).join(" · ");
     const low = enabled.some((p) => model.quota[p] && (model.quota[p].blocked || model.quota[p].remaining_pct < threshold));
