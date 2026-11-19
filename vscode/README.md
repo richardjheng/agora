@@ -2,7 +2,7 @@
 
 在 VSCode 側邊欄管理 Agora：
 
-- **AI 與模型**：勾選這個專案要讓哪些 AI（Claude Code、Antigravity、Codex）參與討論與接手工作，為每個 AI 選模型、推理強度與工作分配比例；同時顯示各自的剩餘額度。設定存在 `<專案>/.agora/config.json`，與 `agora parties` 指令共用。
+- **AI 與模型**：勾選這個專案要讓哪些 AI（Claude Code、Antigravity、Codex）參與討論與接手工作，每個 AI 卡片內可收合設定「討論時用的模型」（模型與思考深度／推理強度）與「接手工作時用的模型」（輕量／標準／重度等級與額度不足時的備用模型），以及自動派工比例；同時顯示各自的剩餘額度。設定存在 `<專案>/.agora/config.json`，與 `agora parties` 指令共用。
 - **討論串**：列出專案的討論串與分派狀態；可新增討論串、發言、讓 AI 自動討論、分派工作、查看進度、收回。點一下開啟逐字稿預覽，AI 回覆時會即時更新。
 - **內建子代理**：每個 AI 的卡片可以設定被 Agora 呼叫時能否啟動自己的內建子代理（Claude 禁用 Task 工具、Antigravity 由 hook 擋下、Codex 只能在提示中要求）。
 - **安裝狀態**：面板依 `agora install --status` 顯示此專案缺少或過期的項目，並提供「安裝到此專案」或「更新」。
