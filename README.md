@@ -10,7 +10,7 @@
 - 一個**討論串**對每個 AI 各保留一段對話；有人發言時，工具把對方還沒看過的訊息一次轉過去。
 - 討論串存在**目標專案**的 `.agora/threads/<id>/`：`transcript.md` 給人看，`state.json` 給程式用。
 - **分派工作**時，接手方在獨立建立的 branch（`<ai>/<slug>-<7 碼分派 ID>`，前綴依接手方為 `claude/`、`codex/`、`agy/`，預設取討論串標題並可用 `assign --name` 覆寫；舊分派 `agora/<分派 ID>` 原樣相容）與 git worktree（位於 `.agora/worktrees/<完整分派 ID>`）中執行：程式碼修改與建置輸出留在各自 worktree，各 worktree 建立獨立 `.venv` 並驗證程式碼載入來源；控制資料（進度檔 `progress.md`、`control.json`、`.agora/` 設定）維持在主工作區。每完成一小步就寫 `progress.md`、檢查是否被叫停、檢查自己的額度；額度用完會等重置後繼續。
-- **由 Agora 代為 commit，並由 `agora merge` 受控合併**：接手方完成後將 commit 訊息寫成檔案，宣告完成後由 Agora 核對分派、branch、檔案範圍並執行實際 `agora check`，附上真實結果後代為 commit。分派與收尾不自動 push / merge；僅在**使用者明確同意**後，由主持方於主工作區執行 `agora merge <討論串>`（`--no-ff` 保留分岔、主工作區整合驗證，通過後預設清理 worktree 與分支）。
+- **由 Agora 代為 commit，並由 `agora merge` 受控合併**：接手方完成後將 commit 訊息寫成檔案，宣告完成後由 Agora 核對分派、branch、檔案範圍並執行實際 `agora check`，附上真實結果後代為 commit。分派與收尾不自動 push / merge；僅在**使用者明確同意**後，由主持方於主工作區執行 `agora merge <討論串>`（`--no-ff` 保留分岔、主工作區整合驗證，通過後預設只清理 worktree、保留分支；加 `--delete-branch` 才刪分支）。
 - **主動回報與完成通知規則**：發起背景討論、總結或分派時，必須設好完成通知（例如以背景執行 `agora watch`，或 `agora wait`、`agora status --wait`），結束後主動向使用者回報結論與下一步，不等使用者問；說了「完成後會給你看」就一定要做到。詳見[背景通知與回報機制](#背景通知與回報機制watch-與-hook-補報)。
 - 回覆進行中的內容（文字、讀檔與執行指令等動作）即時寫到討論串的 `live/discussion.md`、`live/work.md`，動作也會顯示在終端；完成後才正式寫進逐字稿並刪除暫存檔，中途停止的回覆不會寫入。
 - 討論時若某一方用了不被允許的工具或終端指令而整輪中斷，會提醒它改用讀檔工具、接續同一段對話重試一次；仍失敗時記進逐字稿，並繼續請其他 AI 回覆。
@@ -95,7 +95,7 @@ $A assign <id> --from human --from-summary --allow "src/**" [--yes]  # 用總結
 $A status <id> [--wait 900] [--json]                # 分派狀態與最新進度（見下方 exit code）
 $A changes <id> [--json]                            # 分派期間的變更（相對於分派當下的工作區快照）
 $A finalize <id> [--dispatch-id <分派ID>]             # 程序結束後，完整驗證保留成果並提交
-$A merge <id> [--dispatch-id <分派ID>] [--keep]       # 使用者同意後，以 --no-ff 合併分支、整合驗證並預設清理
+$A merge <id> [--dispatch-id <分派ID>] [--keep | --delete-branch]  # 使用者同意後，以 --no-ff 合併分支、整合驗證並預設清 worktree、保留分支
 $A recall <id> [--wait [秒數]]                       # 請接手方停止；--wait 等到真的停止（預設最多 600 秒）
 $A check                                            # 工作區驗證（語法檢查＋測試）
 $A build                                            # 專案建置（.agora/config.json 的 build 指令）
@@ -109,7 +109,7 @@ $A stop <id>                                        # 停止進行中的討論
 $A list / show <id> --last 3
 $A prune [--days 30] [--verbose]                    # 列出不再需要的討論串（不會刪除）
 $A prune --yes [--keep-sessions]                    # 確認刪除討論串
-$A prune --merged [--thread <id>] [--yes]           # 只清理已合併但未清的分派 worktree 與分支（不刪討論串）
+$A prune --merged [--thread <id>] [--delete-branch] [--yes]  # 只清理已合併但未清的分派 worktree（預設保留分支，加 --delete-branch 才刪；不刪討論串）
 $A keep <id> [--off]                                # 標記保留，prune 不會清理
 ```
 
@@ -386,7 +386,7 @@ Agora 在建立訊息、背景 job 或派工 worktree 前立即回報 sandbox �
 - 沒有分派工作，或分派的工作已完成（隔離分派須已合併並已清理）；暫停、失敗、等待中、尚未合併清理的都保留
 - 目前沒有人在使用
 
-另提供 `agora prune --merged [--thread <id>] [--yes]`，專門清理**已合併但未清理**的分派 worktree 與分支（預設只列出，加 `--yes` 執行），只清理分派資源、**不刪除討論串與控制紀錄**；僅自動刪除可重建產物（`.venv`、`__pycache__`、`*.pyc` 與 manifest 記錄的 `build_outputs`），有未知檔案或未提交變更時不清理並列出檔案。
+另提供 `agora prune --merged [--thread <id>] [--delete-branch] [--yes]`，專門清理**已合併但未清理**的分派 worktree（預設保留分支，加 `--delete-branch` 才以 `git branch -d` 刪分支；預設只列出，加 `--yes` 執行），只清理分派資源、**不刪除討論串與控制紀錄**；僅自動刪除可重建產物（`.venv`、`__pycache__`、`*.pyc` 與 manifest 記錄的 `build_outputs`），有未知檔案或未提交變更時不清理並列出檔案。
 
 刪除討論串時，會一併刪除 Agora 為它在各 CLI 開的對話紀錄（`--keep-sessions` 可保留）；使用者用 `--session` 帶進來的對話不會刪：
 
@@ -414,7 +414,7 @@ Agora 在建立訊息、背景 job 或派工 worktree 前立即回報 sandbox �
 - **由 Agora 代為 Commit，並以 `agora merge` 受控合併與清理**：
   - 接手方的書面界線：只改工作單範圍、不自行 commit/push/merge、不碰 `.env`、不做影響外部系統的動作。
   - 接手方把 commit 訊息（任務目的、測試範圍）寫成檔案；宣告完成後由 Agora 核對分派、branch、檔案範圍，執行實際 `agora check`，附上真實結果後代為 commit。
-  - 分派與收尾不自動 push / merge；僅在使用者明確要求時，由主持方於主工作區執行 `agora merge <討論串> [--dispatch-id <ID>] [--keep]`：檢查程序已停止、`commit_status=committed` 且分支 SHA 吻合、主工作區位於 `source_branch`、無未提交的已追蹤變更與進行中 Git 操作；以 `git merge --no-ff` 合併（衝突即 `merge --abort` 並回報，不清理）並在主工作區執行一次 `agora check` 整合驗證（失敗不回滾合併且不清理）；驗證通過後預設先移除 worktree 再 `git branch -d`（`--keep` 跳過），僅自動刪除可重建產物，遇未知檔阻擋、遇 Windows 鎖定（EPERM）記為待重試可重試，控制紀錄含 SHA 完整保留。
+  - 分派與收尾不自動 push / merge；僅在使用者明確要求時，由主持方於主工作區執行 `agora merge <討論串> [--dispatch-id <ID>] [--keep | --delete-branch]`：檢查程序已停止、`commit_status=committed` 且分支 SHA 吻合、主工作區位於 `source_branch`、無未提交的已追蹤變更與進行中 Git 操作；以 `git merge --no-ff` 合併（衝突即 `merge --abort` 並回報，不清理）並在主工作區執行一次 `agora check` 整合驗證（失敗不回滾合併且不清理）；驗證通過後預設只移除 worktree、保留分支（`--keep` 兩者都保留、`--delete-branch` 才於移除 worktree 後以 `git branch -d` 刪分支），僅自動刪除可重建產物，遇未知檔阻擋、遇 Windows 鎖定（EPERM）記為待重試可重試，控制紀錄含 SHA 完整保留。
 - **固定基準審查**：`agora changes` 與審查比對基準改為固定 `base SHA...branch`，避免基準漂移。
 - **確認程序結束才可清理**：未 merge 的成果、branch 與 worktree 均妥善保留，停止或中斷時不會提前清理。
 - hook 與會自動執行指令的設定（`.claude/settings*.json`、`.agents/hooks.json`、`.codex/config.toml`、`.codex/hooks.json`、`.vscode/tasks.json`、git hooks）改了等於繞過指令白名單：Claude 接手時直接禁止編輯 `.claude/`、`.agents/`、`.codex/`、`.git/` 與 `.vscode/tasks.json`；每輪結束時這些檔案被新增、修改或刪除都會還原，並記在逐字稿。

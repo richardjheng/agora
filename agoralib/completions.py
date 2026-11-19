@@ -175,7 +175,20 @@ def describe(item):
     elif kind == "討論":
         next_step = "閱讀逐字稿，回報結論與下一步"
     elif item.get("commit_status") == "committed" and item.get("commit_sha"):
-        next_step = f"審查 diff 與測試，使用者同意後可用 agora merge {item['thread']} 整合分支"
+        merge_rec = item.get("merge_record") or {}
+        cleanup_rec = item.get("cleanup_record") or {}
+        if merge_rec.get("merged"):
+            if cleanup_rec.get("status") == "cleaned":
+                if cleanup_rec.get("branch_deleted"):
+                    next_step = "已合併並清理 worktree 與分支"
+                else:
+                    next_step = "已合併並清理 worktree，分支保留"
+            elif cleanup_rec.get("status") == "kept":
+                next_step = "已合併，保留 worktree 與分支"
+            else:
+                next_step = f"已合併；可用 agora merge {item['thread']} 或 agora prune --merged --yes 完成清理"
+        else:
+            next_step = f"審查 diff 與測試，使用者同意後可用 agora merge {item['thread']} 整合分支（預設清理 worktree、保留分支）"
     else:
         next_step = "查看 progress.md，確認變更與驗證結果後決定下一步"
     details = (f"branch={item.get('branch') or '無'}，commit={item.get('commit_sha') or '無'}"

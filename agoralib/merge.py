@@ -3,7 +3,8 @@
 Dispatches and finalize never auto-merge. Merging happens only when explicitly
 requested by the user via `agora merge`. Cleanup removes only verified
 rebuildable artifacts (`.venv`, `__pycache__`, `*.pyc`, and manifest-recorded
-`build_outputs`), then removes the worktree before running `git branch -d`.
+`build_outputs`), then removes the worktree while keeping the branch by default
+(deleting it with `git branch -d` only when `--delete-branch` is specified).
 """
 
 from __future__ import annotations
@@ -281,14 +282,34 @@ def _prune_stale_worktree_metadata(root: Path) -> None:
     _git_run(root, "worktree", "prune")
 
 
+def describe_cleanup(cleanup_rec: Optional[dict]) -> str:
+    """Human-readable summary of a cleanup_record for status, notes, and hook reports."""
+    if not isinstance(cleanup_rec, dict) or not cleanup_rec.get("status"):
+        return ""
+    status = cleanup_rec["status"]
+    if status == "cleaned":
+        if cleanup_rec.get("branch_deleted"):
+            return "已清理 worktree 與分支"
+        return "已清理 worktree，分支保留"
+    if status == "kept":
+        return "保留 worktree 與分支"
+    if status == "pending_retry":
+        return "待重試"
+    if status == "blocked":
+        return "阻擋（未清理）"
+    return str(status)
+
+
 def cleanup_dispatch(
     root: Path,
     thread: Path,
     meta: dict,
     relay: Optional[dict] = None,
     state: Optional[dict] = None,
+    *,
+    delete_branch: bool = False,
 ) -> dict:
-    """Safely clean a merged dispatch's worktree (first) and branch (`git branch -d`)."""
+    """Safely clean a merged dispatch's worktree; keep branch by default unless `delete_branch=True`."""
     root = root.resolve()
     if state is None:
         state = completions.read_object(thread / "state.json") if (thread / "state.json").is_file() else {}
@@ -298,11 +319,13 @@ def cleanup_dispatch(
     now = _now_str()
 
     def _blocked(reason: str, tracked: Optional[List[str]] = None, blocking: Optional[List[str]] = None) -> dict:
+        br_exists = ref_exists(root, f"refs/heads/{branch}") if branch else False
         rec = {
             "status": "blocked",
             "at": now,
             "worktree_removed": not Path(meta["worktree"]).exists() if meta.get("worktree") else True,
-            "branch_deleted": not ref_exists(root, f"refs/heads/{branch}") if branch else True,
+            "branch_deleted": not br_exists,
+            "branch_kept": br_exists,
             "branch": branch,
             "commit_sha": meta.get("commit_sha"),
             "merge_sha": (meta.get("merge_record") or {}).get("merge_sha"),
@@ -310,6 +333,8 @@ def cleanup_dispatch(
             "tracked_changes": list(tracked or []),
             "blocking_files": list(blocking or []),
         }
+        if isinstance(meta.get("merge_record"), dict):
+            meta["merge_record"]["branch_kept"] = br_exists
         meta["cleanup_record"] = rec
         _sync_dispatch_records(thread, meta)
         return rec
@@ -320,12 +345,15 @@ def cleanup_dispatch(
             "at": now,
             "worktree_removed": wt_removed,
             "branch_deleted": br_deleted,
+            "branch_kept": not br_deleted,
             "branch": branch,
             "commit_sha": meta.get("commit_sha"),
             "merge_sha": (meta.get("merge_record") or {}).get("merge_sha"),
             "error": error,
             "retryable": True,
         }
+        if isinstance(meta.get("merge_record"), dict):
+            meta["merge_record"]["branch_kept"] = not br_deleted
         meta["cleanup_record"] = rec
         _sync_dispatch_records(thread, meta)
         return rec
@@ -364,12 +392,15 @@ def cleanup_dispatch(
 
     # 3. Already cleaned?
     wt_exists = target.exists() or target.is_symlink()
-    if not wt_exists and not branch_exists:
+    if not wt_exists and (not branch_exists or not delete_branch):
+        branch_deleted = not branch_exists
+        branch_kept = branch_exists
         rec = {
             "status": "cleaned",
             "at": (meta.get("cleanup_record") or {}).get("at") or now,
             "worktree_removed": True,
-            "branch_deleted": True,
+            "branch_deleted": branch_deleted,
+            "branch_kept": branch_kept,
             "branch": branch,
             "commit_sha": meta.get("commit_sha"),
             "merge_sha": (meta.get("merge_record") or {}).get("merge_sha"),
@@ -383,7 +414,10 @@ def cleanup_dispatch(
                 "branch": branch,
                 "commit_sha": meta.get("commit_sha"),
                 "detected_at": now,
+                "branch_kept": branch_kept,
             }
+        else:
+            meta["merge_record"]["branch_kept"] = branch_kept
         meta["cleanup_record"] = rec
         _sync_dispatch_records(thread, meta)
         return rec
@@ -429,12 +463,15 @@ def cleanup_dispatch(
     else:
         _prune_stale_worktree_metadata(root)
 
-    # 5. Delete branch using safe `git branch -d` (only after worktree is removed)
-    if branch_exists:
+    # 5. Delete branch using safe `git branch -d` only when requested (after worktree is removed)
+    branch_deleted = not branch_exists
+    if delete_branch and branch_exists:
         try:
             worktree.git(root, "branch", "-d", branch)
+            branch_deleted = True
         except (PermissionError, OSError, worktree.WorktreeError) as exc:
             return _pending_retry(f"刪除分支 {branch} 失敗（待重試）：{exc}", True, False)
+    branch_kept = not branch_deleted
 
     # 6. Persist final cleaned record while preserving all control records
     if not (meta.get("merge_record") or {}).get("merged"):
@@ -445,12 +482,16 @@ def cleanup_dispatch(
             "branch": branch,
             "commit_sha": meta.get("commit_sha"),
             "detected_at": now,
+            "branch_kept": branch_kept,
         }
+    else:
+        meta["merge_record"]["branch_kept"] = branch_kept
     rec = {
         "status": "cleaned",
         "at": now,
         "worktree_removed": True,
-        "branch_deleted": True,
+        "branch_deleted": branch_deleted,
+        "branch_kept": branch_kept,
         "branch": branch,
         "commit_sha": meta.get("commit_sha"),
         "merge_sha": (meta.get("merge_record") or {}).get("merge_sha"),
@@ -568,11 +609,14 @@ def merge_dispatch(
     dispatch_id: Optional[str] = None,
     *,
     keep: bool = False,
+    delete_branch: bool = False,
     run_check: Optional[Callable[[Path], dict]] = None,
 ) -> dict:
-    """Validate preconditions, merge with `--no-ff`, run integration check, and optionally clean up."""
+    """Validate preconditions, merge with `--no-ff`, run integration check, and clean up worktree."""
     from agoralib import cli
 
+    if keep and delete_branch:
+        raise MergeError("--keep 與 --delete-branch 不能同時使用")
     if os.getenv(worktree.WORK_ENV) or ws.root.resolve() != ws.control_root.resolve():
         raise MergeError("agora merge 必須在主工作區執行，不能在分派 worktree 內執行")
     root = ws.control_root.resolve()
@@ -721,6 +765,8 @@ def merge_dispatch(
         cli.append_progress(thread, "agora merge 整合驗證", note_text)
 
         if not check_passed:
+            meta["merge_record"]["branch_kept"] = ref_exists(root, f"refs/heads/{branch}")
+            _sync_dispatch_records(thread, meta)
             return {
                 "ok": False,
                 "dispatch_id": key,
@@ -736,13 +782,16 @@ def merge_dispatch(
     else:
         _sync_dispatch_records(thread, meta)
 
-    # 9. Cleanup (default unless --keep)
+    # 9. Cleanup (default removes worktree and keeps branch unless --keep or --delete-branch)
     if keep:
+        branch_exists_now = ref_exists(root, f"refs/heads/{branch}")
+        meta["merge_record"]["branch_kept"] = branch_exists_now
         cleanup_rec = {
             "status": "kept",
             "at": _now_str(),
             "worktree_removed": not Path(meta["worktree"]).exists(),
-            "branch_deleted": not ref_exists(root, f"refs/heads/{branch}"),
+            "branch_deleted": not branch_exists_now,
+            "branch_kept": branch_exists_now,
             "branch": branch,
             "commit_sha": commit_sha,
             "merge_sha": merge_sha,
@@ -751,12 +800,12 @@ def merge_dispatch(
         meta["cleanup_record"] = cleanup_rec
         _sync_dispatch_records(thread, meta)
     else:
-        cleanup_rec = cleanup_dispatch(root, thread, meta, relay=relay)
+        cleanup_rec = cleanup_dispatch(root, thread, meta, relay=relay, delete_branch=delete_branch)
 
     summary_note = (
         f"🔀 agora merge 完成：分派 {key}（branch：{branch} → {source_branch}，"
         + ("已合併，未建立空節點" if already_merged else f"merge SHA：{(merge_sha or '')[:12]}")
-        + f"；清理狀態：{cleanup_rec.get('status')}）"
+        + f"；清理狀態：{describe_cleanup(cleanup_rec) or cleanup_rec.get('status')}）"
     )
     cli.add_system_note(thread, summary_note)
     cli.append_progress(thread, "agora merge", summary_note)
@@ -804,7 +853,7 @@ def _thread_dispatches(thread: Path, state: dict) -> List[Tuple[str, dict, Optio
 
 
 def _dispatch_is_merged_and_cleaned(meta: dict) -> bool:
-    """True only when a dispatch has been confirmed merged and both worktree and branch are gone."""
+    """True when a dispatch has been confirmed merged and its worktree is gone (branch may be kept)."""
     cleanup = meta.get("cleanup_record") or {}
     merge_rec = meta.get("merge_record") or {}
     if cleanup.get("status") != "cleaned":
@@ -814,14 +863,6 @@ def _dispatch_is_merged_and_cleaned(meta: dict) -> bool:
     wt = meta.get("worktree")
     if wt and (Path(wt).exists() or Path(wt).is_symlink()):
         return False
-    branch = meta.get("branch")
-    control_root = meta.get("control_root")
-    if branch and control_root and Path(control_root).is_dir():
-        try:
-            if ref_exists(Path(control_root), f"refs/heads/{branch}"):
-                return False
-        except OSError:
-            return False
     return True
 
 
@@ -844,7 +885,7 @@ def thread_dispatch_keep_reason(thread: Path, state: dict) -> Optional[str]:
     return None
 
 
-def scan_merged_dispatches(ws, threads: List[Path]) -> Tuple[List[dict], List[dict]]:
+def scan_merged_dispatches(ws, threads: List[Path], *, delete_branch: bool = False) -> Tuple[List[dict], List[dict]]:
     """Inspect all historical dispatches across threads for `agora prune --merged`."""
     root = ws.control_root.resolve()
     candidates: List[dict] = []
@@ -865,7 +906,7 @@ def scan_merged_dispatches(ws, threads: List[Path]) -> Tuple[List[dict], List[di
             source_branch = meta.get("source_branch") or ""
             wt_exists = target.exists() or target.is_symlink()
             br_exists = ref_exists(root, f"refs/heads/{branch}")
-            if not wt_exists and not br_exists:
+            if not wt_exists and (not br_exists or not delete_branch):
                 continue  # Already cleaned; nothing to prune.
             info = {
                 "thread": thread.name,
@@ -934,11 +975,12 @@ def scan_merged_dispatches(ws, threads: List[Path]) -> Tuple[List[dict], List[di
     return candidates, kept
 
 
-def prune_merged_dispatches(ws, threads: List[Path], *, yes: bool = False) -> dict:
+def prune_merged_dispatches(ws, threads: List[Path], *, yes: bool = False, delete_branch: bool = False) -> dict:
     """List or clean merged-but-uncleaned dispatch resources (never deletes threads or sessions)."""
-    candidates, kept = scan_merged_dispatches(ws, threads)
+    candidates, kept = scan_merged_dispatches(ws, threads, delete_branch=delete_branch)
     result = {
         "mode": "merged",
+        "delete_branch": delete_branch,
         "candidates": candidates,
         "kept": kept,
         "cleaned": [],
@@ -962,7 +1004,7 @@ def prune_merged_dispatches(ws, threads: List[Path], *, yes: bool = False) -> di
         relay_path = manifest_path.parent / "relay.json"
         relay = (state.get("relay") if (state.get("relay") or {}).get("dispatch_id") == info["dispatch_id"]
                  else (completions.read_object(relay_path) if relay_path.is_file() else None))
-        outcome = cleanup_dispatch(root, thread, meta, relay=relay, state=state)
+        outcome = cleanup_dispatch(root, thread, meta, relay=relay, state=state, delete_branch=delete_branch)
         entry = {**info, "cleanup": outcome}
         if outcome["status"] == "cleaned":
             result["cleaned"].append(entry)
@@ -976,17 +1018,19 @@ def prune_merged_dispatches(ws, threads: List[Path], *, yes: bool = False) -> di
 
 
 def cmd_merge(ws, args) -> None:
-    """CLI handler for `agora merge <thread> [--dispatch-id <id>] [--keep]`."""
+    """CLI handler for `agora merge <thread> [--dispatch-id <id>] [--keep | --delete-branch]`."""
     from agoralib import cli
 
     cli.guard_nested()
     thread = ws.resolve_thread(args.thread)
+    delete_branch = bool(getattr(args, "delete_branch", False))
     try:
         result = merge_dispatch(
             ws,
             thread,
             dispatch_id=getattr(args, "dispatch_id", None),
             keep=bool(getattr(args, "keep", False)),
+            delete_branch=delete_branch,
         )
     except (MergeError, worktree.WorktreeError, OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
         sys.exit(f"merge 拒絕或失敗：{exc}")
@@ -1017,14 +1061,19 @@ def cmd_merge(ws, args) -> None:
     cleanup = result.get("cleanup") or {}
     c_status = cleanup.get("status")
     if c_status == "cleaned":
-        print(f"已清理 worktree 與分支 {result['branch']}（控制紀錄保留）。")
+        if cleanup.get("branch_deleted"):
+            print(f"已清理 worktree 與分支 {result['branch']}（控制紀錄保留）。")
+        else:
+            print(f"已清理 worktree，分支 {result['branch']} 保留（控制紀錄保留）。")
     elif c_status == "kept":
         print(f"依 --keep 保留 worktree 與分支 {result['branch']}。")
     elif c_status == "pending_retry":
         print(f"⚠️ 清理未完成（待重試）：{cleanup.get('error')}")
-        print(f"已完成的合併不回滾；解除檔案鎖定後可重新執行 agora merge {thread.name} 或 agora prune --merged --yes 重試。")
+        flag = " --delete-branch" if delete_branch else ""
+        print(f"已完成的合併不回滾；解除檔案鎖定後可重新執行 agora merge {thread.name}{flag} 或 agora prune --merged{flag} --yes 重試。")
     elif c_status == "blocked":
-        print(f"⚠️ 未清理 worktree／分支：{cleanup.get('reason')}")
+        target_label = "worktree／分支" if delete_branch else "worktree"
+        print(f"⚠️ 未清理 {target_label}：{cleanup.get('reason')}")
         for p in cleanup.get("tracked_changes") or []:
             print(f"  [已追蹤變更] {p}")
         for p in cleanup.get("blocking_files") or []:
@@ -1041,7 +1090,8 @@ def cmd_prune_merged(ws, args) -> None:
         threads = [ws.resolve_thread(t) for t in args.thread]
     else:
         threads = sorted(p for p in ws.threads.glob("*") if (p / "state.json").exists()) if ws.threads.exists() else []
-    result = prune_merged_dispatches(ws, threads, yes=bool(getattr(args, "yes", False)))
+    delete_branch = bool(getattr(args, "delete_branch", False))
+    result = prune_merged_dispatches(ws, threads, yes=bool(getattr(args, "yes", False)), delete_branch=delete_branch)
     if getattr(args, "json", False):
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
@@ -1051,15 +1101,19 @@ def cmd_prune_merged(ws, args) -> None:
     if not candidates:
         print("沒有可清理的已合併分派資源（不會刪除討論串與控制紀錄）。")
     elif args.yes:
-        print(f"已清理 {len(result['cleaned'])} 個已合併分派資源（討論串與控制紀錄已保留）：")
+        if delete_branch:
+            print(f"已清理 {len(result['cleaned'])} 個已合併分派資源（含刪除分支；討論串與控制紀錄已保留）：")
+        else:
+            print(f"已清理 {len(result['cleaned'])} 個已合併分派的 worktree（分支、討論串與控制紀錄已保留）：")
         for info in result["cleaned"]:
-            print(f"  • {info['thread']} / {info['dispatch_id']}｜branch：{info['branch']}")
+            print(f"  • {info['thread']} / {info['dispatch_id']}｜branch：{info['branch']}｜{describe_cleanup(info['cleanup'])}")
         for info in result["pending_retry"]:
             print(f"  ⏳ 待重試：{info['thread']} / {info['dispatch_id']}｜{info['cleanup'].get('error')}")
         for info in result["blocked"]:
             print(f"  ⚠️ 阻擋：{info['thread']} / {info['dispatch_id']}｜{info['cleanup'].get('reason')}")
     else:
-        print(f"以下 {len(candidates)} 個已合併分派資源可以清理（僅移除 worktree 與分支，不刪除討論串）：")
+        scope_desc = "移除 worktree 與分支" if delete_branch else "僅移除 worktree，分支保留"
+        print(f"以下 {len(candidates)} 個已合併分派資源可以清理（{scope_desc}，不刪除討論串）：")
         for info in candidates:
             print(f"  • {info['thread']} / {info['dispatch_id']}｜branch：{info['branch']}｜source：{info['source_branch']}")
         print("\n確認後加上 --yes 清理以上分派資源。")

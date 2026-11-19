@@ -319,20 +319,23 @@ class TestAgoraMerge(MergeTestBase):
         self.assertIn(f"Agora-Dispatch: {meta['dispatch_id']}", trailers)
         self.assertIn(f"Agora-Branch: {meta['branch']}", trailers)
 
-        # Worktree & branch removed, control records preserved
+        # Worktree removed, branch kept by default, control records preserved
         self.assertFalse(target.exists())
-        self.assertFalse(merge.ref_exists(self.root, f"refs/heads/{meta['branch']}"))
+        self.assertTrue(merge.ref_exists(self.root, f"refs/heads/{meta['branch']}"))
         self.assertTrue(Path(meta["manifest"]).is_file())
         saved = self.read_meta(meta)
         self.assertEqual(saved["merge_record"]["merge_sha"], result["merge_sha"])
+        self.assertTrue(saved["merge_record"]["branch_kept"])
         self.assertEqual(saved["cleanup_record"]["status"], "cleaned")
+        self.assertFalse(saved["cleanup_record"]["branch_deleted"])
+        self.assertTrue(saved["cleanup_record"]["branch_kept"])
         self.assertIn("agora merge 整合驗證", (self.thread / "transcript.md").read_text(encoding="utf-8"))
 
-        # `agora status` and `agora changes` still work after worktree/branch cleanup
+        # `agora status` and `agora changes` still work after worktree cleanup
         out = io.StringIO()
         with patch("sys.stdout", out):
             cli.cmd_status(ws, argparse.Namespace(thread=self.thread.name, wait=None, json=False))
-        self.assertIn("已清理", out.getvalue())
+        self.assertIn("已清理 worktree，分支保留", out.getvalue())
         self.assertIn(meta["branch"], out.getvalue())
 
         out_changes = io.StringIO()
@@ -340,6 +343,40 @@ class TestAgoraMerge(MergeTestBase):
             cli.cmd_changes(ws, argparse.Namespace(thread=self.thread.name, dispatch_id=None, json=True))
         changes_data = json.loads(out_changes.getvalue())
         self.assertEqual([f["path"] for f in changes_data["files"]], ["app.py"])
+
+        # Re-running merge while branch is kept succeeds without creating a new merge commit
+        head_after_merge = worktree.git(self.root, "rev-parse", "HEAD")
+        rerun = merge.merge_dispatch(ws, self.thread, run_check=lambda r: self.fail("already checked"))
+        self.assertTrue(rerun["ok"])
+        self.assertTrue(rerun["already_merged"])
+        self.assertEqual(worktree.git(self.root, "rev-parse", "HEAD"), head_after_merge)
+        self.assertEqual(rerun["cleanup"]["status"], "cleaned")
+        self.assertTrue(rerun["cleanup"]["branch_kept"])
+        self.assertTrue(merge.ref_exists(self.root, f"refs/heads/{meta['branch']}"))
+
+        # Re-running merge with --delete-branch deletes the kept branch
+        deleted = merge.merge_dispatch(ws, self.thread, delete_branch=True, run_check=lambda r: self.fail("already checked"))
+        self.assertTrue(deleted["ok"])
+        self.assertTrue(deleted["already_merged"])
+        self.assertEqual(deleted["cleanup"]["status"], "cleaned")
+        self.assertTrue(deleted["cleanup"]["branch_deleted"])
+        self.assertFalse(deleted["cleanup"]["branch_kept"])
+        self.assertFalse(merge.ref_exists(self.root, f"refs/heads/{meta['branch']}"))
+
+    def test_merge_delete_branch_and_keep_mutual_exclusion(self):
+        ws = cli.Workspace(self.root)
+        meta = self.make_committed_dispatch()
+        with self.assertRaisesRegex(merge.MergeError, "--keep"):
+            merge.merge_dispatch(ws, self.thread, keep=True, delete_branch=True, run_check=lambda r: {"exit_code": 0})
+        result = merge.merge_dispatch(ws, self.thread, delete_branch=True, run_check=lambda r: {"exit_code": 0})
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["cleanup"]["status"], "cleaned")
+        self.assertTrue(result["cleanup"]["branch_deleted"])
+        self.assertFalse(result["cleanup"]["branch_kept"])
+        self.assertFalse(Path(meta["worktree"]).exists())
+        self.assertFalse(merge.ref_exists(self.root, f"refs/heads/{meta['branch']}"))
+        saved = self.read_meta(meta)
+        self.assertFalse(saved["merge_record"]["branch_kept"])
 
     def test_already_merged_skips_empty_commit_and_cleans_up(self):
         ws = cli.Workspace(self.root)
@@ -352,8 +389,9 @@ class TestAgoraMerge(MergeTestBase):
         self.assertTrue(result["already_merged"])
         self.assertEqual(worktree.git(self.root, "rev-parse", "HEAD"), head_before)
         self.assertEqual(result["cleanup"]["status"], "cleaned")
+        self.assertTrue(result["cleanup"]["branch_kept"])
         self.assertFalse(Path(meta["worktree"]).exists())
-        self.assertFalse(merge.ref_exists(self.root, f"refs/heads/{meta['branch']}"))
+        self.assertTrue(merge.ref_exists(self.root, f"refs/heads/{meta['branch']}"))
 
     def test_conflict_aborts_reports_files_and_does_not_clean(self):
         ws = cli.Workspace(self.root)
@@ -437,7 +475,7 @@ class TestCleanupAndPruneMerged(MergeTestBase):
         self.assertTrue(retry["already_merged"])
         self.assertEqual(retry["cleanup"]["status"], "cleaned")
         self.assertFalse(target.exists())
-        self.assertFalse(merge.ref_exists(self.root, f"refs/heads/{meta['branch']}"))
+        self.assertTrue(merge.ref_exists(self.root, f"refs/heads/{meta['branch']}"))
 
     def test_uncommitted_tracked_change_in_worktree_blocks_cleanup(self):
         ws = cli.Workspace(self.root)
@@ -483,7 +521,7 @@ class TestCleanupAndPruneMerged(MergeTestBase):
             return real_git(root, *args)
 
         with patch.object(worktree, "git", side_effect=fail_branch_delete):
-            partial = merge.merge_dispatch(ws, self.thread, run_check=lambda r: self.fail("already checked"))
+            partial = merge.merge_dispatch(ws, self.thread, delete_branch=True, run_check=lambda r: self.fail("already checked"))
         self.assertTrue(partial["already_merged"])
         self.assertEqual(partial["cleanup"]["status"], "pending_retry")
         self.assertTrue(partial["cleanup"]["worktree_removed"])
@@ -492,7 +530,7 @@ class TestCleanupAndPruneMerged(MergeTestBase):
         self.assertTrue(merge.ref_exists(self.root, f"refs/heads/{meta['branch']}"))
 
         # Retry the exact same command once lock is released -> finishes deleting branch!
-        retry = merge.merge_dispatch(ws, self.thread, run_check=lambda r: self.fail("already checked"))
+        retry = merge.merge_dispatch(ws, self.thread, delete_branch=True, run_check=lambda r: self.fail("already checked"))
         self.assertTrue(retry["already_merged"])
         self.assertEqual(retry["cleanup"]["status"], "cleaned")
         self.assertEqual(worktree.git(self.root, "rev-parse", "HEAD"), merge_sha)
@@ -517,24 +555,35 @@ class TestCleanupAndPruneMerged(MergeTestBase):
         self.assertEqual([k["dispatch_id"] for k in dry["kept"]], ["2222222bbbbbbb2222222"])
         self.assertTrue(Path(m1["worktree"]).is_dir())
 
-        # Execute prune --merged --yes via CLI
+        # Execute prune --merged --yes via CLI (default: cleans worktree, keeps branch)
         out = io.StringIO()
         with patch.dict(os.environ, {cli.NESTED_ENV: ""}), patch("sys.stdout", out):
             cli.cmd_prune(ws, argparse.Namespace(
-                thread=None, days=30, yes=True, keep_sessions=False, verbose=True, json=False, merged=True,
+                thread=None, days=30, yes=True, keep_sessions=False, verbose=True, json=False, merged=True, delete_branch=False,
             ))
-        # m1 cleaned, m2 intact, thread & manifest preserved!
+        # m1 worktree cleaned, branch kept; m2 intact; thread & manifest preserved!
         self.assertFalse(Path(m1["worktree"]).exists())
-        self.assertFalse(merge.ref_exists(self.root, f"refs/heads/{m1['branch']}"))
+        self.assertTrue(merge.ref_exists(self.root, f"refs/heads/{m1['branch']}"))
         self.assertTrue(Path(m2["worktree"]).is_dir())
         self.assertTrue(merge.ref_exists(self.root, f"refs/heads/{m2['branch']}"))
         self.assertTrue(self.thread.is_dir())
         self.assertTrue(Path(m1["manifest"]).is_file())
+        # Default prune --merged now sees no candidates for m1 (worktree already gone)
+        dry_again = merge.prune_merged_dispatches(ws, [self.thread], yes=False)
+        self.assertEqual(dry_again["candidates"], [])
+        # prune --merged --delete-branch --yes deletes m1's kept branch
+        out_del = io.StringIO()
+        with patch.dict(os.environ, {cli.NESTED_ENV: ""}), patch("sys.stdout", out_del):
+            cli.cmd_prune(ws, argparse.Namespace(
+                thread=None, days=30, yes=True, keep_sessions=False, verbose=True, json=False, merged=True, delete_branch=True,
+            ))
+        self.assertFalse(merge.ref_exists(self.root, f"refs/heads/{m1['branch']}"))
         # Thread still protected from thread-deletion because m2 is unmerged!
         self.assertIn("保留", prune.why_keep(self.thread, cli.load_state(self.thread), None))
 
-        # Now merge & clean m2 -> thread is no longer blocked by prune.why_keep!
+        # Now merge & clean m2 (default keeps branch) -> thread is no longer blocked by prune.why_keep!
         merge.merge_dispatch(ws, self.thread, dispatch_id="2222222bbbbbbb2222222", run_check=lambda r: {"exit_code": 0})
+        self.assertTrue(merge.ref_exists(self.root, f"refs/heads/{m2['branch']}"))
         self.assertIsNone(prune.why_keep(self.thread, cli.load_state(self.thread), None))
         # Thread itself is STILL preserved after merge cleanup
         self.assertTrue(self.thread.is_dir())
@@ -587,23 +636,29 @@ class TestCleanupAndPruneMerged(MergeTestBase):
         self.assertEqual(saved["commit_status"], "committed")
         self.assertEqual(saved["branch"], f"agora/{did}")
 
-        # 3. Merge & clean legacy dispatch
+        # 3. Merge & clean legacy dispatch (default keeps branch)
         res = merge.merge_dispatch(ws, self.thread, dispatch_id=did, run_check=lambda r: {"exit_code": 0})
         self.assertTrue(res["ok"])
         self.assertEqual(res["cleanup"]["status"], "cleaned")
         self.assertEqual((self.root / "app.py").read_text(encoding="utf-8"), "VALUE = 42\n")
         self.assertFalse(Path(meta["worktree"]).exists())
-        self.assertFalse(merge.ref_exists(self.root, f"refs/heads/agora/{did}"))
+        self.assertTrue(merge.ref_exists(self.root, f"refs/heads/agora/{did}"))
 
     def test_cli_parsing_and_completions_description(self):
         with patch.object(cli, "cmd_merge") as mock_merge:
             cli.main(["--workspace", str(self.root), "merge", "t1", "--dispatch-id", "d1", "--keep"])
         parsed = mock_merge.call_args.args[1]
-        self.assertEqual((parsed.thread, parsed.dispatch_id, parsed.keep), ("t1", "d1", True))
+        self.assertEqual((parsed.thread, parsed.dispatch_id, parsed.keep, parsed.delete_branch), ("t1", "d1", True, False))
+
+        with patch.object(cli, "cmd_merge") as mock_merge:
+            cli.main(["--workspace", str(self.root), "merge", "t1", "--delete-branch"])
+        parsed = mock_merge.call_args.args[1]
+        self.assertEqual((parsed.thread, parsed.keep, parsed.delete_branch), ("t1", False, True))
 
         with patch.object(cli, "cmd_prune") as mock_prune:
-            cli.main(["--workspace", str(self.root), "prune", "--merged", "--yes"])
+            cli.main(["--workspace", str(self.root), "prune", "--merged", "--delete-branch", "--yes"])
         self.assertTrue(mock_prune.call_args.args[1].merged)
+        self.assertTrue(mock_prune.call_args.args[1].delete_branch)
         self.assertTrue(mock_prune.call_args.args[1].yes)
 
         with patch.object(cli, "cmd_assign") as mock_assign:
@@ -611,7 +666,7 @@ class TestCleanupAndPruneMerged(MergeTestBase):
                       "--name", "feat-x", "--message", "hi"])
         self.assertEqual(mock_assign.call_args.args[1].name, "feat-x")
 
-        desc = completions.describe({
+        base_item = {
             "id": "x" * 12,
             "thread": "t1",
             "topic": "測試",
@@ -621,9 +676,24 @@ class TestCleanupAndPruneMerged(MergeTestBase):
             "branch": "agy/測試-abcdef0",
             "commit_sha": "a" * 40,
             "commit_status": "committed",
-        })
+        }
+        desc = completions.describe(base_item)
         self.assertIn("branch=agy/測試-abcdef0", desc)
         self.assertIn("agora merge t1", desc)
+
+        desc_kept_branch = completions.describe({
+            **base_item,
+            "merge_record": {"merged": True, "branch_kept": True},
+            "cleanup_record": {"status": "cleaned", "worktree_removed": True, "branch_deleted": False, "branch_kept": True},
+        })
+        self.assertIn("已合併並清理 worktree，分支保留", desc_kept_branch)
+
+        desc_del_branch = completions.describe({
+            **base_item,
+            "merge_record": {"merged": True, "branch_kept": False},
+            "cleanup_record": {"status": "cleaned", "worktree_removed": True, "branch_deleted": True, "branch_kept": False},
+        })
+        self.assertIn("已合併並清理 worktree 與分支", desc_del_branch)
 
 
 if __name__ == "__main__":

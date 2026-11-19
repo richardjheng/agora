@@ -2275,7 +2275,8 @@ def cmd_status(ws: Workspace, args):
             cleanup_rec = relay.get("cleanup_record") or {}
             if merge_rec or cleanup_rec:
                 m_part = f"合併：{'已合併' if merge_rec.get('merged') else '未合併'}" + (f"（{merge_rec['merge_sha'][:12]}）" if merge_rec.get("merge_sha") else "")
-                c_part = f"｜清理：{cleanup_rec.get('status')}" if cleanup_rec.get("status") else ""
+                c_label = merge.describe_cleanup(cleanup_rec)
+                c_part = f"｜清理：{c_label}" if c_label else ""
                 print(f"{m_part}{c_part}")
             summary = failure_baseline.describe({**relay, "thread": str(thread)})
             if summary:
@@ -2855,6 +2856,8 @@ def cmd_prune(ws: Workspace, args):
     """清理不再需要的討論串（預設只列出，--yes 才刪除）；--merged 只清已合併分派資源、不刪討論串"""
     if getattr(args, "merged", False):
         return merge.cmd_prune_merged(ws, args)
+    if getattr(args, "delete_branch", False):
+        sys.exit("--delete-branch 必須搭配 --merged 使用。")
     if args.thread:
         threads, days = [ws.resolve_thread(t) for t in args.thread], None
     else:
@@ -3513,10 +3516,11 @@ def main(argv=None):
     p.add_argument("--from", dest="sender", choices=who, help="記錄核准主持方；預設分派發起方")
     p.set_defaults(func=cmd_finalize)
 
-    p = sub.add_parser("merge", help="使用者明確要求時，以 --no-ff 合併已驗證提交的分派分支並整合驗證與清理")
+    p = sub.add_parser("merge", help="使用者明確要求時，以 --no-ff 合併已驗證提交的分派分支、整合驗證並預設清理 worktree（保留分支）")
     p.add_argument("thread")
     p.add_argument("--dispatch-id", help="合併指定的隔離分派；預設最近一次")
     p.add_argument("--keep", action="store_true", help="合併並驗證通過後保留 worktree 與分支，不自動清理")
+    p.add_argument("--delete-branch", action="store_true", help="合併並驗證通過後一併以 git branch -d 刪除分派分支（預設保留分支、只清 worktree）")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_merge)
 
@@ -3589,7 +3593,8 @@ def main(argv=None):
     p = sub.add_parser("prune", help="清理不再需要的討論串（預設只列出，--yes 才刪除）；--merged 只清已合併分派資源")
     p.add_argument("--days", type=float, default=30, help="超過幾天沒有活動才清理（預設 30）")
     p.add_argument("--thread", action="append", help="只清理指定的討論串（不看天數，其餘條件照樣檢查）")
-    p.add_argument("--merged", action="store_true", help="只清理已合併但未清的分派 worktree 與分支，不刪除討論串")
+    p.add_argument("--merged", action="store_true", help="只清理已合併但未清的分派 worktree（預設保留分支，加 --delete-branch 才刪分支；不刪討論串）")
+    p.add_argument("--delete-branch", action="store_true", help="搭配 --merged 時一併以 git branch -d 刪除已合併的分派分支")
     p.add_argument("--yes", action="store_true", help="確認刪除")
     p.add_argument("--keep-sessions", action="store_true", help="只刪討論串，保留各 CLI 的對話紀錄")
     p.add_argument("--verbose", action="store_true", help="列出保留的討論串與原因")
