@@ -42,6 +42,8 @@ def assign(ws, args, crash=None, fail_spawn=False, usages=None, output=None):
         return result
 
     with patch.dict(os.environ, {cli.NESTED_ENV: ""}), patch("sys.stdout", output if output is not None else io.StringIO()), \
+            patch.object(cli.sandbox, "network_restricted", return_value=False), \
+            patch.object(cli.sandbox, "is_codex_sandbox", return_value=False), \
             patch.object(cli, "party_usage", side_effect=lambda p, m=None: usages.get(p) if usages is not None
                          else {"remaining_pct": 80, "updated_at": time.time()}), \
             patch.object(cli.quota, "blocked", return_value=None), \
@@ -65,6 +67,11 @@ def process_assign(root, name, key, crash=None):
 
 class TestDispatch(unittest.TestCase):
     def setUp(self):
+        # Some tests also exercise provider calls after the assignment helper returns.
+        for patcher in (patch.object(cli.sandbox, "network_restricted", return_value=False),
+                        patch.object(cli.sandbox, "is_codex_sandbox", return_value=False)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)

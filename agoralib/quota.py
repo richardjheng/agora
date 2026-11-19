@@ -26,6 +26,12 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
+# quota.py is also launched directly by refresh_in_background.
+if __package__:
+    from agoralib import sandbox
+else:
+    import sandbox
+
 if sys.platform.startswith("win"):
     try:
         sys.stdout.reconfigure(encoding="utf-8")
@@ -121,6 +127,8 @@ def write_claude_snapshot(windows: dict, source: str):
 
 def probe_claude(timeout: int = 90) -> bool:
     """用 Haiku 發一個不帶工具的極短請求，從 rate_limit_event 取得用量"""
+    if sandbox.network_restricted():
+        return False
     cmd = [find_claude(), "-p", "ok", "--model", "haiku", "--output-format", "stream-json", "--verbose",
            "--tools", "", "--no-session-persistence", "--settings", '{"disableAllHooks": true}']
     try:
@@ -413,6 +421,8 @@ def _configured_agy_model() -> str | None:
 
 def query_antigravity() -> dict | None:
     """即時查詢；找不到執行中的 Antigravity 時回傳 None"""
+    if sandbox.network_restricted():
+        return None
     for c in _candidates():
         try:
             csrf = c["csrf"]
@@ -516,6 +526,8 @@ def antigravity_usage(model: str | None = None) -> dict | None:
 
 def refresh(force: bool = False, min_interval: int = 60) -> None:
     """重新查詢兩方並寫入快取；多個呼叫者同時觸發時只跑一次"""
+    if sandbox.network_restricted():
+        return
     if os.getenv("AGORA_INVOKED"):
         return  # 接手方常在沙箱裡（如 Codex workspace-write），寫不到 ~/.agora；只讀快取，由主程序負責更新
     if not force and REFRESH_LOCK.exists() and time.time() - REFRESH_LOCK.stat().st_mtime < min_interval:
@@ -545,6 +557,8 @@ def wanted_max_age(*usages) -> int:
 
 def refresh_in_background():
     """丟到背景執行 refresh，不阻塞呼叫者（hook 用）"""
+    if sandbox.network_restricted():
+        return
     if REFRESH_LOCK.exists() and time.time() - REFRESH_LOCK.stat().st_mtime < 120:
         return
     kwargs = {}
