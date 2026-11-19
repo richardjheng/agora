@@ -125,6 +125,28 @@ class TestCheckQueueUnit(unittest.TestCase):
             self.assertIn("check_concurrency", text, rel)
             self.assertIn("不要中斷", text, rel)
 
+    def test_cmd_check_permission_error_reports_clear_message_and_nonzero_exit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            config.save(root, {"check": [sys.executable, "-c", "pass"]})
+            ws = cli.Workspace(root)
+            slots = checkqueue.slots_dir(root)
+            buf = io.StringIO()
+            with patch.dict(os.environ, {}, clear=False), \
+                    patch("sys.stdout", buf), patch("sys.stderr", buf), \
+                    patch.object(checkqueue, "_queue_lock",
+                                 side_effect=PermissionError(13, "Permission denied", str(slots / "queue.lock"))):
+                os.environ.pop(worktree.MANIFEST_ENV, None)
+                os.environ.pop(cli.LOCKED_ENV, None)
+                with self.assertRaises(SystemExit) as ctx:
+                    cli.cmd_check(ws, argparse.Namespace(task=None))
+            msg = str(ctx.exception.code)
+            self.assertNotEqual(ctx.exception.code, 0)
+            self.assertIn("驗證槽位目錄不可寫", msg)
+            self.assertIn(str(slots), msg)
+            self.assertIn("未執行測試", msg)
+            self.assertNotIn("驗證結果：exit=", buf.getvalue())
+
 
 class TestCheckQueueMultiprocess(unittest.TestCase):
     def setUp(self):

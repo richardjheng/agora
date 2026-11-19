@@ -1538,7 +1538,9 @@ def cmd_work(ws: Workspace, args):
         if task:
             opts["env"].update(worktree.environment(task))
             opts["env"][LOCKED_ENV] = json.dumps({k: cfg.get(k) for k in LOCKED_KEYS}, ensure_ascii=False)
-            opts["add_dirs"] = [str(thread)]
+            slots = checkqueue.slots_dir(task["control_root"])
+            slots.mkdir(parents=True, exist_ok=True)
+            opts["add_dirs"] = [str(thread), str(slots)]
             opts["control_dir"] = str(thread)
         # 呼叫前固定本輪請求；結束時與回報一起保存，執行中仍顯示上一輪完整的請求／回報。
         requested = {"model": opts.get("model") or None, "effort": opts.get("effort") or None}
@@ -2019,6 +2021,8 @@ def cmd_check(ws: Workspace, args):
             proc = run_configured_command(check, ws.root)
     except checkqueue.CheckStopped as e:
         sys.exit(str(e))
+    except PermissionError as e:
+        sys.exit(f"驗證槽位目錄不可寫：{checkqueue.slots_dir(control_root)}（{e}）；未執行測試。")
     except ValueError as e:
         sys.exit(str(e))
     keep, in_failure = [], False

@@ -11,7 +11,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from agoralib import cli, completions, config, parties, quota, quota_hook, routing, shares, worktree
+from agoralib import checkqueue, cli, completions, config, parties, quota, quota_hook, routing, shares, worktree
 
 
 def make_thread(root, name):
@@ -366,3 +366,78 @@ class TestDispatch(unittest.TestCase):
         with patch("sys.stdout", out):
             cli.cmd_route(ws, argparse.Namespace(me="claude", json=True))
         self.assertIn(routing.ZERO_SHARE_ROLE, json.loads(out.getvalue())["instruction"])
+
+    def test_isolated_codex_dispatch_creates_and_adds_check_slots_dir(self):
+        ws, thread = self.make("codex-isolated")
+        assign(ws, args_for("codex-isolated", to="codex", reason="驗證隔離 add-dir"))
+        relay = cli.load_state(thread)["relay"]
+        wt = self.root / "wt-isolated"
+        wt.mkdir()
+        task = {
+            "dispatch_id": relay["dispatch_id"],
+            "control_root": str(self.root),
+            "worktree": str(wt),
+            "thread": str(thread),
+            "branch": f"agora/{relay['dispatch_id']}",
+            "base_sha": "base",
+            "allowed_paths": ["**"],
+            "commands": {},
+            "environment_status": "ready",
+            "commit_message": str(thread / "commit-message.md"),
+            "manifest": str(thread / "manifest.json"),
+        }
+        cli.update_relay(thread, worktree=str(wt))
+        slots = checkqueue.slots_dir(self.root)
+        self.assertFalse(slots.exists())
+        captured = {}
+
+        def fake_run(cmd, workspace, prompt, timeout, on_event, env=None):
+            captured["cmd"] = list(cmd)
+            captured["slots_existed"] = slots.is_dir()
+            return ([{"type": "thread.started", "thread_id": "t-1"},
+                     {"type": "item.completed", "item": {"type": "agent_message", "text": "已暫停\n【已暫停】"}}], "")
+
+        with patch.object(cli, "party_usage", return_value={"remaining_pct": 80}), \
+                patch.object(cli.worktree, "load", return_value=task), \
+                patch.object(cli.worktree, "recover_commit"), \
+                patch.object(cli.worktree, "validate", return_value=wt), \
+                patch.object(cli.worktree, "verify_environment"), \
+                patch.object(cli.worktree, "environment", return_value={}), \
+                patch.object(cli, "git_status", return_value=""), \
+                patch.object(parties.quota, "find_codex", return_value="codex"), \
+                patch.object(parties, "_run", side_effect=fake_run), \
+                patch("sys.stdout", io.StringIO()):
+            cli.cmd_work(ws, argparse.Namespace(thread="codex-isolated", dispatch_id=relay["dispatch_id"]))
+
+        self.assertTrue(captured.get("slots_existed"))
+        cmd = captured["cmd"]
+        add_dirs = [cmd[i + 1] for i in range(len(cmd) - 1) if cmd[i] == "--add-dir"]
+        self.assertIn(str(slots), add_dirs)
+        self.assertIn(str(thread), add_dirs)
+        self.assertNotIn(str(self.root / ".agora"), add_dirs)
+        self.assertNotIn(str(self.root), add_dirs)
+
+    def test_non_isolated_codex_dispatch_does_not_add_check_slots_dir(self):
+        ws, thread = self.make("codex-plain")
+        assign(ws, args_for("codex-plain", to="codex", reason="驗證非隔離 add-dir"))
+        relay = cli.load_state(thread)["relay"]
+        slots = checkqueue.slots_dir(self.root)
+        self.assertFalse(slots.exists())
+        captured = {}
+
+        def fake_run(cmd, workspace, prompt, timeout, on_event, env=None):
+            captured["cmd"] = list(cmd)
+            return ([{"type": "thread.started", "thread_id": "t-2"},
+                     {"type": "item.completed", "item": {"type": "agent_message", "text": "完成\n【工作完成】"}}], "")
+
+        with patch.object(cli, "party_usage", return_value={"remaining_pct": 80}), \
+                patch.object(cli, "git_status", return_value=""), \
+                patch.object(parties.quota, "find_codex", return_value="codex"), \
+                patch.object(parties, "_run", side_effect=fake_run), \
+                patch("sys.stdout", io.StringIO()):
+            cli.cmd_work(ws, argparse.Namespace(thread="codex-plain", dispatch_id=relay["dispatch_id"]))
+
+        cmd = captured["cmd"]
+        add_dirs = [cmd[i + 1] for i in range(len(cmd) - 1) if cmd[i] == "--add-dir"]
+        self.assertNotIn(str(slots), add_dirs)
+        self.assertFalse(slots.exists())
