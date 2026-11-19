@@ -41,6 +41,38 @@ class TestGitEnvironment(unittest.TestCase):
                 self.assertNotIn("GIT_CONFIG_COUNT", os.environ)
 
 
+class TestScopePatterns(unittest.TestCase):
+    def test_comma_newline_repeated_and_mixed_scopes(self):
+        cases = (["app.py,demo/*"], ["app.py", "demo/*"],
+                 [" app.py, ,demo/*, ", "\napp.py\r\ndemo/*\n"],
+                 ["app.py\ndemo/*"], ["app.py", "demo\\*, app.py"])
+        for values in cases:
+            with self.subTest(values=values):
+                self.assertEqual(worktree.scope_patterns(values), ["app.py", "demo/*"])
+
+    def test_empty_lists_keep_required_scope_error(self):
+        for values in (None, [], [""], [" , \n\r, ", "  "]):
+            with self.subTest(values=values), self.assertRaisesRegex(worktree.WorktreeError, "分派必須用 --allow"):
+                worktree.scope_patterns(values)
+
+    def test_each_split_item_still_requires_safe_relative_path(self):
+        for value in ("app.py, ../bad.py", "app.py\nC:/bad.py", "app.py, /bad.py", "app.py, :bad"):
+            with self.subTest(value=value), self.assertRaisesRegex(worktree.WorktreeError, "無效的允許範圍"):
+                worktree.scope_patterns([value])
+
+    def test_secret_literals_rejected_before_git_or_resource_creation(self):
+        for name, pattern in ((".env", ".env"), (".env.local", ".env.*"),
+                              ("config/.env.local", ".env.*"), ("server.pem", "*.pem"),
+                              ("private.key", "*.key"), ("bundle.p12", "*.p12"),
+                              ("bundle.pfx", "*.pfx"), ("id_rsa", "id_rsa*"),
+                              ("id_ed25519.pub", "id_ed25519*"), (".env.example.pem", ".env.*")):
+            with self.subTest(name=name), patch.object(worktree, "git") as git:
+                with self.assertRaises(worktree.WorktreeError) as caught:
+                    worktree.prepare(Path.cwd(), "blocked", [f"app.py, {name}"], Path.cwd())
+                self.assertIn(f"{name} 符合機密檔規則（{pattern}），Agora 不代為提交", str(caught.exception))
+                git.assert_not_called()
+
+
 class WorktreeTests(unittest.TestCase):
     def setUp(self):
         env = patch.dict(os.environ)
@@ -126,6 +158,61 @@ class WorktreeTests(unittest.TestCase):
             with self.subTest(values=values), self.assertRaises(worktree.WorktreeError):
                 worktree.prepare(self.root, "one", values, self.thread)
 
+    def test_comma_scope_matches_tracked_and_untracked_changes(self):
+        meta = self.task(allowed=[" app.py, demo/*, ", "new file.txt, app.py\n"])
+        self.modify(meta)
+        self.modify(meta, "demo/new.py")
+        self.modify(meta, "new file.txt", "synthetic fixture\n")
+        self.assertEqual(meta["allowed_paths"], ["app.py", "demo/*", "new file.txt"])
+        self.assertEqual(worktree.checked_paths(meta), ["app.py", "demo/new.py", "new file.txt"])
+
+    def test_out_of_scope_error_shows_effective_allowed_paths(self):
+        meta = self.task(allowed=["app.py, demo/*", " app.py "])
+        self.modify(meta, "other.py")
+        with self.assertRaises(worktree.WorktreeError) as caught:
+            worktree.checked_paths(meta)
+        self.assertEqual(str(caught.exception), "超出允許修改範圍：other.py（允許：app.py, demo/*）")
+
+    def test_literal_secret_templates_reach_task_tree_and_commit(self):
+        names = [".env.example", "config/.env.sample", ".env.template", ".env.dist", "id_rsa.example"]
+        meta = self.task(allowed=[", ".join(names), "**"])
+        target = Path(meta["worktree"])
+        (target / "config").mkdir()
+        for name in names:
+            self.modify(meta, name, "SYNTHETIC_TEMPLATE=replace-me\n")
+        self.message(meta)
+        tree = worktree.task_tree(meta)
+        self.assertEqual(worktree.git(target, "ls-tree", "-r", "--name-only", tree).splitlines(),
+                         sorted([".gitignore", "app.py", "other.py", "demo/__init__.py", *names]))
+        result = worktree.finalize(meta, lambda m: {"exit_code": 0})
+        self.assertEqual(result["commit_status"], "committed")
+        self.assertEqual(worktree.git(target, "rev-parse", "HEAD^{tree}"), tree)
+        for name in names:
+            self.assertEqual(worktree.git(target, "show", f"HEAD:{name}"), "SYNTHETIC_TEMPLATE=replace-me")
+
+    def test_globs_never_exempt_secret_templates(self):
+        for i, pattern in enumerate((".env.*", "**", ".env.?xample", ".env.[e]xample", "config/*")):
+            with self.subTest(pattern=pattern):
+                meta = self.task(f"glob{i}", [pattern])
+                name = "config/.env.example" if pattern == "config/*" else ".env.example"
+                (Path(meta["worktree"]) / name).parent.mkdir(parents=True, exist_ok=True)
+                self.modify(meta, name, "SYNTHETIC_TEMPLATE=replace-me\n")
+                with self.assertRaises(worktree.WorktreeError) as caught:
+                    worktree.checked_paths(meta)
+                self.assertEqual(str(caught.exception),
+                                 f"{name} 符合機密檔規則（.env.*），Agora 不代為提交")
+
+    def test_protected_directories_cannot_use_template_exception(self):
+        meta = self.task(allowed=["**"])
+        for directory in (".git", ".agora", ".venv", "venv"):
+            name = f"nested/{directory}/.env.example"
+            with self.subTest(directory=directory), patch.object(worktree, "git", side_effect=[name + "\0", ""]):
+                with patch.object(worktree, "validate", return_value=Path(meta["worktree"])):
+                    with self.assertRaises(worktree.WorktreeError) as caught:
+                        worktree.checked_paths({**meta, "allowed_paths": [name]})
+                self.assertEqual(str(caught.exception),
+                                 f"{name} 位於受保護目錄（{directory}），Agora 不代為提交")
+
     def test_commit_includes_real_check_result_and_only_task_files(self):
         meta, other = self.task(), self.task("other")
         self.modify(meta)
@@ -146,7 +233,9 @@ class WorktreeTests(unittest.TestCase):
             check.assert_not_called()
 
     def test_out_of_scope_and_secret_changes_refuse_before_check(self):
-        for i, name in enumerate(("other.py", ".env", ".agora/data.json")):
+        for i, (name, reason) in enumerate((("other.py", "超出允許修改範圍"),
+                                            (".env", "符合機密檔規則"),
+                                            (".agora/data.json", "位於受保護目錄"))):
             meta = self.task(f"out{i}", ["**"] if name != "other.py" else ["app.py"])
             target = Path(meta["worktree"]) / name
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -154,7 +243,7 @@ class WorktreeTests(unittest.TestCase):
             if name.startswith(".agora"):
                 worktree.git(Path(meta["worktree"]), "add", "-f", name)
             self.message(meta)
-            with patch.object(cli, "run_task_check") as check, self.assertRaisesRegex(worktree.WorktreeError, "範圍"):
+            with patch.object(cli, "run_task_check") as check, self.assertRaisesRegex(worktree.WorktreeError, reason):
                 worktree.finalize(meta, check)
             check.assert_not_called()
 
@@ -267,11 +356,11 @@ class WorktreeTests(unittest.TestCase):
         self.assertTrue(Path(meta["worktree"]).exists())
         self.assertTrue(Path(meta["manifest"]).exists())
 
-    def assign_task(self, subagents=None, fail_spawn=False):
+    def assign_task(self, subagents=None, fail_spawn=False, allowed=None):
         config.save(self.root, {"parties": {"codex": {"subagents": True}, "antigravity": {"enabled": False}}})
         args = argparse.Namespace(thread="t1", sender="claude", to=None, message="Fix app", file=None,
             session=None, from_summary=False, yes=False, tier=None, model=None, effort=None,
-            subagents=subagents, trigger=None, allow=["app.py"], dispatch_id="worker")
+            subagents=subagents, trigger=None, allow=allowed if allowed is not None else ["app.py"], dispatch_id="worker")
         ws = cli.Workspace(self.root)
         with patch.dict(os.environ, {cli.NESTED_ENV: ""}), patch("sys.stdout", io.StringIO()), \
                 patch.object(cli, "party_usage", return_value={"remaining_pct": 80}), \
@@ -282,6 +371,16 @@ class WorktreeTests(unittest.TestCase):
                 patch.object(cli.jobs, "pid_started", return_value=None):
             cli.cmd_assign(ws, args)
         return ws, cli.load_state(self.thread)["relay"]
+
+    def test_assign_rejects_secret_literals_without_branch_worktree_or_worker(self):
+        for name in (".env", ".env.local"):
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(SystemExit, "符合機密檔規則"):
+                    self.assign_task(allowed=[name])
+                self.assertIsNone(cli.load_state(self.thread).get("relay"))
+                self.assertEqual(worktree.git(self.root, "branch", "--list", "agora/*"), "")
+                self.assertFalse((self.root / ".agora" / "worktrees" / "worker").exists())
+                self.assertFalse((self.thread / "dispatches" / "worker").exists())
 
     def test_worker_runs_in_task_but_controls_in_main_and_commits_after_return(self):
         ws, relay = self.assign_task()

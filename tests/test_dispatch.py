@@ -11,7 +11,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from agoralib import cli, completions, config, parties, quota, quota_hook, routing, shares
+from agoralib import cli, completions, config, parties, quota, quota_hook, routing, shares, worktree
 
 
 def make_thread(root, name):
@@ -75,6 +75,16 @@ class TestDispatch(unittest.TestCase):
 
     def counts(self):
         return shares.recent_usage(self.root, parties.AI_PARTIES)
+
+    def test_allow_cli_accepts_comma_repeated_and_mixed_arguments(self):
+        for flags in (["--allow", "app.py,tests/*"],
+                      ["--allow", "app.py", "--allow", "tests/*"],
+                      ["--allow", " app.py, ,tests/*, ", "--allow", "app.py\n"]):
+            with self.subTest(flags=flags), patch.dict(os.environ), patch.object(cli, "cmd_assign") as assign:
+                cli.main(["--workspace", str(self.root), "assign", "t1", "--from", "claude",
+                          "--message", "修改核心", *flags])
+                args = assign.call_args.args[1]
+                self.assertEqual(worktree.scope_patterns(args.allow), ["app.py", "tests/*"])
 
     def test_persisted_5_to_10_every_three_successful_dispatches(self):
         selected = []

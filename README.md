@@ -112,6 +112,9 @@ $A keep <id> [--off]                                # 標記保留，prune 不�
 
 `<id>` 可以用前綴或 `latest`。沒給 `--message` / `--file` 時讀 stdin。
 
+`--allow` 多路徑可寫成 `--allow "src/**" --allow "tests/*"` 或 `--allow "src/**,tests/*"`，兩種可混用，也可用換行分隔。
+命中機密規則的檔案，只有在 `--allow` 明列完整字面路徑（不含 `*?[`），且檔名以 `.example`、`.sample`、`.template`、`.dist` 結尾時才例外允許提交（例如 `--allow ".env.example"`）；glob 不解除機密限制，其他機密字面路徑會在分派前拒絕，`.git`／`.agora`／`.venv`／`venv` 仍禁止。
+
 ## 等待分派結果
 
 `status <id> --wait N` 等到接手結束或超過 N 秒。加 `--wait` 時以 exit code 區分結果，腳本不必再解析 `state.json`：

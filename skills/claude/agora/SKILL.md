@@ -80,6 +80,9 @@ python D:/github/agora/agora.py assign "$T" --from claude --tier standard --allo
 python D:/github/agora/agora.py watch                          # 同時有分派或背景討論時，一律用 run_in_background 執行
 ```
 
+`--allow` 多路徑可重複參數（`--allow "src/**" --allow "tests/*"`）或用逗號分隔（`--allow "src/**,tests/*"`），也可混用或換行分隔。
+機密規則只有在 `--allow` 明列完整字面路徑（不含 `*?[`）且檔名以 `.example`、`.sample`、`.template`、`.dist` 結尾時才例外允許提交（如 `--allow ".env.example"`）；glob 不解除限制，其他機密字面路徑在分派前拒絕，`.git`／`.agora`／`.venv`／`venv` 仍禁止。
+
 ### 背景通知與回報機制（主要機制＋保險）
 - **主要機制（watch）**：同時有分派或背景討論時，一律用 `run_in_background` 執行 `python D:/github/agora/agora.py watch`（等到任一分派或討論結束即返回 exit 0）。收到結束通知後，立即向使用者回報結論、branch／commit 結果與下一步，再對剩下的背景項目繼續 watch。
 - **保險機制（hook 補報）**：CLI 沒有背景通知能力時（或未及時收到通知），hook（`UserPromptSubmit`、`PostToolUse`）會在下一次使用者互動或工具執行時，附上「上次回報後已結束的分派／討論」一行摘要並標記已回報；屆時依補報內容向使用者回報。被 Agora 呼叫的 CLI（`AGORA_INVOKED=1`）不附。

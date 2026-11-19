@@ -58,15 +58,36 @@ def git(root, *args):
     return proc.stdout if "-z" in args else proc.stdout.strip()
 
 
+def _literal_path(value):
+    return not any(char in value for char in "*?[")
+
+
+def _check_secret_path(name, allowed):
+    pattern = next((pattern for part in name.split("/") for pattern in snapshot.SECRET_PATTERNS
+                    if fnmatch.fnmatchcase(part, pattern)), None)
+    template = (name in allowed and _literal_path(name)
+                and name.rsplit("/", 1)[-1].endswith((".example", ".sample", ".template", ".dist")))
+    if pattern and not template:
+        raise WorktreeError(f"{name} 符合機密檔規則（{pattern}），Agora 不代為提交")
+
+
 def scope_patterns(values):
-    if not values:
-        raise WorktreeError("分派必須用 --allow <相對路徑或 glob> 明列允許修改範圍（可重複）。")
     result = []
-    for value in values:
-        value = value.replace("\\", "/")
-        if not value or value.startswith(("/", ":")) or ":" in value or ".." in value.split("/"):
-            raise WorktreeError(f"無效的允許範圍：{value}")
-        result.append(value.rstrip("/"))
+    for value in values or []:
+        for item in re.split(r"[,\r\n]", value):
+            item = item.strip().replace("\\", "/")
+            if not item:
+                continue
+            if item.startswith(("/", ":")) or ":" in item or ".." in item.split("/"):
+                raise WorktreeError(f"無效的允許範圍：{item}")
+            item = item.rstrip("/")
+            if item not in result:
+                result.append(item)
+    if not result:
+        raise WorktreeError("分派必須用 --allow <相對路徑或 glob> 明列允許修改範圍（可重複）。")
+    for item in result:
+        if _literal_path(item):
+            _check_secret_path(item, result)
     return result
 
 
@@ -258,10 +279,12 @@ def checked_paths(meta):
     paths.update(filter(None, git(target, "ls-files", "--others", "--exclude-standard", "--exclude=.venv/", "-z").split("\0")))
     for name in paths:
         parts = name.split("/")
-        forbidden = any(p in (".git", ".agora", ".venv", "venv") for p in parts)
-        forbidden |= any(fnmatch.fnmatchcase(p, pattern) for p in parts for pattern in snapshot.SECRET_PATTERNS)
-        if forbidden or not any(fnmatch.fnmatchcase(name, pat) for pat in meta["allowed_paths"]):
-            raise WorktreeError(f"超出允許修改範圍：{name}")
+        forbidden = next((p for p in parts if p in (".git", ".agora", ".venv", "venv")), None)
+        if forbidden:
+            raise WorktreeError(f"{name} 位於受保護目錄（{forbidden}），Agora 不代為提交")
+        _check_secret_path(name, meta["allowed_paths"])
+        if not any(fnmatch.fnmatchcase(name, pat) for pat in meta["allowed_paths"]):
+            raise WorktreeError(f"超出允許修改範圍：{name}（允許：{', '.join(meta['allowed_paths'])}）")
         resolved = (target / name).resolve()
         if target not in resolved.parents:
             raise WorktreeError(f"變更路徑指向 worktree 外：{name}")

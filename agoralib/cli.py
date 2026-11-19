@@ -2876,7 +2876,7 @@ def main(argv=None):
         p.add_argument("--from", dest="sender", required=True, choices=who)
         p.add_argument("--to", help="指定接手方（預設省略：額度篩選後依比例輪流）")
         p.add_argument("--dispatch-id", help="派工識別碼；同工作單以相同 ID 重試不重計，未給時建立新 ID")
-        p.add_argument("--allow", action="append", help="允許修改的相對路徑或 glob（必填，可重複；提交前核對）")
+        p.add_argument("--allow", action="append", help="允許修改的相對路徑或 glob（必填，可重複，或以逗號分隔；提交前核對）")
         p.add_argument("--reason", help="--to 必填的指定理由；零權重時須記錄使用者明確指定")
         p.add_argument("--user-override", action="store_true", help="聲明使用者已明確指定零權重 AI 實作，須搭配 --reason")
         p.add_argument("--tier", choices=config.TIER_LEVELS,
