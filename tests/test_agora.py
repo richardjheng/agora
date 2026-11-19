@@ -15,7 +15,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from agoralib import cli, config, jobs, parties, prune, quota, quota_hook, shares, snapshot  # noqa: E402
+from agoralib import cli, config, jobs, parties, prune, quota, quota_hook, sandbox, shares, snapshot  # noqa: E402
 from agoralib.parties import HUMAN, canonical  # noqa: E402
 
 # 測試不能動到使用者真正的「無法使用」標記（~/.agora/blocked.json）
@@ -29,6 +29,15 @@ os.environ.pop(parties.LOCKED_ENV, None)
 for name in ("AGORA_WORKSPACE", cli.worktree.CONTROL_ENV, cli.worktree.WORK_ENV,
              cli.worktree.DISPATCH_ENV, cli.worktree.MANIFEST_ENV):
     os.environ.pop(name, None)
+
+
+def setUpModule():
+    # These tests mock CLI/network boundaries and model an ordinary caller.
+    # Sandbox behavior is exercised separately in test_sandbox.py.
+    for patcher in (patch.object(sandbox, "network_restricted", return_value=False),
+                    patch.object(sandbox, "is_codex_sandbox", return_value=False)):
+        patcher.start()
+        unittest.addModuleCleanup(patcher.stop)
 
 
 def state_with(parties, messages=()):

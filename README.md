@@ -366,6 +366,16 @@ VSCode 面板各 AI 卡片底端與 `agora parties --json`（頂層 `usage` 欄�
 
 必要連線的 DNS／拒絕／連線逾時會分類為 network；證據不足則標「原因未明」。`Failed to shutdown telemetry client` 僅作附註，不會單獨判為 network，也不會蓋掉 auth 失敗。失敗診斷追加到該次討論／工作的 `progress.md`，包含快取的 agy 版本、exit code（無法取得時為 null）、error 與遮蔽敏感內容後的 stderr 摘要。工具被拒時另保留原始 `denied_actions` 結構、cwd、`--add-dir`／`--mode`；由最後一次同名工具配出的路徑會明確標示「推定目標」。
 
+### Codex 沙箱內呼叫其他 AI 沒有回應
+
+已實測的首要原因是 Windows Codex 網路受限沙箱：實際 token 使用者為 `CodexSandboxOffline`（即使 USERNAME／USERPROFILE 仍是原使用者），或 `CODEX_SANDBOX_NETWORK_DISABLED=1`。相關防火牆規則 `codex_sandbox_offline_block_outbound`／`loopback_tcp`／`loopback_udp` 封鎖對外與 loopback，可能讓 agy 等待驗證 60 秒後逾時。尚未證實所有歷史逾時皆由此造成，也未證實憑證不可讀。
+
+Agora 在建立訊息、背景 job 或派工 worktree 前立即回報 sandbox 錯誤，不啟動其他 AI CLI，也不改動共用 `blocked.json`。quota 略過線上探測、保留快取讀取；check、build、status、list 等本機操作照常。`CodexSandboxOnline` 身分本身不會被攔截；若實際呼叫仍發生 auth 失敗，保留原始分類與 stderr 摘要、附註「可能與沙箱有關（未證實）」，不寫全域封鎖。
+
+模型清單可讀取既有快取（含過期資料）；`models --refresh` 或無快取時會拒絕線上查詢。`prune --yes` 若需呼叫 `codex delete`，也會在刪除任何討論串前拒絕；只列出候選或使用 `--keep-sessions` 不受此限制。
+
+請讓 Codex 以 `sandbox_permissions="require_escalated"` 或等效核准在沙箱外執行該 agora 指令；`approval_policy=never` 無法提權時，改由 Claude Code、一般終端或 VSCode 面板發起，不要重試。安裝不會預設加入 Codex `prefix_rule` 放行；若自行在 `~/.codex/rules` 加規則，須了解符合規則的 agora 指令將免提示在沙箱外執行，包含可能建立派工及啟動其他 AI 的指令。
+
 ## 清理
 
 討論串與各 CLI 的對話紀錄不會自動刪除。`prune` 預設只列出，加 `--yes` 才刪除。

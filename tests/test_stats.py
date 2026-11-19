@@ -24,6 +24,8 @@ class TestCallStats(unittest.TestCase):
             return events, ""
 
         with patch.object(parties, "_run", run), \
+                patch.object(parties.sandbox, "network_restricted", return_value=False), \
+                patch.object(parties.sandbox, "is_codex_sandbox", return_value=False), \
                 patch.object(parties.quota, "find_claude", return_value="claude"), \
                 patch.object(parties.quota, "find_codex", return_value="codex"), \
                 patch.object(parties, "find_agy", return_value="agy"), \

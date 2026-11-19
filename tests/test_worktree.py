@@ -75,6 +75,11 @@ class TestScopePatterns(unittest.TestCase):
 
 class WorktreeTests(unittest.TestCase):
     def setUp(self):
+        # Offline fixtures model a normal caller, including when reused by resume tests.
+        for patcher in (patch.object(cli.sandbox, "network_restricted", return_value=False),
+                        patch.object(cli.sandbox, "is_codex_sandbox", return_value=False)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
         env = patch.dict(os.environ)
         env.start()
         self.addCleanup(env.stop)

@@ -28,6 +28,8 @@ def _process_resume_worker(root, thread_name, dispatch_id, result_file):
     )
     try:
         with patch.dict(os.environ, {cli.NESTED_ENV: ""}), patch("sys.stdout", io.StringIO()), \
+                patch.object(cli.sandbox, "network_restricted", return_value=False), \
+                patch.object(cli.sandbox, "is_codex_sandbox", return_value=False), \
                 patch.object(cli, "party_usage", return_value={"remaining_pct": 80, "updated_at": time.time()}), \
                 patch.object(cli.quota, "blocked", return_value=None), \
                 patch.object(cli.models, "CACHE", Path(root) / "models.json"), \

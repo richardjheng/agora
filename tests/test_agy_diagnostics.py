@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from agoralib import cli, parties, quota
+from agoralib import cli, parties, quota, sandbox
 
 
 TELEMETRY = ('Failed to shutdown telemetry client: Post "https://play.googleapis.com/log": '
@@ -24,6 +24,8 @@ class TestAgyDiagnostics(unittest.TestCase):
         self.root = Path(tmp.name)
         self.workspace = self.root / "workspace"
         for patcher in (patch.object(quota, "BLOCKED_FILE", self.root / "blocked.json"),
+                        patch.object(sandbox, "network_restricted", return_value=False),
+                        patch.object(sandbox, "is_codex_sandbox", return_value=False),
                         patch.object(parties, "agy_version", return_value="agy test-1")):
             patcher.start()
             self.addCleanup(patcher.stop)

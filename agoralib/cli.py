@@ -28,7 +28,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from agoralib import __version__, checkqueue, completions, config, jobs, models, prune, quota, routing, shares, snapshot, worktree
+from agoralib import __version__, checkqueue, completions, config, jobs, models, prune, quota, routing, sandbox, shares, snapshot, worktree
 from agoralib import baseline as failure_baseline
 from agoralib.parties import (AGORA_ROOT as AGORA_ROOT_DIR, AI_PARTIES, CALLERS, HUMAN, NAMES,
                               LOCKED_ENV, NESTED_ENV, CallError, Live, agora_cmd, canonical,
@@ -349,6 +349,14 @@ def guard_nested():
         sys.exit("你是被 Agora 呼叫來的，回覆內容會自動轉給其他人，請直接回覆，不要再執行 agora.py 的討論或分派指令。")
 
 
+def guard_network():
+    """Foreground rejection before discussion/dispatch files or jobs are created."""
+    try:
+        sandbox.require_network()
+    except CallError as exc:
+        sys.exit(str(exc))
+
+
 def remember_session(state: dict, party: str, session_id: Optional[str], external: bool = False,
                      opts: Optional[dict] = None):
     """記下 Agora 在各 CLI 開過的對話，清理討論串時一併刪除（external：使用者帶進來的對話，不刪）。
@@ -450,6 +458,7 @@ DENIED_RETRY = ("上一輪你使用了不被允許的工具或終端指令，整
 
 def call_party(party: str, *args, **kwargs):
     """呼叫某一方的 CLI；帳務或權限錯誤時記下它暫時不能用，成功時清除這個標記"""
+    sandbox.require_network()
     mark = quota.blocked(party)
     if mark and mark.get("reason") == "auth":
         raise CallError(f"{NAMES[party]} 因 auth 暫停呼叫：{mark.get('message') or '驗證失敗'}\n"
@@ -458,7 +467,10 @@ def call_party(party: str, *args, **kwargs):
     try:
         result = CALLERS[party](*args, **kwargs)
     except CallError as e:
-        if e.blocked:
+        if e.kind == "auth" and sandbox.is_codex_sandbox():
+            e.args = (f"{e}\n{sandbox.AUTH_NOTE}",)
+            e.diagnostics["sandbox_note"] = sandbox.AUTH_NOTE
+        elif e.blocked:
             quota.mark_blocked(party, str(e), reason="auth" if e.kind == "auth" else None)
         raise
     quota.clear_blocked(party)
@@ -599,9 +611,11 @@ def state_relay_active(thread: Path) -> bool:
 
 
 def cmd_send(ws: Workspace, args):
-    guard_nested()
     thread = ws.resolve_thread(args.thread)
     sender = canonical(args.sender)
+    if targets_for(load_state(thread), sender, args.to, ws.enabled()):
+        guard_network()
+    guard_nested()
     text = read_message(args)
     blind = getattr(args, "blind", False)
     in_background(ws, thread, "send", ["send", thread.name, "--from", sender] + (["--to", args.to] if args.to else [])
@@ -631,6 +645,7 @@ def cmd_send(ws: Workspace, args):
 
 
 def cmd_reply(ws: Workspace, args):
+    guard_network()
     guard_nested()
     thread = ws.resolve_thread(args.thread)
     party = require_enabled(ws, canonical(args.party))
@@ -651,8 +666,11 @@ def agree(agreed: set, party: str, reply: str) -> set:
 
 
 def cmd_auto(ws: Workspace, args):
-    guard_nested()
     thread = ws.resolve_thread(args.thread)
+    targets = args.order.split(",") if args.order else thread_parties(load_state(thread), ws.enabled())
+    if args.rounds > 0 and targets:
+        guard_network()
+    guard_nested()
     in_background(ws, thread, "auto", ["auto", thread.name, "--rounds", str(args.rounds)]
                   + (["--order", args.order] if args.order else []))
     fixed = [require_enabled(ws, canonical(p)) for p in args.order.split(",")] if args.order else None
@@ -747,6 +765,7 @@ def suggest_other(ws: Workspace, party: str) -> Optional[str]:
 
 def cmd_summarize(ws: Workspace, args):
     """請指定的一方用新的對話讀完整逐字稿，產出共識、取捨、異議與工作單（存成 summary.md）"""
+    guard_network()
     guard_nested()
     thread = ws.resolve_thread(args.thread)
     by = args.by or ws.config().get("summarizer")
@@ -1022,6 +1041,7 @@ def pick_worker(ws: Workspace, owner: str, candidates: List[str], state: dict, t
 
 
 def cmd_assign(ws: Workspace, args):
+    guard_network()
     guard_nested()
     with shares.dispatch_lock(ws.control_root):
         recover_assignments(ws)
@@ -2827,6 +2847,9 @@ def cmd_prune(ws: Workspace, args):
     candidates, kept = prune.scan(threads, days)
     result = {"candidates": candidates, "kept": kept, "deleted": [], "errors": [], "dry_run": not args.yes}
     if args.yes:
+        if not args.keep_sessions and any(s.get("party") == "codex" and s.get("id")
+                                          for info in candidates for s in info["sessions"]):
+            guard_network()  # Session deletion starts the Codex CLI, before any thread is deleted.
         guard_nested()
         for info in candidates:
             out = prune.delete_thread(ws.threads / info["id"], info, not args.keep_sessions)
@@ -2868,7 +2891,14 @@ def cmd_prune(ws: Workspace, args):
 
 def cmd_models(ws: Workspace, args):
     """各 AI 可選的模型與推理強度"""
-    data = models.catalog(refresh=args.refresh)
+    if sandbox.network_restricted():
+        if args.refresh:
+            guard_network()
+        data = quota._read_json(models.CACHE)
+        if not data:
+            guard_network()
+    else:
+        data = models.catalog(refresh=args.refresh)
     if args.json:
         print(json.dumps(data, ensure_ascii=False, indent=2))
         return

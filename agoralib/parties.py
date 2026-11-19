@@ -23,7 +23,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Dict, Optional, Tuple
 
-from agoralib import quota
+from agoralib import quota, sandbox
 
 AGORA_ROOT = Path(__file__).resolve().parents[1]
 
@@ -696,6 +696,8 @@ def agy_failure(result: dict, stderr: str, cmd: list, workspace: Path, scratch: 
                  for flag in ("--add-dir", "--mode")},
     })
     if kind == "auth":
+        if sandbox.is_codex_sandbox():
+            diagnostics["sandbox_note"] = sandbox.AUTH_NOTE
         evidence = without_telemetry(str(result.get("error") or "") + "\n" + stderr)
         diagnostics["auth_cause"] = ("原因未明（驗證失敗或逾時，CLI 未區分）" if re.search(r"failed or timed out", evidence, re.I)
                                      else "沒有可用憑證" if re.search(r"(?:no|missing|invalid|expired).*credentials?|credentials?.*(?:missing|invalid|expired|not found|unavailable)", evidence, re.I)
@@ -722,6 +724,7 @@ def agy_failure(result: dict, stderr: str, cmd: list, workspace: Path, scratch: 
 
 def call_antigravity(prompt: str, session_id: Optional[str], opts: dict, work: bool, workspace: Path,
                      timeout: int, scratch: Path, live: Optional[Live] = None) -> Tuple[str, str, str]:
+    sandbox.require_network()
     stats = _CallStats(opts, "antigravity")
     if not opts.get("subagents", True):
         prompt = NO_SUBAGENT_NOTE + prompt
@@ -816,6 +819,7 @@ def claude_event(live: Live, e: dict):
 
 def call_claude(prompt: str, session_id: Optional[str], opts: dict, work: bool, workspace: Path,
                 timeout: int, scratch: Path, live: Optional[Live] = None) -> Tuple[str, str, str]:
+    sandbox.require_network()
     stats = _CallStats(opts, "claude")
     cmd = [quota.find_claude(), "-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages"]
     if work and opts.get("control_dir"):
@@ -878,11 +882,12 @@ def codex_event(live: Live, e: dict):
 
 def call_codex(prompt: str, session_id: Optional[str], opts: dict, work: bool, workspace: Path,
                timeout: int, scratch: Path, live: Optional[Live] = None) -> Tuple[str, str, str]:
+    sandbox.require_network()
     stats = _CallStats(opts, "codex")
     # 討論與總結一律唯讀；工作模式預設只能寫工作區（Codex 沙箱），可由專案設定改為其他模式
-    sandbox = (opts.get("sandbox") or "workspace-write") if work else "read-only"
-    cmd = [quota.find_codex(), "exec", "--json", "-s", sandbox, "-C", str(workspace), "--skip-git-repo-check"]
-    if work and sandbox == "workspace-write":
+    sandbox_mode = (opts.get("sandbox") or "workspace-write") if work else "read-only"
+    cmd = [quota.find_codex(), "exec", "--json", "-s", sandbox_mode, "-C", str(workspace), "--skip-git-repo-check"]
+    if work and sandbox_mode == "workspace-write":
         # 專案設定的額外可寫目錄；不存在的略過，不替使用者建立
         for extra in opts.get("add_dirs") or []:
             d = workspace / extra

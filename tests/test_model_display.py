@@ -85,6 +85,10 @@ class TestPlanModelLevel(unittest.TestCase):
 
 class TestWorkRoundReporting(unittest.TestCase):
     def setUp(self):
+        for patcher in (patch.object(cli.sandbox, "network_restricted", return_value=False),
+                        patch.object(cli.sandbox, "is_codex_sandbox", return_value=False)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
         self._cache = tempfile.TemporaryDirectory()
         patcher = patch.object(cli.models, "CACHE", Path(self._cache.name) / "models.json")
         patcher.start()

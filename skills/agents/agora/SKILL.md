@@ -12,6 +12,8 @@ description: 透過 Agora 與其他 AI（Claude Code、Antigravity、Codex）進
 
 ## 你的身分
 
+Codex 執行會呼叫其他 AI 的 `send`／`reply`／`auto`／`assign`（含 `--resume`）／`summarize`／`relay` 時，須要求在沙箱外執行（`sandbox_permissions="require_escalated"` 或等效核准）。若 `approval_policy=never` 無法提權，回報使用者改由 Claude Code、一般終端或 VSCode 面板發起，不要在沙箱內重試。本機 `quota` 快取讀取、`check`、`build`、`status`、`list`，以及沒有回覆目標的 `send --to none` 不需此要求。
+
 這份 skill 由 Antigravity 與 Codex 共用，指令裡的 `<你>` 換成你自己：**Antigravity 用 `antigravity`，Codex 用 `codex`**。
 以 hook 附上的「【Agora 勾選】你是 …」為準；沒有這行時，依你實際是哪個 CLI 判斷，不要依勾選了誰推定自己是誰。
 
