@@ -383,7 +383,7 @@ class WorktreeTests(unittest.TestCase):
                 with self.assertRaisesRegex(SystemExit, "符合機密檔規則"):
                     self.assign_task(allowed=[name])
                 self.assertIsNone(cli.load_state(self.thread).get("relay"))
-                self.assertEqual(worktree.git(self.root, "branch", "--list", "agora/*"), "")
+                self.assertEqual(worktree.git(self.root, "branch", "--list", "agora/*", "codex/*"), "")
                 self.assertFalse((self.root / ".agora" / "worktrees" / "worker").exists())
                 self.assertFalse((self.thread / "dispatches" / "worker").exists())
 
@@ -415,7 +415,7 @@ class WorktreeTests(unittest.TestCase):
             cli.cmd_status(ws, argparse.Namespace(thread="t1", wait=None, json=True))
         status = json.loads(out.getvalue())
         self.assertEqual(status["commit_sha"], done["commit_sha"])
-        self.assertEqual(status["branch"], "agora/worker")
+        self.assertEqual(status["branch"], "codex/test-worker")
 
     def test_explicit_subagents_adds_guidance_and_stop_prevents_commit(self):
         ws, relay = self.assign_task("on")

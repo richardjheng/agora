@@ -97,9 +97,10 @@ python D:/github/agora/agora.py watch                          # 同時有分派
 - **零權重 AI 實作覆寫**：若被指定的接手方分配比例為 0，另需加上 `--user-override`（僅在使用者明確指定時才使用；例如 `--to claude --reason "使用者指定" --user-override`）。
 
 ### 分支與 Worktree 隔離流程
-- **獨立 Branch 與 Worktree**：每次分派會建立獨立 `agora/<分派 ID>` branch 與獨立 git worktree（位於 `.agora/worktrees/<分派 ID>`；同 AI 多任務各一份）。接手 CLI 的工作目錄設為該 worktree，進度檔、control.json 與 `.agora/` 設定維持在主工作區。
+- **獨立 Branch 與 Worktree**：每次新分派會建立獨立 `<ai>/<slug>-<7 碼分派 ID>` branch（前綴 `claude/`、`codex/`、`agy/`，slug 預設取討論串標題並可用 `assign --name <slug>` 覆寫；改派續跑不改名；舊分派 `agora/<分派 ID>` 原樣相容）與獨立 git worktree（位於 `.agora/worktrees/<完整分派 ID>`；同 AI 多任務各一份）。接手 CLI 的工作目錄設為該 worktree，進度檔、control.json 與 `.agora/` 設定維持在主工作區。
 - **獨立環境與建置**：每個 worktree 各建 `.venv`，建置輸出留在該 worktree。
-- **由 Agora 代做 Commit**：接手方完成後將 commit 訊息（任務目的、測試範圍）寫成檔案，宣告完成後由 Agora 核對分派、branch 與檔案範圍，執行實際 `agora check`，附上真實結果後代為 commit。接手方不要自行 git commit。不自動 push / merge，成果保留由使用者另行指派 merge。
+- **由 Agora 代做 Commit**：接手方完成後將 commit 訊息（任務目的、測試範圍）寫成檔案，宣告完成後由 Agora 核對分派、branch 與檔案範圍，執行實際 `agora check`，附上真實結果後代為 commit。接手方不要自行 git commit。分派與收尾不自動 push / merge。
+- **受控合併與清理（主持方，需使用者同意）**：僅在**使用者明確要求或同意**後，由主持方於主工作區執行 `python D:/github/agora/agora.py merge <討論串> [--dispatch-id <分派ID>] [--keep]`（`--no-ff` 保留線圖分岔、寫入追蹤 trailer、衝突即 `merge --abort` 並回報），合併後於主工作區執行整合 `agora check`；驗證通過後預設先移 worktree 再 `git branch -d`（`--keep` 跳過），僅自動刪可重建產物，未知檔案會阻擋清理、Windows 鎖定記待重試，控制紀錄含 SHA 保留。已合併未清資源亦可用 `python D:/github/agora/agora.py prune --merged --yes` 清理（不刪討論串）。不自動 push。
 - **驗證排隊與不要中斷**：`agora check` 跨分派依控制根目錄 `.agora/config.json` 的 `check_concurrency`（預設 1）FIFO 排隊，可能排隊等待或執行耗時很長；排隊或執行中不要中斷，也不要因為耗時久就改判失敗。
 - **保留成果收尾（主持方）**：停止、暫停或驗證失敗後，確認接手程序已結束、`commit-message.md` 已寫好，可在主工作區用 `python D:/github/agora/agora.py finalize <討論串> [--dispatch-id <分派ID>]` 收尾（預設最近一次）。一定重跑完整驗證，不提供跳過驗證；未核准的失敗保留檔案、不提交。舊停止要求解除時會記錄，執行中新的 `recall` 仍有效；已 committed 只回報既有 SHA。這不是 resume，也不擴大範圍，接手方不可自行執行。
 - **只核准既有失敗**：check 失敗才在分派起點與分派工作區各重跑失敗項目一次，使用分派 `.venv` 並排隊；首次失敗保留，重跑通過列「不穩定」。審查 `status`／進度的「新失敗／既有失敗／不穩定／無法比對」；只有全部為既有失敗，主持方才可用 `agora finalize <討論串> [--dispatch-id <分派ID>] --accept-preexisting --reason "具體理由" --from claude`。仍須完整重驗，核准綁定 tree／凍結指令／失敗 ID，程式碼變動即失效；理由與兩份結果記入 manifest，提交附核准 trailer。收集錯誤、解析不完整與未知框架不可核准，不自動核准，也不將不穩定改算通過。
@@ -121,7 +122,8 @@ python D:/github/agora/agora.py watch                          # 同時有分派
 1. **先看 diff 與測試**：逐項審查接手方的變更（以 `git diff <base_sha>...<branch>` 固定基準比對），確認未超出工作單範圍，並在主工作區執行 `python D:/github/agora/agora.py check --task <討論串>`；Agora 會在任務 worktree，以它的 .venv 與分派時凍結的測試指令驗證（不要先切進 worktree 再執行）。
 2. **必要時定點查證上下文**：對關鍵邏輯改動進行定點上下文查證，避免漫無目的全局搜尋。
 3. **深入除錯交回實作者**：審查若發現問題，先釐清現象後再分派給接手方修復，不要自己動手改或替它深入除錯。
-4. **適時建議開新對話**：大段工作完成並 commit 後，適時建議使用者開新對話（此為建議，不保證節省 token，但可避免單一長對話消耗過大）。
+4. **需使用者同意才合併**：審查通過後向使用者回報結果，經使用者明確同意後，於主工作區執行 `python D:/github/agora/agora.py merge <討論串> [--dispatch-id <分派ID>]` 整合分支並清理（不要自行直接 `git merge` 或自動 push）。
+5. **適時建議開新對話**：大段工作完成並合併後，適時建議使用者開新對話（此為建議，不保證節省 token，但可避免單一長對話消耗過大）。
 
 ## 規則
 

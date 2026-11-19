@@ -51,7 +51,8 @@ def event(thread, kind, record, topic=""):
     key = hashlib.sha256(json.dumps([thread.name, kind, identity], ensure_ascii=False).encode()).hexdigest()
     return {"id": key, "thread": thread.name, "topic": topic, "type": kind,
             **{k: record.get(k) for k in ("dispatch_id", "job_id", "worker", "kind", "status", "branch",
-                                         "commit_sha", "commit_status", "error", "blocked_reason", "baseline_comparison")}}
+                                         "commit_sha", "commit_status", "error", "blocked_reason",
+                                         "baseline_comparison", "merge_record", "cleanup_record")}}
 
 
 def archive(thread, kind, record, topic=""):
@@ -174,7 +175,7 @@ def describe(item):
     elif kind == "討論":
         next_step = "閱讀逐字稿，回報結論與下一步"
     elif item.get("commit_status") == "committed" and item.get("commit_sha"):
-        next_step = "審查 diff 與測試，再決定是否整合分支"
+        next_step = f"審查 diff 與測試，使用者同意後可用 agora merge {item['thread']} 整合分支"
     else:
         next_step = "查看 progress.md，確認變更與驗證結果後決定下一步"
     details = (f"branch={item.get('branch') or '無'}，commit={item.get('commit_sha') or '無'}"

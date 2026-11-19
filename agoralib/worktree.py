@@ -1,4 +1,5 @@
-"""Dispatch-owned Git resources. Never merge, overwrite, or remove task results.
+"""Dispatch-owned Git resources. Dispatches and finalize never auto-merge;
+merging is executed only by `agora merge` when explicitly requested by the user.
 
 The manifest lives in the controller, independently of a thread's latest relay.
 Checks fail closed; failed checks leave the branch and worktree for review.
@@ -21,9 +22,17 @@ CONTROL_ENV = "AGORA_CONTROL_ROOT"
 WORK_ENV = "AGORA_WORKTREE"
 DISPATCH_ENV = "AGORA_DISPATCH_ID"
 MANIFEST_ENV = "AGORA_DISPATCH_MANIFEST"
-FIELDS = ("dispatch_id", "source_branch", "base_sha", "branch", "worktree", "control_root",
-          "manifest", "commit_message", "check_result", "commit_sha", "commit_status", "environment_status",
-          "baseline_comparison", "preexisting_approval")
+FIELDS = ("dispatch_id", "source_branch", "base_sha", "branch", "branch_naming_version", "initial_worker",
+          "worktree", "control_root", "manifest", "commit_message", "check_result", "commit_sha",
+          "commit_status", "environment_status", "baseline_comparison", "preexisting_approval",
+          "merge_record", "cleanup_record")
+AI_BRANCH_PREFIX = {"claude": "claude", "codex": "codex", "antigravity": "agy", "agy": "agy"}
+BRANCH_PREFIXES = ("claude", "codex", "agy")
+BRANCH_NAMING_VERSION = 2
+SLUG_MAX_LEN = 30
+SHORT_ID_LEN = 7
+_SLUG_DISALLOWED_RE = re.compile(r"[^A-Za-z0-9\u3400-\u4dbf\u4e00-\u9fff]+")
+_SLUG_VALID_RE = re.compile(r"[A-Za-z0-9\u3400-\u4dbf\u4e00-\u9fff]+(?:-[A-Za-z0-9\u3400-\u4dbf\u4e00-\u9fff]+)*")
 
 
 class WorktreeError(RuntimeError):
@@ -124,7 +133,128 @@ def save(meta):
     tmp.replace(path)
 
 
-def prepare(root, dispatch_id, allowed, thread):
+def branch_prefix(worker):
+    key = (worker or "").strip().lower()
+    prefix = AI_BRANCH_PREFIX.get(key)
+    if not prefix:
+        raise WorktreeError(f"無效的分派 AI 名稱：{worker}")
+    return prefix
+
+
+def branch_slug(text):
+    """Sanitize a title or --name into a Git branch slug (CJK + ASCII alnum, max 30 chars, fallback 'task')."""
+    raw = (text or "").strip()
+    slug = _SLUG_DISALLOWED_RE.sub("-", raw).strip("-")
+    if len(slug) > SLUG_MAX_LEN:
+        slug = slug[:SLUG_MAX_LEN].rstrip("-")
+    return slug or "task"
+
+
+def build_branch_name(root, dispatch_id, worker, title=None, name=None):
+    """Construct `<ai>/<slug>-<short_id>`, extending ID on collision and validating with git check-ref-format."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", dispatch_id or ""):
+        raise WorktreeError("無效的 dispatch ID")
+    prefix = branch_prefix(worker)
+    raw_slug = name if name is not None else title
+    slug = branch_slug(raw_slug)
+    existing = set(git(root, "for-each-ref", "--format=%(refname)", "refs/heads").splitlines())
+    if f"refs/heads/{prefix}" in existing:
+        raise WorktreeError(f"既有分支 {prefix} 與命名空間 {prefix}/ 衝突，無法建立分支")
+    min_len = min(SHORT_ID_LEN, len(dispatch_id))
+    chosen = None
+    for length in range(min_len, len(dispatch_id) + 1):
+        candidate = f"{prefix}/{slug}-{dispatch_id[:length]}"
+        full_ref = f"refs/heads/{candidate}"
+        if full_ref in existing or any(ref.startswith(full_ref + "/") for ref in existing):
+            continue
+        chosen = candidate
+        break
+    if not chosen:
+        raise WorktreeError(f"分派資源已存在，不覆蓋：{prefix}/{slug}-{dispatch_id}")
+    try:
+        git(root, "check-ref-format", "--branch", chosen)
+    except WorktreeError as exc:
+        raise WorktreeError(f"無效的 branch 名稱（{chosen}）：{exc}") from exc
+    return chosen
+
+
+def is_valid_dispatch_branch(branch, dispatch_id, naming_version=None, initial_worker=None):
+    """Verify branch matches either legacy `agora/<full_id>` or new `<ai>/<slug>-<id_prefix>`."""
+    if not isinstance(branch, str) or not branch or not isinstance(dispatch_id, str):
+        return False
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", dispatch_id):
+        return False
+    if branch == f"agora/{dispatch_id}":
+        return naming_version in (None, 1)
+    if naming_version not in (None, BRANCH_NAMING_VERSION):
+        return False
+    parts = branch.split("/")
+    if len(parts) != 2:
+        return False
+    prefix, rest = parts
+    if prefix not in BRANCH_PREFIXES:
+        return False
+    if initial_worker:
+        expected = AI_BRANCH_PREFIX.get(str(initial_worker).strip().lower())
+        if not expected or prefix != expected:
+            return False
+    min_len = min(SHORT_ID_LEN, len(dispatch_id))
+    for length in range(min_len, len(dispatch_id) + 1):
+        suffix = "-" + dispatch_id[:length]
+        if rest.endswith(suffix):
+            slug = rest[:-len(suffix)]
+            if slug and len(slug) <= SLUG_MAX_LEN and _SLUG_VALID_RE.fullmatch(slug):
+                return True
+    return False
+
+
+def validate_branch_ownership(meta):
+    """Ensure meta['branch'] matches persisted manifest and conforms to dispatch ownership rules."""
+    dispatch_id = meta.get("dispatch_id")
+    branch = meta.get("branch")
+    manifest_path = meta.get("manifest")
+    if manifest_path and Path(manifest_path).is_file():
+        try:
+            disk = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise WorktreeError(f"無法讀取分派 manifest：{exc}") from exc
+        if disk.get("branch") != branch or disk.get("dispatch_id") != dispatch_id:
+            raise WorktreeError("dispatch 與 branch 不符")
+        if disk.get("initial_worker") and meta.get("initial_worker") and disk.get("initial_worker") != meta.get("initial_worker"):
+            raise WorktreeError("dispatch 與 branch 不符")
+    if not is_valid_dispatch_branch(
+        branch,
+        dispatch_id,
+        naming_version=meta.get("branch_naming_version"),
+        initial_worker=meta.get("initial_worker"),
+    ):
+        raise WorktreeError("dispatch 與 branch 不符")
+
+
+def normalize_build_outputs(values):
+    """Validate safe relative build-output directory paths recorded in manifest."""
+    if not values:
+        return []
+    if isinstance(values, str):
+        values = [values]
+    result = []
+    for raw in values:
+        if not isinstance(raw, str):
+            continue
+        item = raw.strip().replace("\\", "/").strip("/")
+        if not item or item in (".", ".."):
+            continue
+        parts = item.split("/")
+        if (item.startswith(("/", ":")) or ":" in item or ".." in parts
+                or any(p in ("", ".", ".git", ".agora") for p in parts)
+                or any(ch in item for ch in "*?[")):
+            continue
+        if item not in result:
+            result.append(item)
+    return result
+
+
+def prepare(root, dispatch_id, allowed, thread, *, worker=None, title=None, name=None, build_outputs=None):
     root = root.resolve()
     allowed = scope_patterns(allowed)
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", dispatch_id):
@@ -138,18 +268,31 @@ def prepare(root, dispatch_id, allowed, thread):
     if not source:
         raise WorktreeError("detached HEAD：無法分派。")
     base = git(root, "rev-parse", "HEAD")
-    branch = f"agora/{dispatch_id}"
+    if worker is not None:
+        branch = build_branch_name(root, dispatch_id, worker, title=title, name=name)
+        naming_version = BRANCH_NAMING_VERSION
+        initial_worker = "antigravity" if str(worker).strip().lower() == "agy" else str(worker).strip().lower()
+    else:
+        branch = f"agora/{dispatch_id}"
+        naming_version = 1
+        initial_worker = None
+        refs = git(root, "for-each-ref", "--format=%(refname)", f"refs/heads/{branch}").splitlines()
+        if f"refs/heads/{branch}" in refs:
+            raise WorktreeError(f"分派資源已存在，不覆蓋：{branch}")
     target = root / ".agora" / "worktrees" / dispatch_id
     control = thread / "dispatches" / dispatch_id
-    refs = git(root, "for-each-ref", "--format=%(refname)", f"refs/heads/{branch}").splitlines()
-    if f"refs/heads/{branch}" in refs or target.exists() or target.is_symlink() or control.exists():
+    if target.exists() or target.is_symlink() or control.exists():
         raise WorktreeError(f"分派資源已存在，不覆蓋：{branch} / {target} / {control}")
     dirty = bool(git(root, "status", "--porcelain"))
     meta = dict(dispatch_id=dispatch_id, source_branch=source, base_sha=base, branch=branch,
+                branch_naming_version=naming_version, initial_worker=initial_worker,
                 worktree=str(target), control_root=str(root), thread=str(thread.resolve()),
                 allowed_paths=allowed, source_dirty=dirty, manifest=str(control / "manifest.json"),
                 commit_message=str(control / "commit-message.md"), check_result=None,
                 commit_sha=None, commit_status="pending", environment_status="pending")
+    outputs = normalize_build_outputs(build_outputs)
+    if outputs:
+        meta["build_outputs"] = outputs
     control.mkdir(parents=True, exist_ok=False)
     save(meta)
     try:
@@ -177,8 +320,7 @@ def validate(meta):
     target = Path(meta["worktree"]).resolve()
     if target != root / ".agora" / "worktrees" / meta["dispatch_id"]:
         raise WorktreeError("worktree 位置不符")
-    if meta["branch"] != f"agora/{meta['dispatch_id']}":
-        raise WorktreeError("dispatch 與 branch 不符")
+    validate_branch_ownership(meta)
     if Path(git(target, "rev-parse", "--show-toplevel")).resolve() != target:
         raise WorktreeError("Git worktree 根目錄不符")
     if git(target, "symbolic-ref", "--quiet", "--short", "HEAD") != meta["branch"]:
@@ -216,6 +358,7 @@ def setup_environment(meta):
     if (target / ".venv").exists():
         raise WorktreeError(".venv 已存在，拒絕覆用未驗證的環境")
     try:
+        egg_before = {p.name for p in target.glob("*.egg-info")}
         venv.EnvBuilder(with_pip=True).create(target / ".venv")
         commands = []
         for name in ("requirements.txt", "requirements-dev.txt"):
@@ -228,6 +371,9 @@ def setup_environment(meta):
                                   text=True, encoding="utf-8", errors="replace", timeout=600, **quota.NO_WINDOW)
             if proc.returncode:
                 raise WorktreeError(f"依賴安裝失敗：{(proc.stdout + proc.stderr)[-2000:]}")
+        new_eggs = sorted({p.name for p in target.glob("*.egg-info")} - egg_before)
+        if new_eggs:
+            meta["build_outputs"] = normalize_build_outputs(list(meta.get("build_outputs") or []) + new_eggs)
         verify_environment(meta)
         meta["environment_status"] = "ready"
         save(meta)

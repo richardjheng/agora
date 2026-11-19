@@ -28,7 +28,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from agoralib import __version__, checkqueue, completions, config, jobs, models, prune, quota, routing, sandbox, shares, snapshot, worktree
+from agoralib import __version__, checkqueue, completions, config, jobs, merge, models, prune, quota, routing, sandbox, shares, snapshot, worktree
 from agoralib import baseline as failure_baseline
 from agoralib.parties import (AGORA_ROOT as AGORA_ROOT_DIR, AI_PARTIES, CALLERS, HUMAN, NAMES,
                               LOCKED_ENV, NESTED_ENV, CallError, Live, agora_cmd, canonical,
@@ -1180,6 +1180,8 @@ def _cmd_resume_locked(ws: Workspace, args):
     owner = canonical(args.sender)
     if getattr(args, "dispatch_id", None):
         sys.exit("--resume 已指定分派 ID，不能同時使用 --dispatch-id。")
+    if getattr(args, "name", None) is not None:
+        sys.exit("--resume 沿用原分派分支，不能指定 --name。")
     if getattr(args, "from_summary", False):
         sys.exit("--resume 不能和 --from-summary 一起使用。")
     if getattr(args, "session", None):
@@ -1409,6 +1411,21 @@ def _cmd_resume_locked(ws: Workspace, args):
     print(f"查詢：{agora_cmd()} status {thread.name} --wait 900")
 
 
+_REAL_WORKTREE_PREPARE = worktree.prepare
+
+
+def _prepare_worktree(root, dispatch_id, allowed, thread, *, worker=None, title=None, name=None, build_outputs=None):
+    try:
+        return worktree.prepare(
+            root, dispatch_id, allowed, thread,
+            worker=worker, title=title, name=name, build_outputs=build_outputs,
+        )
+    except TypeError as exc:
+        if "unexpected keyword argument" not in str(exc) or worktree.prepare is _REAL_WORKTREE_PREPARE:
+            raise
+        return worktree.prepare(root, dispatch_id, allowed, thread)
+
+
 def _cmd_assign_locked(ws: Workspace, args):
     if getattr(args, "resume", None):
         return _cmd_resume_locked(ws, args)
@@ -1443,7 +1460,8 @@ def _cmd_assign_locked(ws: Workspace, args):
     request = {"thread": thread.name, "from": owner, "text": text, "to": canonical(args.to) if args.to else None,
                "session": args.session, "tier": tier, "model": model_arg, "effort": effort_arg,
                "subagents": getattr(args, "subagents", None), "trigger": getattr(args, "trigger", None),
-               "reason": reason, "user_override": override, "allowed_paths": getattr(args, "allow", None)}
+               "reason": reason, "user_override": override, "allowed_paths": getattr(args, "allow", None),
+               "name": getattr(args, "name", None)}
     import hashlib
     fingerprint = hashlib.sha256(json.dumps(request, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
     previous = shares.dispatch_state(ws.root)["dispatches"].get(dispatch_id)
@@ -1479,7 +1497,11 @@ def _cmd_assign_locked(ws: Workspace, args):
               f"若問題還在，接手會立即停止並顯示原因。")
     paths = relay_paths(thread)
     try:
-        task = worktree.prepare(ws.root, dispatch_id, getattr(args, "allow", None), thread)
+        task = _prepare_worktree(
+            ws.root, dispatch_id, getattr(args, "allow", None), thread,
+            worker=worker, title=state.get("topic"), name=getattr(args, "name", None),
+            build_outputs=ws.config().get("build_outputs"),
+        )
     except (worktree.WorktreeError, OSError, subprocess.SubprocessError) as exc:
         sys.exit(f"無法建立隔離分派：{exc}；已建立的資源保留，不自動覆蓋或刪除。")
     task["commands"] = {k: ws.config().get(k) for k in LOCKED_KEYS}
@@ -1641,6 +1663,11 @@ def cmd_finalize(ws: Workspace, args):
     print(f"finalize 完成：{meta['branch']}｜{meta.get('commit_sha') or meta.get('commit_status')}")
 
 
+def cmd_merge(ws: Workspace, args):
+    """使用者明確要求時，以 --no-ff 合併已驗證提交的分派分支並整合驗證與清理。"""
+    return merge.cmd_merge(ws, args)
+
+
 def cmd_changes(ws: Workspace, args):
     """分派期間的變更：相對於 assign 當下的工作區快照（期間任何人的修改都會列出）"""
     thread = ws.resolve_thread(args.thread)
@@ -1661,7 +1688,10 @@ def cmd_changes(ws: Workspace, args):
     if not base.get("commit"):
         sys.exit("此討論串的分派沒有記錄基準" + (f"：{base['error']}" if base.get("error") else "（尚未分派，或是舊版的分派）。"))
     try:
-        files = (snapshot.branch_changes(ws.root, relay["base_sha"], relay["branch"])
+        target_ref = relay["branch"] if relay.get("worktree") else None
+        if target_ref and not merge.ref_exists(ws.root, f"refs/heads/{target_ref}") and relay.get("commit_sha"):
+            target_ref = relay["commit_sha"]
+        files = (snapshot.branch_changes(ws.root, relay["base_sha"], target_ref)
                  if relay.get("worktree") else snapshot.changes(ws.root, base["commit"]))
     except (snapshot.SnapshotError, OSError, subprocess.SubprocessError) as e:
         sys.exit(str(e))
@@ -2262,8 +2292,15 @@ def cmd_status(ws: Workspace, args):
               f"背景程序：{'執行中' if alive else '已結束'}｜更新：{relay.get('updated')}")
         print(relay_model_line(relay))
         if relay.get("worktree"):
-            print(f"分派：{relay.get('dispatch_id')}｜branch：{relay.get('branch')}｜worktree：{relay['worktree']}")
+            wt_note = "（已清理）" if (relay.get("cleanup_record") or {}).get("status") == "cleaned" and not Path(relay["worktree"]).exists() else ""
+            print(f"分派：{relay.get('dispatch_id')}｜branch：{relay.get('branch')}｜worktree：{relay['worktree']}{wt_note}")
             print(f"提交：{relay.get('commit_status')}｜{relay.get('commit_sha') or '尚無 commit'}")
+            merge_rec = relay.get("merge_record") or {}
+            cleanup_rec = relay.get("cleanup_record") or {}
+            if merge_rec or cleanup_rec:
+                m_part = f"合併：{'已合併' if merge_rec.get('merged') else '未合併'}" + (f"（{merge_rec['merge_sha'][:12]}）" if merge_rec.get("merge_sha") else "")
+                c_part = f"｜清理：{cleanup_rec.get('status')}" if cleanup_rec.get("status") else ""
+                print(f"{m_part}{c_part}")
             summary = failure_baseline.describe({**relay, "thread": str(thread)})
             if summary:
                 print(summary)
@@ -2838,7 +2875,9 @@ def cmd_keep(ws: Workspace, args):
 
 
 def cmd_prune(ws: Workspace, args):
-    """清理不再需要的討論串（預設只列出，--yes 才刪除）；條件見 prune.py"""
+    """清理不再需要的討論串（預設只列出，--yes 才刪除）；--merged 只清已合併分派資源、不刪討論串"""
+    if getattr(args, "merged", False):
+        return merge.cmd_prune_merged(ws, args)
     if args.thread:
         threads, days = [ws.resolve_thread(t) for t in args.thread], None
     else:
@@ -3454,6 +3493,7 @@ def main(argv=None):
         p.add_argument("--from", dest="sender", required=True, choices=who)
         p.add_argument("--to", help="指定接手方（預設省略：額度篩選後依比例輪流）")
         p.add_argument("--dispatch-id", help="派工識別碼；同工作單以相同 ID 重試不重計，未給時建立新 ID")
+        p.add_argument("--name", metavar="slug", help="自訂分派分支 slug（預設取討論串標題；保留中英數，最多 30 字）")
         p.add_argument("--resume", metavar="分派ID", help="沿用既有 branch／worktree 續跑未提交的隔離分派（已提交者不可續跑）")
         p.add_argument("--allow", action="append", help="允許修改的相對路徑或 glob（新分派必填；--resume 用於擴大範圍並須加 --reason；可重複或以逗號分隔）")
         p.add_argument("--reason", help="--to 指定分派或 --resume --allow 擴大範圍必填的理由；零權重時須記錄使用者明確指定")
@@ -3495,6 +3535,13 @@ def main(argv=None):
     p.add_argument("--reason", help="核准既有失敗的理由（--accept-preexisting 必填）")
     p.add_argument("--from", dest="sender", choices=who, help="記錄核准主持方；預設分派發起方")
     p.set_defaults(func=cmd_finalize)
+
+    p = sub.add_parser("merge", help="使用者明確要求時，以 --no-ff 合併已驗證提交的分派分支並整合驗證與清理")
+    p.add_argument("thread")
+    p.add_argument("--dispatch-id", help="合併指定的隔離分派；預設最近一次")
+    p.add_argument("--keep", action="store_true", help="合併並驗證通過後保留 worktree 與分支，不自動清理")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_merge)
 
     p = sub.add_parser("recall", help="請接手方在下一個檢查點暫停")
     p.add_argument("thread")
@@ -3563,9 +3610,10 @@ def main(argv=None):
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_activity)
 
-    p = sub.add_parser("prune", help="清理不再需要的討論串（預設只列出，--yes 才刪除）")
+    p = sub.add_parser("prune", help="清理不再需要的討論串（預設只列出，--yes 才刪除）；--merged 只清已合併分派資源")
     p.add_argument("--days", type=float, default=30, help="超過幾天沒有活動才清理（預設 30）")
     p.add_argument("--thread", action="append", help="只清理指定的討論串（不看天數，其餘條件照樣檢查）")
+    p.add_argument("--merged", action="store_true", help="只清理已合併但未清的分派 worktree 與分支，不刪除討論串")
     p.add_argument("--yes", action="store_true", help="確認刪除")
     p.add_argument("--keep-sessions", action="store_true", help="只刪討論串，保留各 CLI 的對話紀錄")
     p.add_argument("--verbose", action="store_true", help="列出保留的討論串與原因")

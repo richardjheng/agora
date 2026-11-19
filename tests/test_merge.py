@@ -1,0 +1,630 @@
+"""Tests for AI-prefixed branch naming, compatibility, `agora merge` (--no-ff), and conservative cleanup."""
+
+import argparse
+import errno
+import io
+import json
+import os
+import shutil
+import sys
+import time
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from agoralib import cli, completions, config, merge, prune, worktree
+
+try:
+    from . import test_worktree as fixtures
+except ImportError:
+    import test_worktree as fixtures
+
+
+class MergeTestBase(unittest.TestCase):
+    setUp = fixtures.WorktreeTests.setUp
+    task = fixtures.WorktreeTests.task
+    message = fixtures.WorktreeTests.message
+    modify = fixtures.WorktreeTests.modify
+    venv = fixtures.WorktreeTests.venv
+
+    def configure_parties(self):
+        config.save(self.root, {
+            "parties": {
+                "claude": {"enabled": True, "share": 0},
+                "codex": {"enabled": True, "share": 10},
+                "antigravity": {"enabled": True, "share": 5},
+            },
+            "check": [sys.executable, "-c", "pass"],
+        })
+
+    def make_committed_dispatch(
+        self,
+        dispatch_id="abcdef0123456789abcdef0123456789",
+        worker="antigravity",
+        title="分派分支命名與 --no-ff 合併清理",
+        name=None,
+        allowed=None,
+        edit_file="app.py",
+        edit_text="VALUE = 2\n",
+        build_outputs=None,
+        legacy=False,
+    ):
+        cli.save_state(self.thread, {"topic": title, "parties": {}, "messages": []})
+        if legacy:
+            meta = worktree.prepare(self.root, dispatch_id, allowed or ["app.py", "demo/*"], self.thread)
+            meta["worker"] = worker
+            worktree.save(meta)
+        else:
+            meta = worktree.prepare(
+                self.root, dispatch_id, allowed or ["app.py", "demo/*"], self.thread,
+                worker=worker, title=title, name=name, build_outputs=build_outputs,
+            )
+            meta["worker"] = worker
+            worktree.save(meta)
+        self.modify(meta, edit_file, edit_text)
+        self.message(meta)
+        worktree.finalize(meta, lambda m: {"exit_code": 0, "output_tail": "Ran 1 test in 0.01s\nOK"})
+        cli.update_relay(
+            self.thread,
+            **{k: meta.get(k) for k in worktree.FIELDS},
+            allowed_paths=meta["allowed_paths"],
+            worker=worker,
+            status="done",
+            pid=99999999,
+            pid_started=123.0,
+        )
+        return json.loads(Path(meta["manifest"]).read_text(encoding="utf-8"))
+
+    def read_meta(self, meta):
+        return json.loads(Path(meta["manifest"]).read_text(encoding="utf-8"))
+
+
+class TestBranchNamingAndOwnership(MergeTestBase):
+    def test_slug_sanitization_chinese_symbols_length_and_fallback(self):
+        self.assertEqual(worktree.branch_slug("分派分支命名與 --no-ff 合併清理"), "分派分支命名與-no-ff-合併清理")
+        self.assertEqual(worktree.branch_slug("!!!@@@###___---   "), "task")
+        self.assertEqual(worktree.branch_slug(""), "task")
+        self.assertEqual(worktree.branch_slug(None), "task")
+        self.assertEqual(worktree.branch_slug("foo_bar baz..qux.lock"), "foo-bar-baz-qux-lock")
+        long_title = "a" * 29 + "-extra-suffix-here"
+        self.assertEqual(worktree.branch_slug(long_title), "a" * 29)
+        self.assertEqual(len(worktree.branch_slug("中" * 40)), 30)
+
+    def test_prefixes_for_all_three_ais_and_worktree_dir_unchanged(self):
+        for worker, expected_prefix in (("claude", "claude"), ("codex", "codex"), ("antigravity", "agy")):
+            did = f"{expected_prefix}0123456789abcdef0123456789"
+            meta = worktree.prepare(
+                self.root, did, ["app.py"], self.thread,
+                worker=worker, title="中文功能測試",
+            )
+            self.assertEqual(meta["branch"], f"{expected_prefix}/中文功能測試-{did[:7]}")
+            self.assertEqual(meta["branch_naming_version"], 2)
+            self.assertEqual(meta["initial_worker"], worker)
+            self.assertEqual(Path(meta["worktree"]), self.root / ".agora" / "worktrees" / did)
+            worktree.validate(meta)
+
+    def test_assign_name_override_and_all_symbols_fallback(self):
+        did = "1234567890abcdef1234567890abcdef"
+        meta1 = worktree.prepare(
+            self.root, did, ["app.py"], self.thread,
+            worker="codex", title="不會用到這個標題", name="自訂名稱!! #1",
+        )
+        self.assertEqual(meta1["branch"], "codex/自訂名稱-1-1234567")
+        did2 = "fedcba0987654321fedcba0987654321"
+        meta2 = worktree.prepare(
+            self.root, did2, ["app.py"], self.thread,
+            worker="claude", title="有標題", name="***///___",
+        )
+        self.assertEqual(meta2["branch"], "claude/task-fedcba0")
+
+    def test_7_char_collision_extends_id_and_ref_format_validated(self):
+        did = "abcdef0123456789abcdef0123456789"
+        worktree.git(self.root, "branch", "agy/中文主題-abcdef0")
+        worktree.git(self.root, "branch", "agy/中文主題-abcdef01")
+        meta = worktree.prepare(
+            self.root, did, ["app.py"], self.thread,
+            worker="antigravity", title="中文主題",
+        )
+        self.assertEqual(meta["branch"], "agy/中文主題-abcdef012")
+        worktree.validate(meta)
+
+        # If check-ref-format fails, prepare must refuse without creating a branch.
+        real_git = worktree.git
+        def fail_ref_check(root, *args):
+            if args[:2] == ("check-ref-format", "--branch"):
+                raise worktree.WorktreeError("invalid ref")
+            return real_git(root, *args)
+
+        with patch.object(worktree, "git", side_effect=fail_ref_check):
+            with self.assertRaisesRegex(worktree.WorktreeError, "無效的 branch 名稱"):
+                worktree.build_branch_name(self.root, "99999998888888", "codex", title="ok")
+
+    def test_ownership_validation_new_legacy_and_forged_branches(self):
+        did = "abcdef0123456789abcdef0123456789"
+        # Valid v2 & v1
+        self.assertTrue(worktree.is_valid_dispatch_branch("agy/中文-abcdef0", did, 2, "antigravity"))
+        self.assertTrue(worktree.is_valid_dispatch_branch("agy/中文-abcdef0123", did, 2, "antigravity"))
+        self.assertTrue(worktree.is_valid_dispatch_branch(f"agora/{did}", did, 1, None))
+        self.assertTrue(worktree.is_valid_dispatch_branch(f"agora/{did}", did, None, None))
+        # Hyphenated custom dispatch IDs work properly
+        self.assertTrue(worktree.is_valid_dispatch_branch("codex/fix-bug-work-1", "work-1", 2, "codex"))
+
+        # Forged / invalid branches must all be rejected
+        forged = [
+            ("main", did, 2, "antigravity"),
+            ("agy/中文-1111111", did, 2, "antigravity"),        # wrong ID prefix
+            ("agy/中文-abcd", did, 2, "antigravity"),           # too short (< 7)
+            ("evil/中文-abcdef0", did, 2, "antigravity"),       # invalid prefix
+            ("claude/中文-abcdef0", did, 2, "antigravity"),     # wrong initial_worker prefix
+            ("agy/-abcdef0", did, 2, "antigravity"),            # empty slug
+            ("agy/a/b-abcdef0", did, 2, "antigravity"),         # extra slash
+            (f"agora/{did}", did, 2, "antigravity"),            # v1 name on v2 manifest
+            ("agora/otherid", did, 1, None),                    # wrong legacy ID
+        ]
+        for branch, d, ver, init_w in forged:
+            with self.subTest(branch=branch):
+                self.assertFalse(worktree.is_valid_dispatch_branch(branch, d, ver, init_w))
+
+        # Forged branch written directly into manifest on disk is rejected by validate()
+        meta = worktree.prepare(self.root, did, ["app.py"], self.thread, worker="codex", title="test")
+        worktree.git(Path(meta["worktree"]), "checkout", "-b", "codex/forged-0000000")
+        meta["branch"] = "codex/forged-0000000"
+        worktree.save(meta)
+        with self.assertRaisesRegex(worktree.WorktreeError, "dispatch 與 branch 不符"):
+            worktree.validate(meta)
+
+    def test_resume_switch_worker_keeps_branch_name_and_rejects_name_flag(self):
+        self.configure_parties()
+        ws = cli.Workspace(self.root)
+        cli.save_state(self.thread, {"topic": "切換接手測試", "parties": {}, "messages": []})
+        did = "11223344556677889900aabbccddeeff"
+        args = argparse.Namespace(
+            thread=self.thread.name, sender="claude", to=None, message="實作", file=None,
+            session=None, from_summary=False, yes=False, tier=None, model=None, effort=None,
+            subagents=None, trigger=None, allow=["app.py"], reason=None, user_override=False,
+            dispatch_id=did, resume=None, name="自訂分支",
+        )
+        with patch.dict(os.environ, {cli.NESTED_ENV: ""}), patch("sys.stdout", io.StringIO()), \
+                patch.object(cli, "party_usage", return_value={"remaining_pct": 80, "updated_at": time.time()}), \
+                patch.object(cli.quota, "blocked", return_value=None), \
+                patch.object(cli.models, "CACHE", self.root / "models.json"), \
+                patch.object(cli.jobs, "spawn", return_value=99999999), \
+                patch.object(cli.jobs, "pid_started", return_value=123.0):
+            cli.cmd_assign(ws, args)
+        relay = cli.load_state(self.thread)["relay"]
+        self.assertEqual(relay["worker"], "codex")
+        self.assertEqual(relay["initial_worker"], "codex")
+        self.assertEqual(relay["branch"], "codex/自訂分支-1122334")
+        cli.update_relay(self.thread, status="stopped")
+
+        # --resume with --name must refuse
+        bad_resume = argparse.Namespace(**{**vars(args), "dispatch_id": None, "resume": did, "name": "new-name"})
+        with patch.dict(os.environ, {cli.NESTED_ENV: ""}), self.assertRaisesRegex(SystemExit, "--name"):
+            cli.cmd_assign(ws, bad_resume)
+
+        # --resume switching to antigravity keeps original codex/... branch and initial_worker
+        good_resume = argparse.Namespace(
+            **{**vars(args), "dispatch_id": None, "resume": did, "name": None,
+               "to": "antigravity", "reason": "改派", "allow": None, "message": None}
+        )
+        with patch.dict(os.environ, {cli.NESTED_ENV: ""}), patch("sys.stdout", io.StringIO()), \
+                patch.object(cli, "party_usage", return_value={"remaining_pct": 80, "updated_at": time.time()}), \
+                patch.object(cli.quota, "blocked", return_value=None), \
+                patch.object(cli.models, "CACHE", self.root / "models.json"), \
+                patch.object(cli.jobs, "spawn", return_value=88888888), \
+                patch.object(cli.jobs, "pid_started", return_value=456.0):
+            cli.cmd_assign(ws, good_resume)
+        resumed = cli.load_state(self.thread)["relay"]
+        self.assertEqual(resumed["worker"], "antigravity")
+        self.assertEqual(resumed["initial_worker"], "codex")
+        self.assertEqual(resumed["branch"], "codex/自訂分支-1122334")
+        worktree.validate(worktree.load(resumed))
+
+
+class TestAgoraMerge(MergeTestBase):
+    def test_merge_precheck_refusals(self):
+        ws = cli.Workspace(self.root)
+        meta = self.make_committed_dispatch()
+
+        # 1. Live worker process refused
+        cli.update_relay(self.thread, pid=os.getpid(), pid_started=cli.jobs.pid_started(os.getpid()))
+        with self.assertRaisesRegex(merge.MergeError, "仍在執行"):
+            merge.merge_dispatch(ws, self.thread, run_check=lambda r: {"exit_code": 0})
+        cli.update_relay(self.thread, pid=99999999, pid_started=123.0)
+
+        # 2. Relay still active status refused
+        cli.update_relay(self.thread, status="running")
+        with self.assertRaisesRegex(merge.MergeError, "尚未結束"):
+            merge.merge_dispatch(ws, self.thread, run_check=lambda r: {"exit_code": 0})
+        cli.update_relay(self.thread, status="done")
+
+        # 3. Uncommitted dispatch refused
+        saved = self.read_meta(meta)
+        saved["commit_status"] = "pending"
+        worktree.save(saved)
+        with self.assertRaisesRegex(merge.MergeError, "尚未完成驗證與提交"):
+            merge.merge_dispatch(ws, self.thread, run_check=lambda r: {"exit_code": 0})
+        saved["commit_status"] = "committed"
+        worktree.save(saved)
+
+        # 4. Branch SHA diverged from commit_sha refused
+        worktree.git(Path(meta["worktree"]), "commit", "--allow-empty", "-m", "unverified extra")
+        with self.assertRaisesRegex(merge.MergeError, "commit_sha"):
+            merge.merge_dispatch(ws, self.thread, run_check=lambda r: {"exit_code": 0})
+        worktree.git(Path(meta["worktree"]), "reset", "--hard", meta["commit_sha"])
+
+        # 5. Wrong current branch in main workspace refused
+        worktree.git(self.root, "checkout", "-b", "other-branch")
+        with self.assertRaisesRegex(merge.MergeError, "來源分支"):
+            merge.merge_dispatch(ws, self.thread, run_check=lambda r: {"exit_code": 0})
+        worktree.git(self.root, "checkout", "main")
+        worktree.git(self.root, "branch", "-D", "other-branch")
+
+        # 6. Uncommitted tracked change in main workspace refused
+        (self.root / "other.py").write_text("DIRTY = True\n", encoding="utf-8")
+        with self.assertRaisesRegex(merge.MergeError, "未提交的已追蹤變更"):
+            merge.merge_dispatch(ws, self.thread, run_check=lambda r: {"exit_code": 0})
+        (self.root / "other.py").write_text("VALUE = 9\n", encoding="utf-8")
+
+        # 7. In-progress merge / rebase / cherry-pick refused
+        git_dir = merge._git_dir(self.root)
+        for marker, label in (("MERGE_HEAD", "merge"), ("REBASE_HEAD", "rebase"), ("CHERRY_PICK_HEAD", "cherry-pick")):
+            (git_dir / marker).write_text("0" * 40 + "\n", encoding="utf-8")
+            try:
+                with self.assertRaisesRegex(merge.MergeError, label):
+                    merge.merge_dispatch(ws, self.thread, run_check=lambda r: {"exit_code": 0})
+            finally:
+                (git_dir / marker).unlink()
+
+        # 8. Nested worker cannot run cmd_merge; merge not in AGENT_COMMANDS
+        self.assertNotIn("merge", cli.AGENT_COMMANDS)
+        with patch.dict(os.environ, {cli.NESTED_ENV: "1"}), self.assertRaises(SystemExit):
+            cli.cmd_merge(ws, argparse.Namespace(thread=self.thread.name, dispatch_id=None, keep=False, json=False))
+
+    def test_merge_no_ff_message_trailers_check_and_default_cleanup(self):
+        ws = cli.Workspace(self.root)
+        # Untracked file in main workspace must NOT block merge pre-check
+        (self.root / "local-untracked.txt").write_text("ok\n", encoding="utf-8")
+        meta = self.make_committed_dispatch()
+        target = Path(meta["worktree"])
+        # Add rebuildable artifacts that should be auto-cleaned
+        (target / ".venv").mkdir()
+        (target / ".venv" / "pyvenv.cfg").write_text("home = x\n", encoding="utf-8")
+        (target / "demo" / "__pycache__").mkdir()
+        (target / "demo" / "__pycache__" / "mod.cpython-311.pyc").write_bytes(b"pyc")
+        (target / "temp.pyc").write_bytes(b"pyc")
+
+        checked_roots = []
+        def fake_check(root):
+            checked_roots.append(root)
+            return {"exit_code": 0, "time": "2026-11-19 16:00:00", "output_tail": "Ran 10 tests\nOK"}
+
+        result = merge.merge_dispatch(ws, self.thread, run_check=fake_check)
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["already_merged"])
+        self.assertEqual(checked_roots, [self.root])
+        self.assertEqual(result["cleanup"]["status"], "cleaned")
+
+        # Must be a true 2-parent --no-ff merge commit
+        parents = worktree.git(self.root, "rev-list", "--parents", "-n", "1", "HEAD").split()
+        self.assertEqual(len(parents), 3)
+        self.assertEqual(parents[2], meta["commit_sha"])
+
+        # Verify commit message & trailers
+        msg = worktree.git(self.root, "show", "-s", "--format=%B", "HEAD")
+        self.assertTrue(msg.startswith("合併：分派分支命名與 --no-ff 合併清理（Antigravity）"))
+        self.assertIn(meta["branch"], msg)
+        self.assertIn("驗證結果摘要", msg)
+        trailers = worktree.git(self.root, "show", "-s", "--format=%(trailers)", "HEAD")
+        self.assertIn(f"Agora-Dispatch: {meta['dispatch_id']}", trailers)
+        self.assertIn(f"Agora-Branch: {meta['branch']}", trailers)
+
+        # Worktree & branch removed, control records preserved
+        self.assertFalse(target.exists())
+        self.assertFalse(merge.ref_exists(self.root, f"refs/heads/{meta['branch']}"))
+        self.assertTrue(Path(meta["manifest"]).is_file())
+        saved = self.read_meta(meta)
+        self.assertEqual(saved["merge_record"]["merge_sha"], result["merge_sha"])
+        self.assertEqual(saved["cleanup_record"]["status"], "cleaned")
+        self.assertIn("agora merge 整合驗證", (self.thread / "transcript.md").read_text(encoding="utf-8"))
+
+        # `agora status` and `agora changes` still work after worktree/branch cleanup
+        out = io.StringIO()
+        with patch("sys.stdout", out):
+            cli.cmd_status(ws, argparse.Namespace(thread=self.thread.name, wait=None, json=False))
+        self.assertIn("已清理", out.getvalue())
+        self.assertIn(meta["branch"], out.getvalue())
+
+        out_changes = io.StringIO()
+        with patch("sys.stdout", out_changes):
+            cli.cmd_changes(ws, argparse.Namespace(thread=self.thread.name, dispatch_id=None, json=True))
+        changes_data = json.loads(out_changes.getvalue())
+        self.assertEqual([f["path"] for f in changes_data["files"]], ["app.py"])
+
+    def test_already_merged_skips_empty_commit_and_cleans_up(self):
+        ws = cli.Workspace(self.root)
+        meta = self.make_committed_dispatch()
+        worktree.git(self.root, "merge", "--no-ff", "-m", "manual merge", meta["branch"])
+        head_before = worktree.git(self.root, "rev-parse", "HEAD")
+
+        result = merge.merge_dispatch(ws, self.thread, run_check=lambda r: self.fail("should not re-run check"))
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["already_merged"])
+        self.assertEqual(worktree.git(self.root, "rev-parse", "HEAD"), head_before)
+        self.assertEqual(result["cleanup"]["status"], "cleaned")
+        self.assertFalse(Path(meta["worktree"]).exists())
+        self.assertFalse(merge.ref_exists(self.root, f"refs/heads/{meta['branch']}"))
+
+    def test_conflict_aborts_reports_files_and_does_not_clean(self):
+        ws = cli.Workspace(self.root)
+        meta = self.make_committed_dispatch(edit_file="app.py", edit_text="VALUE = 200\n")
+        # Create conflicting change on main
+        (self.root / "app.py").write_text("VALUE = 999\n", encoding="utf-8")
+        worktree.git(self.root, "add", "app.py")
+        worktree.git(self.root, "commit", "-m", "conflicting main edit")
+        head_before = worktree.git(self.root, "rev-parse", "HEAD")
+
+        with self.assertRaises(merge.MergeError) as caught:
+            merge.merge_dispatch(ws, self.thread, run_check=lambda r: self.fail("must not run check on conflict"))
+        self.assertIn("衝突", str(caught.exception))
+        self.assertIn("git merge --abort", str(caught.exception))
+        self.assertIn("app.py", str(caught.exception))
+        # Main repo must be clean, no MERGE_HEAD, HEAD unchanged, worktree & branch preserved
+        self.assertFalse((merge._git_dir(self.root) / "MERGE_HEAD").exists())
+        self.assertEqual(worktree.git(self.root, "rev-parse", "HEAD"), head_before)
+        self.assertEqual(worktree.git(self.root, "status", "--porcelain", "--untracked-files=no"), "")
+        self.assertTrue(Path(meta["worktree"]).is_dir())
+        self.assertTrue(merge.ref_exists(self.root, f"refs/heads/{meta['branch']}"))
+
+    def test_integration_check_failure_does_not_rollback_or_clean(self):
+        ws = cli.Workspace(self.root)
+        meta = self.make_committed_dispatch()
+        result = merge.merge_dispatch(
+            ws, self.thread,
+            run_check=lambda r: {"exit_code": 1, "time": "2026-11-19 16:00:00", "output_tail": "FAIL: test_x"},
+        )
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["check_passed"])
+        # Merge commit stays on main (not rolled back!)
+        self.assertEqual(worktree.git(self.root, "rev-parse", "HEAD"), result["merge_sha"])
+        self.assertEqual((self.root / "app.py").read_text(encoding="utf-8"), "VALUE = 2\n")
+        # Worktree & branch are NOT cleaned up
+        self.assertTrue(Path(meta["worktree"]).is_dir())
+        self.assertTrue(merge.ref_exists(self.root, f"refs/heads/{meta['branch']}"))
+        self.assertIn("不回滾", (self.thread / "transcript.md").read_text(encoding="utf-8"))
+
+    def test_merge_keep_flag_preserves_worktree_and_branch(self):
+        ws = cli.Workspace(self.root)
+        meta = self.make_committed_dispatch()
+        result = merge.merge_dispatch(ws, self.thread, keep=True, run_check=lambda r: {"exit_code": 0})
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["cleanup"]["status"], "kept")
+        self.assertTrue(Path(meta["worktree"]).is_dir())
+        self.assertTrue(merge.ref_exists(self.root, f"refs/heads/{meta['branch']}"))
+
+
+class TestCleanupAndPruneMerged(MergeTestBase):
+    def test_rebuildable_build_outputs_cleaned_but_unknown_files_block(self):
+        ws = cli.Workspace(self.root)
+        meta = self.make_committed_dispatch(build_outputs=["dist"])
+        target = Path(meta["worktree"])
+        (target / "dist").mkdir()
+        (target / "dist" / "bundle.js").write_text("ok", encoding="utf-8")
+        # Unknown untracked file + unknown ignored file
+        (target / "notes.txt").write_text("keep me", encoding="utf-8")
+        (target / "debug.log").write_text("ignored or untracked", encoding="utf-8")
+        (target / "demo" / "__pycache__").mkdir()
+        (target / "demo" / "__pycache__" / "keep.txt").write_text("not pyc", encoding="utf-8")
+
+        result = merge.merge_dispatch(ws, self.thread, run_check=lambda r: {"exit_code": 0})
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["cleanup"]["status"], "blocked")
+        self.assertIn("notes.txt", result["cleanup"]["blocking_files"])
+        self.assertIn("debug.log", result["cleanup"]["blocking_files"])
+        self.assertIn("demo/__pycache__/keep.txt", result["cleanup"]["blocking_files"])
+        # Nothing deleted when blocked!
+        self.assertTrue(target.is_dir())
+        self.assertTrue((target / "dist" / "bundle.js").is_file())
+        self.assertTrue(merge.ref_exists(self.root, f"refs/heads/{meta['branch']}"))
+
+        # Remove unknown files, leave recorded build_outputs + .pyc -> retry succeeds
+        (target / "notes.txt").unlink()
+        (target / "debug.log").unlink()
+        (target / "demo" / "__pycache__" / "keep.txt").unlink()
+        (target / "demo" / "__pycache__" / "ok.pyc").write_bytes(b"pyc")
+
+        retry = merge.merge_dispatch(ws, self.thread, run_check=lambda r: self.fail("already checked"))
+        self.assertTrue(retry["already_merged"])
+        self.assertEqual(retry["cleanup"]["status"], "cleaned")
+        self.assertFalse(target.exists())
+        self.assertFalse(merge.ref_exists(self.root, f"refs/heads/{meta['branch']}"))
+
+    def test_uncommitted_tracked_change_in_worktree_blocks_cleanup(self):
+        ws = cli.Workspace(self.root)
+        meta = self.make_committed_dispatch()
+        worktree.git(self.root, "merge", "--no-ff", "-m", "merge", meta["branch"])
+        (Path(meta["worktree"]) / "app.py").write_text("UNCOMMITTED EDIT\n", encoding="utf-8")
+        outcome = merge.cleanup_dispatch(self.root, self.thread, meta)
+        self.assertEqual(outcome["status"], "blocked")
+        self.assertEqual(outcome["tracked_changes"], ["app.py"])
+        self.assertTrue(Path(meta["worktree"]).is_dir())
+        self.assertTrue(merge.ref_exists(self.root, f"refs/heads/{meta['branch']}"))
+
+    def test_eperm_marks_pending_retry_and_retry_completes_without_rollback(self):
+        ws = cli.Workspace(self.root)
+        meta = self.make_committed_dispatch()
+        target = Path(meta["worktree"])
+        (target / ".venv").mkdir()
+        (target / ".venv" / "locked.dll").write_text("busy", encoding="utf-8")
+
+        # Simulate Windows EPERM on first cleanup attempt (only for worktree artifact, not tempfile)
+        real_rmtree = shutil.rmtree
+        def locked_rmtree(path, *a, **kw):
+            if str(target) in str(path):
+                raise PermissionError(errno.EPERM, "Operation not permitted")
+            return real_rmtree(path, *a, **kw)
+
+        with patch.object(merge.shutil, "rmtree", side_effect=locked_rmtree):
+            res = merge.merge_dispatch(ws, self.thread, run_check=lambda r: {"exit_code": 0})
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["cleanup"]["status"], "pending_retry")
+        self.assertTrue(res["cleanup"]["retryable"])
+        # Merge is NOT rolled back; worktree & branch still present
+        merge_sha = res["merge_sha"]
+        self.assertEqual(worktree.git(self.root, "rev-parse", "HEAD"), merge_sha)
+        self.assertTrue(target.is_dir())
+        self.assertTrue(merge.ref_exists(self.root, f"refs/heads/{meta['branch']}"))
+
+        # Simulate partial failure: worktree removed, then git branch -d locked -> pending_retry
+        real_git = worktree.git
+        def fail_branch_delete(root, *args):
+            if args[:2] == ("branch", "-d"):
+                raise worktree.WorktreeError("cannot lock ref: Permission denied")
+            return real_git(root, *args)
+
+        with patch.object(worktree, "git", side_effect=fail_branch_delete):
+            partial = merge.merge_dispatch(ws, self.thread, run_check=lambda r: self.fail("already checked"))
+        self.assertTrue(partial["already_merged"])
+        self.assertEqual(partial["cleanup"]["status"], "pending_retry")
+        self.assertTrue(partial["cleanup"]["worktree_removed"])
+        self.assertFalse(partial["cleanup"]["branch_deleted"])
+        self.assertFalse(target.exists())
+        self.assertTrue(merge.ref_exists(self.root, f"refs/heads/{meta['branch']}"))
+
+        # Retry the exact same command once lock is released -> finishes deleting branch!
+        retry = merge.merge_dispatch(ws, self.thread, run_check=lambda r: self.fail("already checked"))
+        self.assertTrue(retry["already_merged"])
+        self.assertEqual(retry["cleanup"]["status"], "cleaned")
+        self.assertEqual(worktree.git(self.root, "rev-parse", "HEAD"), merge_sha)
+        self.assertFalse(target.exists())
+        self.assertFalse(merge.ref_exists(self.root, f"refs/heads/{meta['branch']}"))
+
+    def test_prune_merged_cleans_only_merged_dispatches_and_never_deletes_thread(self):
+        ws = cli.Workspace(self.root)
+        # Historical merged dispatch + newer unmerged dispatch in the same thread
+        m1 = self.make_committed_dispatch(dispatch_id="1111111aaaaaaa1111111", worker="codex", title="第一任務")
+        merge.merge_dispatch(ws, self.thread, dispatch_id="1111111aaaaaaa1111111", keep=True, run_check=lambda r: {"exit_code": 0})
+
+        m2 = self.make_committed_dispatch(
+            dispatch_id="2222222bbbbbbb2222222", worker="antigravity", title="第二任務",
+            allowed=["other.py"], edit_file="other.py", edit_text="VALUE = 10\n",
+        )
+
+        # Dry run lists only m1, keeps m2
+        dry = merge.prune_merged_dispatches(ws, [self.thread], yes=False)
+        self.assertTrue(dry["dry_run"])
+        self.assertEqual([c["dispatch_id"] for c in dry["candidates"]], ["1111111aaaaaaa1111111"])
+        self.assertEqual([k["dispatch_id"] for k in dry["kept"]], ["2222222bbbbbbb2222222"])
+        self.assertTrue(Path(m1["worktree"]).is_dir())
+
+        # Execute prune --merged --yes via CLI
+        out = io.StringIO()
+        with patch.dict(os.environ, {cli.NESTED_ENV: ""}), patch("sys.stdout", out):
+            cli.cmd_prune(ws, argparse.Namespace(
+                thread=None, days=30, yes=True, keep_sessions=False, verbose=True, json=False, merged=True,
+            ))
+        # m1 cleaned, m2 intact, thread & manifest preserved!
+        self.assertFalse(Path(m1["worktree"]).exists())
+        self.assertFalse(merge.ref_exists(self.root, f"refs/heads/{m1['branch']}"))
+        self.assertTrue(Path(m2["worktree"]).is_dir())
+        self.assertTrue(merge.ref_exists(self.root, f"refs/heads/{m2['branch']}"))
+        self.assertTrue(self.thread.is_dir())
+        self.assertTrue(Path(m1["manifest"]).is_file())
+        # Thread still protected from thread-deletion because m2 is unmerged!
+        self.assertIn("保留", prune.why_keep(self.thread, cli.load_state(self.thread), None))
+
+        # Now merge & clean m2 -> thread is no longer blocked by prune.why_keep!
+        merge.merge_dispatch(ws, self.thread, dispatch_id="2222222bbbbbbb2222222", run_check=lambda r: {"exit_code": 0})
+        self.assertIsNone(prune.why_keep(self.thread, cli.load_state(self.thread), None))
+        # Thread itself is STILL preserved after merge cleanup
+        self.assertTrue(self.thread.is_dir())
+
+    def test_legacy_agora_branch_supports_resume_finalize_and_merge(self):
+        self.configure_parties()
+        ws = cli.Workspace(self.root)
+        did = "legacy0123456789abcdef"
+        # Create legacy v1 dispatch (agora/<full_id>)
+        meta = worktree.prepare(self.root, did, ["app.py", "demo/*"], self.thread)
+        self.assertEqual(meta["branch"], f"agora/{did}")
+        meta.update(worker="codex", commands={"check": [sys.executable, "-c", "pass"]})
+        worktree.save(meta)
+        self.venv(meta)
+        cli.update_relay(
+            self.thread,
+            **{k: meta.get(k) for k in worktree.FIELDS},
+            allowed_paths=meta["allowed_paths"],
+            worker="codex",
+            status="stopped",
+            pid=99999999,
+            pid_started=123.0,
+        )
+        (self.thread / "control.json").write_text('{"stop_requested": false}', encoding="utf-8")
+
+        # 1. Resume legacy dispatch (keeps agora/<id> name!)
+        resume_args = argparse.Namespace(
+            thread=self.thread.name, sender="claude", to=None, message="繼續", file=None,
+            session=None, from_summary=False, yes=False, tier=None, model=None, effort=None,
+            subagents=None, trigger=None, allow=None, reason="續跑舊分派", user_override=False,
+            dispatch_id=None, resume=did, name=None,
+        )
+        with patch.dict(os.environ, {cli.NESTED_ENV: ""}), patch("sys.stdout", io.StringIO()), \
+                patch.object(cli, "party_usage", return_value={"remaining_pct": 80, "updated_at": time.time()}), \
+                patch.object(cli.quota, "blocked", return_value=None), \
+                patch.object(cli.models, "CACHE", self.root / "models.json"), \
+                patch.object(cli.jobs, "spawn", return_value=77777777), \
+                patch.object(cli.jobs, "pid_started", return_value=789.0):
+            cli.cmd_assign(ws, resume_args)
+        self.assertEqual(cli.load_state(self.thread)["relay"]["branch"], f"agora/{did}")
+        cli.update_relay(self.thread, status="stopped")
+
+        # 2. Finalize legacy dispatch
+        self.modify(meta, "app.py", "VALUE = 42\n")
+        self.message(meta)
+        with patch.dict(os.environ, {cli.NESTED_ENV: ""}), patch("sys.stdout", io.StringIO()), \
+                patch.object(cli, "run_task_check", return_value={"exit_code": 0, "output_tail": "OK"}):
+            cli.cmd_finalize(ws, argparse.Namespace(thread=self.thread.name, dispatch_id=did))
+        saved = self.read_meta(meta)
+        self.assertEqual(saved["commit_status"], "committed")
+        self.assertEqual(saved["branch"], f"agora/{did}")
+
+        # 3. Merge & clean legacy dispatch
+        res = merge.merge_dispatch(ws, self.thread, dispatch_id=did, run_check=lambda r: {"exit_code": 0})
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["cleanup"]["status"], "cleaned")
+        self.assertEqual((self.root / "app.py").read_text(encoding="utf-8"), "VALUE = 42\n")
+        self.assertFalse(Path(meta["worktree"]).exists())
+        self.assertFalse(merge.ref_exists(self.root, f"refs/heads/agora/{did}"))
+
+    def test_cli_parsing_and_completions_description(self):
+        with patch.object(cli, "cmd_merge") as mock_merge:
+            cli.main(["--workspace", str(self.root), "merge", "t1", "--dispatch-id", "d1", "--keep"])
+        parsed = mock_merge.call_args.args[1]
+        self.assertEqual((parsed.thread, parsed.dispatch_id, parsed.keep), ("t1", "d1", True))
+
+        with patch.object(cli, "cmd_prune") as mock_prune:
+            cli.main(["--workspace", str(self.root), "prune", "--merged", "--yes"])
+        self.assertTrue(mock_prune.call_args.args[1].merged)
+        self.assertTrue(mock_prune.call_args.args[1].yes)
+
+        with patch.object(cli, "cmd_assign") as mock_assign:
+            cli.main(["--workspace", str(self.root), "assign", "t1", "--from", "claude", "--allow", "app.py",
+                      "--name", "feat-x", "--message", "hi"])
+        self.assertEqual(mock_assign.call_args.args[1].name, "feat-x")
+
+        desc = completions.describe({
+            "id": "x" * 12,
+            "thread": "t1",
+            "topic": "測試",
+            "type": "relay",
+            "dispatch_id": "abcdef0123456789",
+            "status": "done",
+            "branch": "agy/測試-abcdef0",
+            "commit_sha": "a" * 40,
+            "commit_status": "committed",
+        })
+        self.assertIn("branch=agy/測試-abcdef0", desc)
+        self.assertIn("agora merge t1", desc)
+
+
+if __name__ == "__main__":
+    unittest.main()
