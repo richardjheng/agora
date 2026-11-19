@@ -51,7 +51,7 @@ def event(thread, kind, record, topic=""):
     key = hashlib.sha256(json.dumps([thread.name, kind, identity], ensure_ascii=False).encode()).hexdigest()
     return {"id": key, "thread": thread.name, "topic": topic, "type": kind,
             **{k: record.get(k) for k in ("dispatch_id", "job_id", "worker", "kind", "status", "branch",
-                                         "commit_sha", "commit_status", "error", "blocked_reason")}}
+                                         "commit_sha", "commit_status", "error", "blocked_reason", "baseline_comparison")}}
 
 
 def archive(thread, kind, record, topic=""):
@@ -161,6 +161,7 @@ def one_line(value):
 
 
 def describe(item):
+    from agoralib import baseline
     kind = "分派" if item["type"] == "relay" else "討論"
     identity = item.get("dispatch_id") or item.get("job_id") or item["id"][:12]
     status = item["status"]
@@ -180,4 +181,5 @@ def describe(item):
                f"（{item.get('commit_status') or '未提交'}）")
     error = item.get("blocked_reason") or item.get("error")
     return one_line(f"{kind} {item['thread']} / {identity}｜{item.get('topic') or ''}｜{status}｜{details}"
-                    + (f"｜{error}" if error else "") + f"｜下一步：{next_step}")
+                    + (f"｜{error}" if error else "") + f"｜下一步：{next_step}"
+                    + ("｜" + baseline.describe(item) if item.get("baseline_comparison") else ""))

@@ -241,6 +241,23 @@ class FinalizeTests(unittest.TestCase):
         self.assertIsNone(self.read_meta(meta)["commit_sha"])
         self.assertEqual(cli.load_state(self.thread)["relay"]["status"], "stopped")
 
+    def test_stop_during_final_tree_check_prevents_ref_update(self):
+        meta = self.retained()
+        real = worktree.task_tree
+        calls = 0
+
+        def task_tree(task):
+            nonlocal calls
+            tree = real(task)
+            calls += 1
+            if calls == 3:  # The last tree comparison immediately before update-ref.
+                self.control(True, "stop-during-tree-check")
+            return tree
+
+        with patch.object(worktree, "task_tree", side_effect=task_tree):
+            self.refused("已要求停止")
+        self.assertEqual(worktree.git(Path(meta["worktree"]), "rev-parse", "HEAD"), meta["base_sha"])
+
     def test_corrupt_control_fails_closed_before_or_during_finalize(self):
         meta = self.retained()
         path = self.thread / "control.json"

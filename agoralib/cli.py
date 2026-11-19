@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 from agoralib import __version__, checkqueue, completions, config, jobs, models, prune, quota, routing, shares, snapshot, worktree
+from agoralib import baseline as failure_baseline
 from agoralib.parties import (AGORA_ROOT as AGORA_ROOT_DIR, AI_PARTIES, CALLERS, HUMAN, NAMES,
                               LOCKED_ENV, NESTED_ENV, CallError, Live, agora_cmd, canonical,
                               STREAM_INTERRUPTED, no_space_path, quote_path, AGY_SUBAGENT_TOOLS)
@@ -1249,9 +1250,11 @@ def _cmd_resume_locked(ws: Workspace, args):
                 added_paths = worktree.extend_scope(meta, allow_arg, reason, owner, at=now_str())
             else:
                 added_paths = []
-                if meta.get("commit_status") in ("failed", "check_failed", "no_changes"):
+                if meta.get("commit_status") in ("failed", "check_failed", "check_failed_preexisting", "no_changes"):
                     meta["commit_status"] = "pending"
                     meta.pop("error", None)
+            meta.pop("preexisting_approval", None)
+            meta.pop("baseline_comparison", None)
             meta["worker"] = worker
             cleared_stop = record_stop_clearance(meta, control, "resume")
             worktree.save(meta)  # Save scope_extensions & stop_clearances before clearing stop_requested.
@@ -1555,12 +1558,21 @@ def finish_finalize(thread: Path, relay: dict, meta: dict, error=None):
         archive_relay(thread, result)
         completions.archive(thread, "relay", result, state.get("topic", ""))
     detail = str(error) if error else f"branch：{meta['branch']}；commit：{meta.get('commit_sha') or meta.get('commit_status')}"
+    summary = failure_baseline.describe(meta)
+    if summary and not error:
+        detail += "\n" + summary
     append_progress(thread, "finalize", f"分派：{meta['dispatch_id']}；{detail}")
 
 
 def cmd_finalize(ws: Workspace, args):
     """Host-only recovery of retained work, always through the checked commit path."""
     guard_nested()
+    accept = getattr(args, "accept_preexisting", False)
+    reason = getattr(args, "reason", None)
+    if accept and not (reason or "").strip():
+        sys.exit("--accept-preexisting 必須提供非空的 --reason")
+    if reason and not accept:
+        sys.exit("--reason 必須搭配 --accept-preexisting")
     thread = ws.resolve_thread(args.thread)
     started = False
     relay = None
@@ -1594,7 +1606,9 @@ def cmd_finalize(ws: Workspace, args):
                 archive_relay(thread, relay)
                 started = True
         if started:
-            meta = worktree.finalize(meta, run_task_check, lambda: not stop_requested(thread))
+            meta = worktree.finalize(meta, run_task_check, lambda: not stop_requested(thread),
+                                    accept_preexisting=accept, reason=reason,
+                                    sender=getattr(args, "sender", None) or relay.get("from") or HUMAN)
         finish_finalize(thread, relay, meta)
     except (worktree.WorktreeError, OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
         if started:
@@ -2120,7 +2134,9 @@ def cmd_work(ws: Workspace, args):
                     append_progress(thread, "Agora 驗證與提交", json.dumps(
                         {k: task.get(k) for k in worktree.FIELDS}, ensure_ascii=False))
                 except (worktree.WorktreeError, snapshot.SnapshotError, OSError, subprocess.SubprocessError) as exc:
-                    task.update(commit_status="failed", error=str(exc))
+                    task.update(error=str(exc))
+                    if task.get("commit_status") not in ("check_failed", "check_failed_preexisting"):
+                        task["commit_status"] = "failed"
                     worktree.save(task)
                     update_relay(thread, status="stopped" if stop_requested(thread) else "failed", error=str(exc),
                                  **{k: task.get(k) for k in worktree.FIELDS})
@@ -2214,6 +2230,8 @@ def cmd_status(ws: Workspace, args):
                           "warning": unverified_warning(relay), "last_progress": blocks[-1].strip() if blocks else None,
                           "resume_count": relay.get("resume_count") or 0, "resumes": relay.get("resumes") or [],
                           "requested_scope": req_scope, "resume_hint": scope_hint,
+                          "baseline_comparison": relay.get("baseline_comparison"),
+                          "failure_summary": failure_baseline.describe({**relay, "thread": str(thread)}),
                           **relay_model_fields(relay), "exit_code": code}, ensure_ascii=False, indent=2))
     else:
         if timed_out:
@@ -2226,6 +2244,9 @@ def cmd_status(ws: Workspace, args):
         if relay.get("worktree"):
             print(f"分派：{relay.get('dispatch_id')}｜branch：{relay.get('branch')}｜worktree：{relay['worktree']}")
             print(f"提交：{relay.get('commit_status')}｜{relay.get('commit_sha') or '尚無 commit'}")
+            summary = failure_baseline.describe({**relay, "thread": str(thread)})
+            if summary:
+                print(summary)
         if relay.get("status") == "blocked":
             print(f"⛔ 需要人工處理：{NAMES[relay['worker']]} {relay.get('blocked_reason') or ''}".rstrip())
         if relay.get("error") and not alive:
@@ -2402,15 +2423,29 @@ def active_task(ws: Workspace):
 def run_task_check(meta):
     env = worktree.environment(meta)
     env[LOCKED_ENV] = json.dumps(meta["commands"], ensure_ascii=False)
+    record = Path(meta["manifest"]).parent / ("check-" + uuid.uuid4().hex + ".json")
+    env[failure_baseline.RECORD_ENV] = str(record)
     command = [str(worktree.python_path(Path(meta["worktree"]))), str(AGORA_ROOT_DIR / "agora.py"),
                "--workspace", meta["worktree"], "check"]
     proc = subprocess.run(command, cwd=meta["worktree"], env=env, capture_output=True, text=True,
                           encoding="utf-8", errors="replace", **quota.NO_WINDOW)
     output = proc.stdout + proc.stderr
-    record = Path(meta["manifest"]).parent / "check.log"
-    record.write_text(output, encoding="utf-8")
-    return {"exit_code": proc.returncode, "command": command, "log": str(record), "time": now_str(),
-            "output_tail": output[-3000:]}
+    evidence = completions.read_object(record)
+    # Preserve the child's environment checks (including missing pytest). Freeze
+    # only the command that actually ran, never a parent's fallback detection.
+    if not meta["commands"].get("check") and evidence.get("complete"):
+        meta["commands"]["check"] = evidence.get("check_command")
+        worktree.save(meta)
+    raw = evidence.get("output", output)
+    log = record.with_suffix(".log")
+    log.write_text(output, encoding="utf-8")
+    test_log = record.with_suffix(".tests.log")
+    test_log.write_text(raw, encoding="utf-8")
+    (record.parent / "check.log").write_text(output, encoding="utf-8")
+    return {"exit_code": proc.returncode, "command": command, "log": str(log), "time": now_str(),
+            "test_log": str(test_log),
+            "output_tail": output[-3000:], "complete": evidence.get("complete", False),
+            "syntax_errors": evidence.get("syntax_errors"), "test_exit_code": evidence.get("exit_code")}
 
 
 def cmd_build(ws: Workspace, args):
@@ -2499,6 +2534,10 @@ def cmd_check(ws: Workspace, args):
         sys.exit(f"驗證槽位目錄不可寫：{checkqueue.slots_dir(control_root)}（{e}）；未執行測試。")
     except ValueError as e:
         sys.exit(str(e))
+    if os.getenv(failure_baseline.RECORD_ENV):
+        completions.atomic_write(Path(os.environ[failure_baseline.RECORD_ENV]), {
+            "complete": True, "syntax_errors": len(errors), "exit_code": proc.returncode,
+            "check_command": check, "output": proc.stdout + proc.stderr})
     keep, in_failure = [], False
     for line in proc.stderr.splitlines() + proc.stdout.splitlines():
         if line.startswith(("ERROR:", "FAIL:")):
@@ -3422,6 +3461,9 @@ def main(argv=None):
     p = sub.add_parser("finalize", help="接手程序結束後，重新完整驗證保留成果並由 Agora 提交")
     p.add_argument("thread")
     p.add_argument("--dispatch-id", help="收尾指定的隔離分派；預設最近一次")
+    p.add_argument("--accept-preexisting", action="store_true", help="主持方明確核准所有已證實的既有失敗；仍須完整驗證")
+    p.add_argument("--reason", help="核准既有失敗的理由（--accept-preexisting 必填）")
+    p.add_argument("--from", dest="sender", choices=who, help="記錄核准主持方；預設分派發起方")
     p.set_defaults(func=cmd_finalize)
 
     p = sub.add_parser("recall", help="請接手方在下一個檢查點暫停")

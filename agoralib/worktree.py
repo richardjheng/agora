@@ -22,7 +22,8 @@ WORK_ENV = "AGORA_WORKTREE"
 DISPATCH_ENV = "AGORA_DISPATCH_ID"
 MANIFEST_ENV = "AGORA_DISPATCH_MANIFEST"
 FIELDS = ("dispatch_id", "source_branch", "base_sha", "branch", "worktree", "control_root",
-          "manifest", "commit_message", "check_result", "commit_sha", "commit_status", "environment_status")
+          "manifest", "commit_message", "check_result", "commit_sha", "commit_status", "environment_status",
+          "baseline_comparison", "preexisting_approval")
 
 
 class WorktreeError(RuntimeError):
@@ -110,6 +111,8 @@ def extend_scope(meta, values, reason, by, at=""):
     })
     meta["check_result"] = None
     meta["checked_tree"] = None
+    meta.pop("preexisting_approval", None)
+    meta.pop("baseline_comparison", None)
     meta["commit_status"] = "pending"
     return added
 
@@ -332,19 +335,29 @@ def recover_commit(meta):
     if head != meta["base_sha"] and not meta.get("commit_sha"):
         body = git(target, "show", "-s", "--format=%B", "HEAD")
         parent = git(target, "rev-parse", "HEAD^")
+        from agoralib import baseline
+        approved = baseline.approval_valid(meta, git(target, "rev-parse", "HEAD^{tree}"))
+        if approved:
+            approval = meta["preexisting_approval"]
+            approved = ("Agora-Preexisting-Failures: " + ", ".join(approval["ids"]) in body.splitlines()
+                        and f"Agora-Approval: by={approval['by']} reason={approval['reason']}" in body.splitlines())
         if (f"Agora-Dispatch: {meta['dispatch_id']}" in body and parent == meta["base_sha"]
-                and (meta.get("check_result") or {}).get("exit_code") == 0
+                and ((meta.get("check_result") or {}).get("exit_code") == 0
+                     or approved)
                 and meta.get("checked_tree") == git(target, "rev-parse", "HEAD^{tree}")):
             meta.update(commit_sha=head, commit_status="committed")
             save(meta)
 
 
-def finalize(meta, run_check, can_commit=lambda: True):
+def finalize(meta, run_check, can_commit=lambda: True, *, accept_preexisting=False, reason=None, sender="human"):
     """Called only after the CLI process has exited; commit the exact checked tree.
 
-    A failing/not-run check never commits. A private index and commit-tree bind the
-    check to immutable content. A crash after update-ref is recovered by its trailer.
+    Failed checks require complete base evidence and explicit host approval.
+    A private index binds verification and approval to immutable content.
     """
+    from agoralib import baseline
+    if accept_preexisting and (not reason or not reason.strip()):
+        raise WorktreeError("--accept-preexisting 必須提供非空的 --reason")
     recover_commit(meta)
     target = validate(meta)
     if meta.get("commit_sha"):
@@ -355,6 +368,10 @@ def finalize(meta, run_check, can_commit=lambda: True):
     if not message:
         raise WorktreeError("缺少提交說明：請交代任務目的與測試範圍")
     tree = task_tree(meta)
+    previous_tree = meta.get("checked_tree")
+    previous_comparison = meta.get("baseline_comparison")
+    meta.pop("preexisting_approval", None)
+    meta.pop("baseline_comparison", None)
     meta.update(commit_status="checking", checked_tree=tree)
     save(meta)
     result = run_check(meta)
@@ -362,12 +379,37 @@ def finalize(meta, run_check, can_commit=lambda: True):
     meta["commit_status"] = "check_failed" if result.get("exit_code") != 0 else "checked"
     save(meta)
     if result.get("exit_code") != 0:
-        raise WorktreeError("agora check 失敗或未執行，成果保留但不提交")
+        meta["baseline_comparison"] = baseline.compare(meta, result, can_commit)
+        all_preexisting = baseline.eligible(meta["baseline_comparison"])
+        meta["commit_status"] = "check_failed_preexisting" if all_preexisting else "check_failed"
+        save(meta)
+        if not accept_preexisting or not all_preexisting:
+            raise WorktreeError("agora check 失敗或未執行，成果保留但不提交\n" + baseline.describe(meta))
+        # An approval request made against old content cannot authorize new content,
+        # even if its fresh check also fails. The host must review that new result.
+        if previous_tree and previous_tree != tree:
+            raise WorktreeError("worktree 已改變，舊核准失效；已重新驗證，請審查後再次核准\n" + baseline.describe(meta))
+        if previous_comparison and (
+                previous_comparison.get("commands") != meta.get("commands")
+                or sorted(previous_comparison.get("classifications", {})) != sorted(meta["baseline_comparison"]["classifications"])):
+            raise WorktreeError("凍結指令或失敗 ID 集合改變，核准失效；請審查新結果後再次核准\n" + baseline.describe(meta))
     if not can_commit():
         raise WorktreeError("已要求停止，成果保留但不提交")
     checked_paths(meta)
     if task_tree(meta) != tree:
+        meta.pop("preexisting_approval", None)
+        meta["commit_status"] = "check_failed"
+        save(meta)
         raise WorktreeError("check 期間程式碼改變，拒絕提交與驗證不符的內容")
+    if result.get("exit_code") != 0:
+        comparison = meta["baseline_comparison"]
+        approval = {"time": baseline.now(), "by": " ".join(sender.split()), "reason": " ".join(reason.split()),
+                    "checked_tree": tree, "commands": meta.get("commands"),
+                    "ids": sorted(comparison["classifications"]), "comparison_hash": baseline.digest(comparison),
+                    "base": comparison["base"], "dispatch": comparison["dispatch"]}
+        meta["preexisting_approval"] = approval
+        meta.setdefault("preexisting_approvals", []).append(approval)
+        save(meta)
     if tree == git(target, "rev-parse", "HEAD^{tree}"):
         meta["commit_status"] = "no_changes"
         save(meta)
@@ -376,11 +418,22 @@ def finalize(meta, run_check, can_commit=lambda: True):
     body = (message + f"\n\nAgora-Dispatch: {meta['dispatch_id']}\nAgora-Base: {meta['base_sha']}"
             + f"\nAgora-Check: exit={result['exit_code']}; record-sha256={check_hash}\n"
             + "\n" + result.get("output_tail", ""))
+    if result.get("exit_code") != 0:
+        approval = meta["preexisting_approval"]
+        body += ("\n\nAgora-Preexisting-Failures: " + ", ".join(approval["ids"])
+                 + f"\nAgora-Approval: by={approval['by']} reason={approval['reason']}\n")
     with tempfile.TemporaryDirectory(prefix="agora-commit-") as tmp:
         msg = Path(tmp) / "message.txt"
         msg.write_text(body, encoding="utf-8")
         commit = git(target, "commit-tree", tree, "-p", meta["base_sha"], "-F", str(msg))
     # Compare-and-swap: never overwrite a branch moved by somebody else.
+    if not can_commit():
+        raise WorktreeError("已要求停止，成果保留但不提交")
+    if task_tree(meta) != tree:
+        meta.pop("preexisting_approval", None)
+        meta["commit_status"] = "check_failed"
+        save(meta)
+        raise WorktreeError("提交前 worktree 已改變，核准失效，必須重新驗證")
     if not can_commit():
         raise WorktreeError("已要求停止，成果保留但不提交")
     git(target, "update-ref", f"refs/heads/{meta['branch']}", commit, meta["base_sha"])

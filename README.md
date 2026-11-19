@@ -134,9 +134,20 @@ VSCode 面板分派狀態與終端皆會顯示獨立 branch、worktree 位置與
 停止、暫停或驗證失敗後，若成果仍保留在隔離 worktree，主持方可在主工作區執行
 `agora finalize <討論串> [--dispatch-id <分派ID>]`（預設最近一次）。接手程序必須已結束，
 且分派目錄的 `commit-message.md` 必須寫明任務目的與測試範圍。finalize 一定重跑完整驗證，
-不提供跳過驗證或接受失敗的選項；範圍不符、驗證失敗或新停止要求都不提交，也不刪除或搬移成果。
+不提供跳過驗證；範圍不符、新失敗或新停止要求都不提交，也不刪除或搬移成果。
 舊停止要求會在確認程序結束後解除並記入 manifest；執行中仍可用 `recall` 再次停止。
 已提交的分派再次 finalize 只回報既有 SHA。這是主持方的收尾指令，不加入接手方的指令白名單。
+
+驗證失敗時才做基準比較：支援一般 `python -m unittest discover -s tests`、`python -m pytest -q`
+（或 `pytest -q`）指令，在分派起點的 detached worktree 與分派工作區各只重跑失敗項目一次，使用分派 `.venv` 並經驗證排隊。
+首次失敗完整保留，分類為「新失敗」「既有失敗」「不穩定」「無法比對」；收集／匯入失敗、截斷輸出、複合 shell 或不支援的測試選項均不可核准。
+**只有全部為既有失敗**時，主持方審查後可執行
+`agora finalize <討論串> [--dispatch-id <分派ID>] --accept-preexisting --reason "已核對起點；修復安排" [--from claude]`。
+這仍重跑完整驗證；不穩定或未知失敗不能當成通過。核准綁定 tree、凍結指令與失敗 ID，程式碼再改動須重新驗證與核准。
+manifest 保存兩份診斷結果、時間、log 及核准理由；commit 記錄 `Agora-Preexisting-Failures` 與 `Agora-Approval` trailer。
+基準結果快取包含 base SHA、凍結指令、失敗 ID 集合與依賴檔指紋，分派重跑不使用快取；`status`、`watch`／hook 與進度檔會列出分類及可用核准指令，絕不自動核准。
+
+開發測試若目前 Python 沒有 pytest，可用環境變數 `AGORA_TEST_PYTEST_SITE` 指向相容 Python 的既有 `site-packages`（不含外部 editable 專案），再執行 `agora check`；測試僅讓暫存 venv 引用現成依賴，不會安裝套件。沒有可用 pytest 時會明確跳過兩項 pytest 整合測試，不能將跳過當成 pytest 實測通過。
 
 若停止、暫停或驗證失敗後需要繼續修改（而非直接收尾），主持方可在主工作區執行
 `agora assign <討論串> --resume <分派ID> --from <你> [--allow 新增路徑 --reason 理由] [--to <AI>] [--file／--message 補充說明]`：
