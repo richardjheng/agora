@@ -9,8 +9,8 @@
 - 每個 AI 都透過自己的非互動 CLI 被呼叫：`claude -p`、`agy -p`、`codex exec`。
 - 一個**討論串**對每個 AI 各保留一段對話；有人發言時，工具把對方還沒看過的訊息一次轉過去。
 - 討論串存在**目標專案**的 `.agora/threads/<id>/`：`transcript.md` 給人看，`state.json` 給程式用。
-- **分派工作**時，接手方在獨立建立的 branch（`agora/<分派 ID>`）與 git worktree（位於 `.agora/worktrees/<分派 ID>`）中執行：程式碼修改與建置輸出留在各自 worktree，各 worktree 建立獨立 `.venv` 並驗證程式碼載入來源；控制資料（進度檔 `progress.md`、`control.json`、`.agora/` 設定）維持在主工作區。每完成一小步就寫 `progress.md`、檢查是否被叫停、檢查自己的額度；額度用完會等重置後繼續。
-- **由 Agora 代為 commit**：接手方完成後將 commit 訊息寫成檔案，宣告完成後由 Agora 核對分派、branch、檔案範圍並執行實際 `agora check`，附上真實結果後代為 commit。本期不自動 push / merge，成果保留由使用者另行指派 merge。
+- **分派工作**時，接手方在獨立建立的 branch（`<ai>/<slug>-<7 碼分派 ID>`，前綴依接手方為 `claude/`、`codex/`、`agy/`，預設取討論串標題並可用 `assign --name` 覆寫；舊分派 `agora/<分派 ID>` 原樣相容）與 git worktree（位於 `.agora/worktrees/<完整分派 ID>`）中執行：程式碼修改與建置輸出留在各自 worktree，各 worktree 建立獨立 `.venv` 並驗證程式碼載入來源；控制資料（進度檔 `progress.md`、`control.json`、`.agora/` 設定）維持在主工作區。每完成一小步就寫 `progress.md`、檢查是否被叫停、檢查自己的額度；額度用完會等重置後繼續。
+- **由 Agora 代為 commit，並由 `agora merge` 受控合併**：接手方完成後將 commit 訊息寫成檔案，宣告完成後由 Agora 核對分派、branch、檔案範圍並執行實際 `agora check`，附上真實結果後代為 commit。分派與收尾不自動 push / merge；僅在**使用者明確同意**後，由主持方於主工作區執行 `agora merge <討論串>`（`--no-ff` 保留分岔、主工作區整合驗證，通過後預設清理 worktree 與分支）。
 - **主動回報與完成通知規則**：發起背景討論、總結或分派時，必須設好完成通知（例如以背景執行 `agora watch`，或 `agora wait`、`agora status --wait`），結束後主動向使用者回報結論與下一步，不等使用者問；說了「完成後會給你看」就一定要做到。詳見[背景通知與回報機制](#背景通知與回報機制watch-與-hook-補報)。
 - 回覆進行中的內容（文字、讀檔與執行指令等動作）即時寫到討論串的 `live/discussion.md`、`live/work.md`，動作也會顯示在終端；完成後才正式寫進逐字稿並刪除暫存檔，中途停止的回覆不會寫入。
 - 討論時若某一方用了不被允許的工具或終端指令而整輪中斷，會提醒它改用讀檔工具、接續同一段對話重試一次；仍失敗時記進逐字稿，並繼續請其他 AI 回覆。
@@ -89,13 +89,14 @@ $A send <id> --from claude --blind --file q.md      # 獨立作答：各方看�
 $A send <id> --from human --message "..."           # 使用者插話（只記錄，下次轉給 AI）
 $A reply <id> --party antigravity                   # 不發言，直接請某方回覆
 $A auto <id> --rounds 6 [--order codex,claude]      # AI 依序自動發言（各方都表示【已達成共識】時提前結束）
-$A assign <id> --from claude [--tier standard] [--to codex --reason "指定理由"] --allow "src/**" [--allow ...] --file 工作單.md   # 分派工作（--to 留空則依比例輪流挑選）
+$A assign <id> --from claude [--tier standard] [--to codex --reason "指定理由"] [--name slug] --allow "src/**" [--allow ...] --file 工作單.md   # 分派工作（--to 留空則依比例輪流挑選）
 $A assign <id> --resume <分派ID> --from claude [--allow "新路徑" --reason "理由"] [--to <AI>] [--message "補充"]  # 沿用原 branch/worktree 續跑未提交的分派
 $A summarize <id> --by claude                       # 用新對話讀完整逐字稿，產出共識、取捨、異議與工作單（summary.md）
 $A assign <id> --from human --from-summary --allow "src/**" [--yes]  # 用總結的工作單分派；總結過期時要 --yes 確認
 $A status <id> [--wait 900] [--json]                # 分派狀態與最新進度（見下方 exit code）
 $A changes <id> [--json]                            # 分派期間的變更（相對於分派當下的工作區快照）
 $A finalize <id> [--dispatch-id <分派ID>]             # 程序結束後，完整驗證保留成果並提交
+$A merge <id> [--dispatch-id <分派ID>] [--keep]       # 使用者同意後，以 --no-ff 合併分支、整合驗證並預設清理
 $A recall <id> [--wait [秒數]]                       # 請接手方停止；--wait 等到真的停止（預設最多 600 秒）
 $A check                                            # 工作區驗證（語法檢查＋測試）
 $A build                                            # 專案建置（.agora/config.json 的 build 指令）
@@ -108,7 +109,8 @@ $A wait <id>                                        # 接上背景進行中的�
 $A stop <id>                                        # 停止進行中的討論
 $A list / show <id> --last 3
 $A prune [--days 30] [--verbose]                    # 列出不再需要的討論串（不會刪除）
-$A prune --yes [--keep-sessions]                    # 確認刪除
+$A prune --yes [--keep-sessions]                    # 確認刪除討論串
+$A prune --merged [--thread <id>] [--yes]           # 只清理已合併但未清的分派 worktree 與分支（不刪討論串）
 $A keep <id> [--off]                                # 標記保留，prune 不會清理
 ```
 
@@ -373,8 +375,10 @@ VSCode 面板各 AI 卡片底端與 `agora parties --json`（頂層 `usage` 欄�
 
 - 超過 `--days` 天（預設 30）沒有任何活動
 - 沒有標記保留（`keep`）
-- 沒有分派工作，或分派的工作已完成；暫停、失敗、等待中的都保留
+- 沒有分派工作，或分派的工作已完成（隔離分派須已合併並已清理）；暫停、失敗、等待中、尚未合併清理的都保留
 - 目前沒有人在使用
+
+另提供 `agora prune --merged [--thread <id>] [--yes]`，專門清理**已合併但未清理**的分派 worktree 與分支（預設只列出，加 `--yes` 執行），只清理分派資源、**不刪除討論串與控制紀錄**；僅自動刪除可重建產物（`.venv`、`__pycache__`、`*.pyc` 與 manifest 記錄的 `build_outputs`），有未知檔案或未提交變更時不清理並列出檔案。
 
 刪除討論串時，會一併刪除 Agora 為它在各 CLI 開的對話紀錄（`--keep-sessions` 可保留）；使用者用 `--session` 帶進來的對話不會刪：
 
@@ -394,15 +398,15 @@ VSCode 面板各 AI 卡片底端與 `agora parties --json`（頂層 `usage` 欄�
 
 - **Branch 與 Worktree 實體隔離**：
   - 分派時檢查來源 branch：若處於 detached HEAD 則停止分派；有未 commit 修改時予以提醒（新 worktree 從記錄的 HEAD/base SHA 建立，不會帶入來源未 commit 的修改）。記錄來源 branch 與 base SHA。
-  - 每次分派建立 `agora/<分派 ID>` branch 與獨立 git worktree（位於 `.agora/worktrees/<分派 ID>`，同 AI 多任務各一份）；若同名資源已存在則停止，不覆蓋。
+  - 每次新分派建立 `<ai>/<slug>-<7 碼分派 ID>` branch（前綴 `claude/`、`codex/`、`agy/`；slug 預設取討論串標題並保留中英數、其他轉 `-`、最多 30 字、空值用 `task`，可用 `assign --name` 覆寫；7 碼碰撞自動延長 ID 並經 `git check-ref-format --branch` 驗證；改派續跑不改名；舊分派 `agora/<完整 ID>` 原樣相容）與獨立 git worktree（位於 `.agora/worktrees/<完整分派 ID>`，同 AI 多任務各一份）；若同名資源已存在則停止，不覆蓋。
 - **工作目錄與控制資料分離**：
   - 接手 CLI 的工作目錄設為對應 worktree，程式碼與建置輸出留在各自 worktree。
   - 控制資料（進度檔 `progress.md`、`control.json`、`.agora/` 設定）維持在主工作區，集中管理不分散。
   - 各 worktree 建立獨立 `.venv` 並安裝依賴，偵測 editable install 與 `PYTHONPATH` 是否指回主目錄，確認 `agora check` 載入的是該 worktree 的程式碼。
-- **由 Agora 代為 Commit**：
+- **由 Agora 代為 Commit，並以 `agora merge` 受控合併與清理**：
   - 接手方的書面界線：只改工作單範圍、不自行 commit/push/merge、不碰 `.env`、不做影響外部系統的動作。
   - 接手方把 commit 訊息（任務目的、測試範圍）寫成檔案；宣告完成後由 Agora 核對分派、branch、檔案範圍，執行實際 `agora check`，附上真實結果後代為 commit。
-  - 本期完成後只 commit，不自動 push / merge，成果保留由使用者另行指派 merge。
+  - 分派與收尾不自動 push / merge；僅在使用者明確要求時，由主持方於主工作區執行 `agora merge <討論串> [--dispatch-id <ID>] [--keep]`：檢查程序已停止、`commit_status=committed` 且分支 SHA 吻合、主工作區位於 `source_branch`、無未提交的已追蹤變更與進行中 Git 操作；以 `git merge --no-ff` 合併（衝突即 `merge --abort` 並回報，不清理）並在主工作區執行一次 `agora check` 整合驗證（失敗不回滾合併且不清理）；驗證通過後預設先移除 worktree 再 `git branch -d`（`--keep` 跳過），僅自動刪除可重建產物，遇未知檔阻擋、遇 Windows 鎖定（EPERM）記為待重試可重試，控制紀錄含 SHA 完整保留。
 - **固定基準審查**：`agora changes` 與審查比對基準改為固定 `base SHA...branch`，避免基準漂移。
 - **確認程序結束才可清理**：未 merge 的成果、branch 與 worktree 均妥善保留，停止或中斷時不會提前清理。
 - hook 與會自動執行指令的設定（`.claude/settings*.json`、`.agents/hooks.json`、`.codex/config.toml`、`.codex/hooks.json`、`.vscode/tasks.json`、git hooks）改了等於繞過指令白名單：Claude 接手時直接禁止編輯 `.claude/`、`.agents/`、`.codex/`、`.git/` 與 `.vscode/tasks.json`；每輪結束時這些檔案被新增、修改或刪除都會還原，並記在逐字稿。
@@ -480,6 +484,8 @@ VSCode 面板各 AI 卡片底端與 `agora parties --json`（頂層 `usage` 欄�
 agora.py               進入點
 pyproject.toml         pip 套件設定（agora 指令）
 agoralib/cli.py        討論、分派、狀態、驗證
+agoralib/worktree.py   隔離分派分支命名、worktree 與代為提交
+agoralib/merge.py      受控 --no-ff 合併、整合驗證與合併後清理
 agoralib/config.py     工作區設定（參與的 AI、模型、推理強度、分配比例）
 agoralib/shares.py     依分配比例挑選接手方、記錄接手輪數
 agoralib/snapshot.py   分派基準快照與分派期間的變更

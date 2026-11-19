@@ -65,8 +65,10 @@ def why_keep(thread: Path, state: dict, days: Optional[float]) -> Optional[str]:
     relay = state.get("relay")
     if relay and jobs.alive(relay):
         return "分派程序尚未退出"
-    if relay and relay.get("worktree"):
-        return "保留隔離分派成果與控制紀錄；merge／清理須另行指派"
+    from agoralib import merge
+    dispatch_reason = merge.thread_dispatch_keep_reason(thread, state)
+    if dispatch_reason:
+        return dispatch_reason
     if relay and relay.get("status") not in FINISHED_RELAY:
         return f"分派的工作尚未完成（{relay.get('status')}）"
     if (thread / ".lock").exists():
