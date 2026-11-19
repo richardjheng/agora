@@ -28,7 +28,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from agoralib import __version__, completions, config, jobs, models, prune, quota, routing, shares, snapshot, worktree
+from agoralib import __version__, checkqueue, completions, config, jobs, models, prune, quota, routing, shares, snapshot, worktree
 from agoralib.parties import (AGORA_ROOT as AGORA_ROOT_DIR, AI_PARTIES, CALLERS, HUMAN, NAMES,
                               LOCKED_ENV, NESTED_ENV, CallError, Live, agora_cmd, canonical,
                               STREAM_INTERRUPTED, no_space_path, quote_path, AGY_SUBAGENT_TOOLS)
@@ -78,6 +78,7 @@ WORK_PREAMBLE = """\
 2. 讀 {control}；若 "stop_requested" 為 true，把交接說明寫進進度檔後結束這一輪，最後一行寫「【已暫停】」。
 3. 執行 `{agora} quota`；若你（{me}）的額度低於 {threshold:.0f}%，把交接說明寫進進度檔後結束，最後一行寫「【額度不足】」。
 全部完成時，執行 {finish_cmds}，在進度檔寫總結，回覆最後一行寫「【工作完成】」。
+執行 `{agora} check` 時可能因其他分派正在驗證而排隊，或測試本身耗時很長；排隊或執行中不要中斷，也不要因為耗時久就改判失敗。
 這次的等級：{tier_line}。若判斷這個等級（模型）不足以完成，不要勉強：在進度檔寫明理由，回覆最後一行寫「【需要升級】」後結束。
 
 以下是 {owner} 的工作單：
@@ -121,7 +122,7 @@ FILE_RULES = {"codex": "Codex 沒有內建的讀檔工具：列目錄、讀檔�
 CONTINUE_PROMPT = """\
 【Agora 工作分派・繼續】
 請先讀 {progress} 與 {control}，從上次停下的地方繼續。界線與工作方式和第一輪相同：
-每完成一小步就更新進度檔、檢查 control.json、執行 `{agora} quota`；結束時最後一行寫「【工作完成】」「【已暫停】」「【額度不足】」或「【需要升級】」。
+每完成一小步就更新進度檔、檢查 control.json、執行 `{agora} quota`；執行 `{agora} check` 可能排隊或耗時很長，排隊或執行中不要中斷、不要因為久就改判失敗；結束時最後一行寫「【工作完成】」「【已暫停】」「【額度不足】」或「【需要升級】」。
 """
 
 
@@ -1942,6 +1943,22 @@ def cmd_build(ws: Workspace, args):
     sys.exit(1 if proc.returncode else 0)
 
 
+def check_slot_context(ws: Workspace) -> Tuple[Path, Optional[Path], str]:
+    """回傳 (控制根目錄, 分派討論串路徑或 None, 顯示標籤)。
+    分派 worktree 內執行時（環境有 MANIFEST_ENV）從 manifest 取得 control_root 與 thread，否則用 ws.root。"""
+    manifest = os.getenv(worktree.MANIFEST_ENV)
+    if manifest:
+        try:
+            meta = json.loads(Path(manifest).read_text(encoding="utf-8"))
+            control_root = Path(meta["control_root"]).resolve()
+            thread = Path(meta["thread"]).resolve() if meta.get("thread") else None
+            label = meta.get("dispatch_id") or ws.root.name
+            return control_root, thread, label
+        except (OSError, ValueError, KeyError):
+            pass
+    return ws.root.resolve(), None, ws.root.name
+
+
 def cmd_check(ws: Workspace, args):
     """工作區驗證：語法檢查 git 追蹤的 .py，再執行 .agora/config.json 的 check 指令
     （沒設定時自動偵測，見 default_check）。建置另用 agora build。
@@ -1987,8 +2004,13 @@ def cmd_check(ws: Workspace, args):
     if not check:
         print(f"未設定 check 指令，也沒有 tests/ 資料夾，略過測試（{source}）。")
         sys.exit(1 if errors or os.getenv(worktree.MANIFEST_ENV) else 0)
+    control_root, task_thread, slot_label = check_slot_context(ws)
+    stop_check = (lambda: stop_requested(task_thread)) if task_thread else None
     try:
-        proc = run_configured_command(check, ws.root)
+        with checkqueue.acquire_slot(control_root, label=slot_label, stop_check=stop_check):
+            proc = run_configured_command(check, ws.root)
+    except checkqueue.CheckStopped as e:
+        sys.exit(str(e))
     except ValueError as e:
         sys.exit(str(e))
     keep, in_failure = [], False

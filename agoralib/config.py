@@ -192,6 +192,14 @@ def update_parties(root: Path, enable: Iterable[str] = (), disable: Iterable[str
     return settings
 
 
+def check_concurrency(root: Path, data: Optional[dict] = None) -> int:
+    """跨分派 `agora check` 的同時執行上限（預設 1，非正整數視為 1）"""
+    raw = (load(root) if data is None else data).get("check_concurrency", 1)
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 1:
+        return 1
+    return raw
+
+
 def find_root(start: Path) -> Optional[Path]:
     """從 start 往上找含有 .agora 的資料夾（hook 用來判斷目前專案啟用了哪些 AI）"""
     for p in [start, *start.parents]:
