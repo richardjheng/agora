@@ -66,6 +66,7 @@ WORK_PREAMBLE = """\
 
 界線（遇到需要越界的情況就停下來，寫進進度檔等 {human} 決定）：
 - 只修改工作單範圍內的檔案，不要刪除範圍外的檔案。
+- 若因允許修改範圍不足而暫停，請在進度檔用獨立一行 `需要範圍：a.py, tests/b.py` 列出需要的相對路徑，並以「【已暫停】」結束。
 - 不要 git commit / push / reset / checkout / stash，不要安裝套件，不要讀寫 .env 或任何憑證。
 - 不要執行會影響外部系統的動作（下單、發訊息、部署）。
 
@@ -122,7 +123,7 @@ FILE_RULES = {"codex": "Codex 沒有內建的讀檔工具：列目錄、讀檔�
 CONTINUE_PROMPT = """\
 【Agora 工作分派・繼續】
 請先讀 {progress} 與 {control}，從上次停下的地方繼續。界線與工作方式和第一輪相同：
-每完成一小步就更新進度檔、檢查 control.json、執行 `{agora} quota`；執行 `{agora} check` 可能排隊或耗時很長，排隊或執行中不要中斷、不要因為久就改判失敗；結束時最後一行寫「【工作完成】」「【已暫停】」「【額度不足】」或「【需要升級】」。
+每完成一小步就更新進度檔、檢查 control.json、執行 `{agora} quota`；執行 `{agora} check` 可能排隊或耗時很長，排隊或執行中不要中斷、不要因為久就改判失敗；若因允許修改範圍不足而暫停，在進度檔用獨立一行 `需要範圍：a.py, tests/b.py` 列出需要的相對路徑；結束時最後一行寫「【工作完成】」「【已暫停】」「【額度不足】」或「【需要升級】」。
 """
 
 
@@ -301,6 +302,19 @@ def read_message(args) -> str:
     if not text.strip():
         sys.exit("訊息內容是空的。")
     return text
+
+
+def read_optional_message(args) -> str:
+    """讀取可選的補充說明（--message / --file）；兩者皆未提供時不讀 stdin，回傳空字串。"""
+    if getattr(args, "message", None) is not None:
+        text = args.message
+    elif getattr(args, "file", None):
+        text = Path(args.file).read_text(encoding="utf-8")
+    else:
+        return ""
+    if not text.strip():
+        sys.exit("訊息內容是空的。")
+    return text.strip()
 
 
 def parse_tier_pairs(items: Optional[List[str]]) -> dict:
@@ -1008,7 +1022,7 @@ def pick_worker(ws: Workspace, owner: str, candidates: List[str], state: dict, t
 
 def cmd_assign(ws: Workspace, args):
     guard_nested()
-    with shares.dispatch_lock(ws.root):
+    with shares.dispatch_lock(ws.control_root):
         recover_assignments(ws)
         try:
             _cmd_assign_locked(ws, args)
@@ -1034,7 +1048,347 @@ def recover_assignments(ws: Workspace):
     return data
 
 
+NEEDED_SCOPE_LINE = re.compile(r"^[ \t]*(?:[-*>][ \t]*)?需要範圍[：:][ \t]*(.+?)[ \t]*$", re.M)
+RUN_BOUNDARY_HEADING = re.compile(r"^##[ \t]+[^\n]*·[ \t]*(?:Agora：續跑|[^\n]+ 分派給 [^\n]+)[ \t]*$", re.M)
+
+
+def parse_requested_scope(text: str, existing_allowed: Optional[List[str]] = None) -> List[str]:
+    """從進度檔文字解析最近一輪的「需要範圍：a.py, tests/b.py」行（排除已在 allowed_paths 內的項目）。"""
+    if not text:
+        return []
+    boundaries = list(RUN_BOUNDARY_HEADING.finditer(text))
+    segment = text[boundaries[-1].end():] if boundaries else text
+    existing = set(existing_allowed or [])
+    result: List[str] = []
+    for match in NEEDED_SCOPE_LINE.finditer(segment):
+        for raw in re.split(r"[,、]", match.group(1)):
+            item = raw.strip().strip("`\"'").strip().replace("\\", "/").rstrip("/")
+            if item and item not in existing and item not in result:
+                result.append(item)
+    return result
+
+
+def requested_scope(thread: Path, existing_allowed: Optional[List[str]] = None) -> List[str]:
+    try:
+        text = relay_paths(thread)["progress"].read_text(encoding="utf-8")
+    except OSError:
+        return []
+    return parse_requested_scope(text, existing_allowed)
+
+
+def resume_scope_hint(thread: Path, relay: Optional[dict], paths: Optional[List[str]] = None) -> Optional[str]:
+    """依進度檔的「需要範圍：」產生建議的 assign --resume 指令（僅提示，不自動核准）。"""
+    if not relay or not relay.get("dispatch_id"):
+        return None
+    if relay.get("commit_status") == "committed" or relay.get("commit_sha"):
+        return None
+    needed = requested_scope(thread, relay.get("allowed_paths")) if paths is None else paths
+    if not needed:
+        return None
+    sender = relay.get("from") or HUMAN
+    allow_arg = ",".join(needed)
+    return (f"{agora_cmd()} assign {thread.name} --resume {relay['dispatch_id']} "
+            f"--from {sender} --allow \"{allow_arg}\" --reason \"<補充理由>\"")
+
+
+def load_recovery_target(ws: Workspace, thread: Path, state: dict, key: Optional[str]) -> Tuple[str, dict, dict, dict]:
+    """載入並核對 finalize 與 assign --resume 共用的隔離分派 manifest 與 relay。"""
+    latest = state.get("relay") or {}
+    key = key or latest.get("dispatch_id")
+    if not key or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", key):
+        raise worktree.WorktreeError("沒有有效的隔離分派 ID，請確認討論串或 --dispatch-id")
+    directory = thread / "dispatches" / key
+    meta = completions.read_object(directory / "manifest.json")
+    if (meta.get("dispatch_id") != key or meta.get("control_root") != str(ws.control_root.resolve())
+            or meta.get("thread") != str(thread.resolve())
+            or meta.get("manifest") != str(directory / "manifest.json")
+            or meta.get("commit_message") != str(directory / "commit-message.md")):
+        raise worktree.WorktreeError("隔離分派紀錄與工作區／討論串不符，請檢查 manifest")
+    relay = latest if latest.get("dispatch_id") == key else completions.read_object(directory / "relay.json")
+    if relay:
+        meta = worktree.load(relay)
+    return key, meta, relay, latest
+
+
+def verify_recovery_inactive(state: dict, relay: dict, latest: dict, meta: dict):
+    """確認原接手程序與任何收尾程序已結束、worktree 存在，並恢復尚未寫入 manifest 的已提交 ref。"""
+    if not relay or not relay.get("pid"):
+        raise worktree.WorktreeError("缺少原 relay 的 PID 紀錄，無法確認接手程序已結束；請先查明程序狀態")
+    for record in (relay, latest, state.get("finalizer") or {}):
+        if jobs.pid_alive(record.get("pid"), record.get("pid_started")):
+            raise worktree.WorktreeError("接手或收尾程序仍在執行，請先 recall 並等待程序結束")
+        if record.get("status") == "starting" and relay_alive(record):
+            raise worktree.WorktreeError("程序正在啟動、PID 尚未確認，請稍後再試")
+    if not Path(meta["worktree"]).is_dir():
+        raise worktree.WorktreeError("worktree 不存在，請先查明保留成果的位置")
+    worktree.recover_commit(meta)
+
+
+def read_control_for_recovery(thread: Path) -> dict:
+    control_path = relay_paths(thread)["control"]
+    try:
+        return completions.read_object(control_path)
+    except (OSError, ValueError) as exc:
+        raise worktree.WorktreeError("control.json 無法讀取或解析，視為停止；請先修復控制檔") from exc
+
+
+def record_stop_clearance(meta: dict, control: dict, by: str) -> bool:
+    if not control.get("stop_requested"):
+        return False
+    meta.setdefault("stop_clearances", []).append({
+        "cleared_at": now_str(),
+        "stop_at": control.get("at"),
+        "by": by,
+    })
+    return True
+
+
+def clear_stop_for_recovery(thread: Path, meta: dict, by: str, *, ensure_file: bool = False):
+    control_path = relay_paths(thread)["control"]
+    control = read_control_for_recovery(thread)
+    if record_stop_clearance(meta, control, by):
+        worktree.save(meta)  # Save audit evidence before clearing the old stop.
+        completions.atomic_write(control_path, {**control, "stop_requested": False})
+    elif ensure_file and not control_path.exists():
+        completions.atomic_write(control_path, {"stop_requested": False})
+
+
+def _cmd_resume_locked(ws: Workspace, args):
+    """沿用既有 branch／worktree 續跑未提交的隔離分派（呼叫者已持有 shares.dispatch_lock）。"""
+    thread = ws.resolve_thread(args.thread)
+    owner = canonical(args.sender)
+    if getattr(args, "dispatch_id", None):
+        sys.exit("--resume 已指定分派 ID，不能同時使用 --dispatch-id。")
+    if getattr(args, "from_summary", False):
+        sys.exit("--resume 不能和 --from-summary 一起使用。")
+    if getattr(args, "session", None):
+        sys.exit("--resume 會自動續接同一方的原對話，不能同時指定 --session。")
+    tier, model_arg, effort_arg = getattr(args, "tier", None), getattr(args, "model", None), getattr(args, "effort", None)
+    if tier or model_arg or effort_arg:
+        sys.exit("--resume 沿用原分派的模型與等級設定，不能指定 --tier、--model 或 --effort；要換等級請開新的分派。")
+    note = read_optional_message(args)
+    reason = (getattr(args, "reason", None) or "").strip()
+    override = bool(getattr(args, "user_override", False))
+    allow_arg = getattr(args, "allow", None)
+    relay = None
+
+    try:
+        # Phase 1: 唯讀前置檢查（不修改 manifest、control.json 或 state.json）
+        with thread_lock(thread, wait=WORKER_LOCK_WAIT):
+            state = load_state(thread)
+            key, meta, relay, latest = load_recovery_target(ws, thread, state, args.resume)
+            if meta.get("commit_status") == "committed" or meta.get("commit_sha"):
+                raise worktree.WorktreeError(
+                    f"此分派已提交（commit {meta.get('commit_sha') or '已存在'}），無法續跑；請改開新分派。")
+            verify_recovery_inactive(state, relay, latest, meta)
+            if meta.get("commit_status") == "committed" or meta.get("commit_sha"):
+                raise worktree.WorktreeError(
+                    f"此分派已提交（commit {meta.get('commit_sha') or '已存在'}），無法續跑；請改開新分派。")
+            worktree.validate(meta)
+            read_control_for_recovery(thread)
+            if allow_arg:
+                if not reason:
+                    raise worktree.WorktreeError("擴大範圍（--allow）時必須用 --reason 記錄理由")
+                worktree.scope_patterns(allow_arg)
+
+        orig_worker = relay.get("worker") or meta.get("worker")
+        if not orig_worker:
+            raise worktree.WorktreeError("找不到原分派的接手方紀錄")
+        worker = require_enabled(ws, canonical(args.to)) if getattr(args, "to", None) else require_enabled(ws, orig_worker)
+        switched = worker != orig_worker
+        if config.shares(ws.root)[worker] == 0:
+            if not switched and relay.get("user_override") and relay.get("reason"):
+                effective_override = True
+                effective_reason = reason or relay.get("reason", "")
+            elif override and reason:
+                effective_override = True
+                effective_reason = reason
+            else:
+                sys.exit(routing.ZERO_SHARE_ROLE + " 指定零權重實作須加 --user-override 與 --reason 記錄使用者明確指定。")
+        else:
+            effective_override = override or (not switched and bool(relay.get("user_override")))
+            effective_reason = reason or relay.get("reason", "")
+
+        # Phase 2: 依原模型等級設定檢查接手方額度（不持有 thread_lock）
+        if not switched:
+            plan = {"level": relay.get("tier"), "model": relay.get("model"), "effort": relay.get("effort"),
+                    "source": relay.get("model_source") or "沿用原分派",
+                    "fallback_used": bool(relay.get("fallback_used")),
+                    "model_known": bool(relay.get("model_known"))}
+            tier_requested = relay.get("tier_requested")
+            u = party_usage(worker, plan.get("model"))
+        else:
+            orig_tier = relay.get("tier_requested") or relay.get("tier")
+            plan, u = choose_model(worker, plan_model(ws, state, worker, orig_tier, None, None))
+            tier_requested = orig_tier
+        cand_info = usage_info(plan, u)
+        if not shares.eligible([worker], {worker: 1}, {worker: u}):
+            sys.exit(f"續跑接手方 {NAMES[worker]} 不合格：{describe_candidate(worker, cand_info)}。已退出，不等待重置。")
+        mark = quota.blocked(worker)
+        if mark:
+            print(f"⚠️ {NAMES[worker]} 在 {quota.fmt_time(mark.get('at'))} 被標記為無法使用（{mark.get('reason')}）；"
+                  f"若問題還在，接手會立即停止並顯示原因。")
+
+        subagents_arg = getattr(args, "subagents", None)
+        subagents = (subagents_arg == "on") if subagents_arg is not None else bool(relay.get("subagents"))
+
+        # Phase 3: 重新驗證後一次提交 manifest、control.json、progress.md 與 state.json
+        with thread_lock(thread, wait=WORKER_LOCK_WAIT):
+            state = load_state(thread)
+            key, meta, relay, latest = load_recovery_target(ws, thread, state, args.resume)
+            if meta.get("commit_status") == "committed" or meta.get("commit_sha"):
+                raise worktree.WorktreeError(
+                    f"此分派已提交（commit {meta.get('commit_sha') or '已存在'}），無法續跑；請改開新分派。")
+            verify_recovery_inactive(state, relay, latest, meta)
+            if meta.get("commit_status") == "committed" or meta.get("commit_sha"):
+                raise worktree.WorktreeError(
+                    f"此分派已提交（commit {meta.get('commit_sha') or '已存在'}），無法續跑；請改開新分派。")
+            worktree.validate(meta)
+            control = read_control_for_recovery(thread)
+            if allow_arg:
+                added_paths = worktree.extend_scope(meta, allow_arg, reason, owner, at=now_str())
+            else:
+                added_paths = []
+                if meta.get("commit_status") in ("failed", "check_failed", "no_changes"):
+                    meta["commit_status"] = "pending"
+                    meta.pop("error", None)
+            meta["worker"] = worker
+            cleared_stop = record_stop_clearance(meta, control, "resume")
+            worktree.save(meta)  # Save scope_extensions & stop_clearances before clearing stop_requested.
+            control_path = relay_paths(thread)["control"]
+            if cleared_stop:
+                completions.atomic_write(control_path, {**control, "stop_requested": False})
+            elif not control_path.exists():
+                completions.atomic_write(control_path, {"stop_requested": False})
+
+            previous = state.get("relay") or {}
+            if previous.get("status") in RELAY_ACTIVE:
+                previous = {**previous, "status": "interrupted"}
+            completions.archive(thread, "relay", previous, state.get("topic", ""))
+            if previous.get("dispatch_id") and previous.get("dispatch_id") != key:
+                archive_relay(thread, previous)
+
+            resume_count = int(relay.get("resume_count") or 0) + 1
+            resume_id = uuid.uuid4().hex
+            resumed_session_id = None if switched else relay.get("session_id")
+            resumed_external = None if switched else relay.get("external_session")
+            resume_record = {
+                "count": resume_count,
+                "resume_id": resume_id,
+                "at": now_str(),
+                "by": owner,
+                "worker": worker,
+                "previous_worker": orig_worker,
+                "reason": reason,
+                "added_paths": added_paths,
+                "note": note,
+                "session_continued": bool(resumed_session_id),
+            }
+            resumed_relay = {**relay}
+            for stale_key in ("finalize_id", "finalize_previous_pid", "finalize_previous_pid_started"):
+                resumed_relay.pop(stale_key, None)
+            resumed_relay.update({
+                "from": owner,
+                "worker": worker,
+                "status": "starting",
+                **{k: meta.get(k) for k in worktree.FIELDS},
+                "allowed_paths": meta["allowed_paths"],
+                "dispatch_id": key,
+                "dispatch_created": False,
+                "reason": effective_reason,
+                "user_override": effective_override,
+                "session_id": resumed_session_id,
+                "external_session": resumed_external,
+                "handoff": relay.get("handoff") or "",
+                "started": now_str(),
+                "started_ts": time.time(),
+                "updated": now_str(),
+                "error": None,
+                "waiting_until": None,
+                "blocked_reason": None,
+                "frozen": True,
+                "tier": plan.get("level"),
+                "tier_requested": tier_requested,
+                "model": plan.get("model"),
+                "effort": plan.get("effort"),
+                "model_source": plan.get("source"),
+                "fallback_used": bool(plan.get("fallback_used")),
+                "model_known": bool(plan.get("model_known")),
+                "subagents": subagents,
+                "resume_count": resume_count,
+                "resume_id": resume_id,
+                "run_id": resume_id,
+                "resumes": list(relay.get("resumes") or []) + [resume_record],
+                "resume_reason": reason,
+                "resume_note": note,
+                "resume_added_paths": added_paths,
+                "resume_switched_from": orig_worker if switched else None,
+            })
+            state["parties"].setdefault(worker, new_party())
+            msg_lines = [f"【續跑分派 {key}（第 {resume_count} 次）→ {NAMES[worker]}】"]
+            if switched:
+                msg_lines.append(f"改派自：{NAMES[orig_worker]}（開新對話）")
+            elif resumed_session_id:
+                msg_lines.append("續接原對話")
+            if added_paths:
+                msg_lines.append(f"擴大允許修改範圍：{', '.join(added_paths)}（理由：{reason}）")
+            elif reason:
+                msg_lines.append(f"理由：{reason}")
+            if note:
+                msg_lines.append(f"\n{note}")
+            add_message(thread, state, owner, "\n".join(msg_lines))
+            state["relay"] = resumed_relay
+            save_state(thread, state)
+            archive_relay(thread, resumed_relay)
+
+            paths = relay_paths(thread)
+            if not paths["progress"].exists():
+                paths["progress"].write_text(f"# 工作進度：{state['topic']}\n", encoding="utf-8")
+            prog_lines = [f"分派：{key}；接手方：{NAMES[worker]}" + (f"（改派自 {NAMES[orig_worker]}）" if switched else "")]
+            if added_paths:
+                prog_lines.append(f"擴大範圍：{', '.join(added_paths)}；理由：{reason}")
+            elif reason:
+                prog_lines.append(f"理由：{reason}")
+            if cleared_stop:
+                prog_lines.append("已確認舊程序結束並解除舊停止要求。")
+            if note:
+                prog_lines.append(f"\n補充說明：\n{note}")
+            append_progress(thread, f"續跑第 {resume_count} 次", "\n".join(prog_lines))
+    except (worktree.WorktreeError, OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
+        hint = resume_scope_hint(thread, relay)
+        sys.exit(f"續跑失敗：{exc}" + (f"\n建議續跑指令（不自動核准）：{hint}" if hint else ""))
+
+    level = f"{config.TIER_LABELS[plan['level']]}等級" if plan.get("level") else plan.get("source")
+    add_system_note(
+        thread,
+        f"▶️ 續跑分派 {key}（第 {resume_count} 次）→ {NAMES[worker]}"
+        f"（{level}：{plan.get('model') or 'CLI 預設模型'}"
+        + (f"、{plan['effort']}" if plan.get("effort") else "") + "）"
+        + (f"；改派自 {NAMES[orig_worker]}（新對話）" if switched else ("；續接原對話" if resumed_session_id else "；開新對話"))
+        + (f"；擴大範圍：{', '.join(added_paths)}" if added_paths else "")
+        + (f"；理由：{reason}" if reason else "")
+        + "；續跑不重複計件"
+    )
+
+    entry = AGORA_ROOT_DIR / "agora.py"
+    try:
+        pid = jobs.spawn([sys.executable, str(entry), "--workspace", str(ws.root), "_work", thread.name,
+                          "--dispatch-id", key, "--run-id", resume_id],
+                         ws.root, paths["log"], paths["log"], append=True)
+    except Exception as e:
+        update_relay(thread, status="failed", error=f"無法啟動背景程序：{e}")
+        sys.exit(f"無法啟動接手程序：{e}")
+    update_relay(thread, pid=pid, pid_started=jobs.pid_started(pid), dispatch_created=True)
+    print(f"已續跑分派 {key}（第 {resume_count} 次，交給 {NAMES[worker]}，背景程序 PID {pid}）。")
+    if added_paths:
+        print(f"已擴大允許修改範圍：{', '.join(added_paths)}（舊驗證結果已失效）")
+    print(f"進度：{paths['progress']}")
+    print(f"查詢：{agora_cmd()} status {thread.name} --wait 900")
+
+
 def _cmd_assign_locked(ws: Workspace, args):
+    if getattr(args, "resume", None):
+        return _cmd_resume_locked(ws, args)
     thread = ws.resolve_thread(args.thread)
     owner = canonical(args.sender)
     state = load_state(thread)
@@ -1209,55 +1563,25 @@ def cmd_finalize(ws: Workspace, args):
     guard_nested()
     thread = ws.resolve_thread(args.thread)
     started = False
+    relay = None
     try:
         # Serialize setup with assign, but release both locks throughout the check.
         # recall can then write a NEW stop request while checks run or queue.
         with shares.dispatch_lock(ws.control_root), thread_lock(thread, wait=WORKER_LOCK_WAIT):
             state = load_state(thread)
-            latest = state.get("relay") or {}
-            key = getattr(args, "dispatch_id", None) or latest.get("dispatch_id")
-            if not key or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", key):
-                raise worktree.WorktreeError("沒有有效的隔離分派 ID，請確認討論串或 --dispatch-id")
-            directory = thread / "dispatches" / key
-            meta = completions.read_object(directory / "manifest.json")
-            if (meta.get("dispatch_id") != key or meta.get("control_root") != str(ws.control_root.resolve())
-                    or meta.get("thread") != str(thread.resolve())
-                    or meta.get("manifest") != str(directory / "manifest.json")
-                    or meta.get("commit_message") != str(directory / "commit-message.md")):
-                raise worktree.WorktreeError("隔離分派紀錄與工作區／討論串不符，請檢查 manifest")
-            relay = latest if latest.get("dispatch_id") == key else completions.read_object(directory / "relay.json")
-            if relay:
-                meta = worktree.load(relay)
+            key, meta, relay, latest = load_recovery_target(ws, thread, state, getattr(args, "dispatch_id", None))
             # A recorded commit is already complete; do not rerun checks or Git.
             if meta.get("commit_status") == "committed" and meta.get("commit_sha"):
                 relay = {**meta, **relay, **{k: meta.get(k) for k in worktree.FIELDS}}
                 relay.setdefault("finalize_id", "committed-" + meta["commit_sha"])
             else:
-                if not relay or not relay.get("pid"):
-                    raise worktree.WorktreeError("缺少原 relay 的 PID 紀錄，無法確認接手程序已結束；請先查明程序狀態")
-                for record in (relay, latest, state.get("finalizer") or {}):
-                    if jobs.pid_alive(record.get("pid"), record.get("pid_started")):
-                        raise worktree.WorktreeError("接手或收尾程序仍在執行，請先 recall 並等待程序結束")
-                    if record.get("status") == "starting" and relay_alive(record):
-                        raise worktree.WorktreeError("程序正在啟動、PID 尚未確認，請稍後再試")
-                if not Path(meta["worktree"]).is_dir():
-                    raise worktree.WorktreeError("worktree 不存在，請先查明保留成果的位置")
-                worktree.recover_commit(meta)
+                verify_recovery_inactive(state, relay, latest, meta)
                 if not meta.get("commit_sha"):
                     worktree.validate(meta)
                     message = Path(meta["commit_message"])
                     if not message.is_file() or not message.read_text(encoding="utf-8").strip():
                         raise worktree.WorktreeError("缺少非空的 commit-message.md；請先寫明任務目的與測試範圍")
-                control_path = relay_paths(thread)["control"]
-                try:
-                    control = completions.read_object(control_path)
-                except (OSError, ValueError) as exc:
-                    raise worktree.WorktreeError("control.json 無法讀取或解析，視為停止；請先修復控制檔") from exc
-                if control.get("stop_requested"):
-                    meta.setdefault("stop_clearances", []).append({"cleared_at": now_str(),
-                        "stop_at": control.get("at"), "by": "finalize"})
-                    worktree.save(meta)  # Save audit evidence before clearing the old stop.
-                    completions.atomic_write(control_path, {**control, "stop_requested": False})
+                clear_stop_for_recovery(thread, meta, "finalize")
                 relay = {**relay, "finalize_id": uuid.uuid4().hex, "status": "checking",
                          "finalize_previous_pid": relay.get("pid"),
                          "finalize_previous_pid_started": relay.get("pid_started"),
@@ -1277,7 +1601,9 @@ def cmd_finalize(ws: Workspace, args):
             finish_finalize(thread, relay, meta, exc)
         else:
             append_progress(thread, "finalize", f"未提交：{exc}")
-        sys.exit(f"finalize 未提交：{exc}。成果保留；請修正上述原因後重新執行 finalize，停止時請先確認可重新收尾。")
+        hint = resume_scope_hint(thread, relay)
+        sys.exit(f"finalize 未提交：{exc}。成果保留；請修正上述原因後重新執行 finalize，停止時請先確認可重新收尾。"
+                 + (f"\n建議續跑指令（不自動核准）：{hint}" if hint else ""))
     print(f"finalize 完成：{meta['branch']}｜{meta.get('commit_sha') or meta.get('commit_status')}")
 
 
@@ -1547,11 +1873,13 @@ def cmd_work(ws: Workspace, args):
     paths = relay_paths(thread)
     relay = load_state(thread)["relay"]
     if relay.get("dispatch_id") or getattr(args, "dispatch_id", None):
-        with shares.dispatch_lock(ws.root):
+        with shares.dispatch_lock(ws.control_root):
             data = recover_assignments(ws)
             relay = load_state(thread)["relay"]
             if (getattr(args, "dispatch_id", None) != relay.get("dispatch_id")
-                    or not relay.get("dispatch_created") or relay["dispatch_id"] not in data["dispatches"]):
+                    or (getattr(args, "run_id", None) and args.run_id != relay.get("run_id"))
+                    or not relay.get("dispatch_created")
+                    or (not relay.get("resume_count") and relay["dispatch_id"] not in data["dispatches"])):
                 return   # 建立中斷或已被新工作取代，絕不執行未提交的分派
     worker, owner = relay["worker"], relay["from"]
     log = lambda msg: print(f"[{now_str()}] {msg}", flush=True)  # noqa: E731
@@ -1577,8 +1905,9 @@ def cmd_work(ws: Workspace, args):
             return
 
     # 輪數上限只算真正跑完的輪；等額度、被拒重試不算（等待有時間間隔，被拒重試另有上限，不會空轉）
-    denial_retries, quota_retries, denial_note, rounds = 0, 0, "", relay.get("rounds", 0)
-    while rounds < MAX_WORK_ROUNDS:
+    denial_retries, quota_retries, denial_note = 0, 0, ""
+    run_rounds = 0 if relay.get("resume_count") else relay.get("rounds", 0)
+    while run_rounds < MAX_WORK_ROUNDS:
         if stop_requested(thread):
             update_relay(thread, status="stopped", waiting_until=None)
             add_system_note(thread, f"🔁 {NAMES[owner]} 已收回工作，{NAMES[worker]} 停止接手。")
@@ -1618,9 +1947,22 @@ def cmd_work(ws: Workspace, args):
         if relay.get("session_id"):
             prompt = CONTINUE_PROMPT.format(**fmt) + denial_note
             if relay["rounds"] == 0:
-                prompt += f"\n\n{NAMES[owner]} 的工作單：\n{relay['handoff']}"
+                prompt += f"\n\n{NAMES[owner]} 的工作單：\n{relay.get('handoff') or ''}"
         else:
-            prompt = WORK_PREAMBLE.format(**fmt) + relay["handoff"]
+            prompt = WORK_PREAMBLE.format(**fmt) + (relay.get("handoff") or "")
+        if run_rounds == 0 and relay.get("resume_count"):
+            if not relay.get("session_id"):
+                if relay.get("resume_switched_from"):
+                    prompt += (f"\n\n【續跑改派說明】此分派原本由 {NAMES[relay['resume_switched_from']]} 執行，"
+                               f"現改派由你接手同一 worktree 內的保留成果。請先讀取進度檔 {paths['progress']} 並確認既有變更，再接續完成上方工作單。")
+                else:
+                    prompt += (f"\n\n【續跑說明】這是延續既有分派的續跑（保留 worktree 內的既有變更）。"
+                               f"請先讀取進度檔 {paths['progress']} 了解已完成進度，再接續完成上方工作單。")
+            if relay.get("resume_added_paths"):
+                prompt += (f"\n\n【本次續跑已擴大允許修改範圍】新增：{', '.join(relay['resume_added_paths'])}"
+                           + (f"（理由：{relay['resume_reason']}）" if relay.get("resume_reason") else "") + "。")
+            if relay.get("resume_note"):
+                prompt += f"\n\n【續跑補充說明（來自 {NAMES[owner]}）】\n{relay['resume_note']}"
         prompt += "\n\n" + routing.DISPATCH_GUIDE
         if task:
             prompt += (f"\n\n分派 ID：{task['dispatch_id']}；branch：{task['branch']}；base SHA：{task['base_sha']}。"
@@ -1748,7 +2090,7 @@ def cmd_work(ws: Workspace, args):
                 state["relay"]["interrupted_rounds"] = (state["relay"].get("interrupted_rounds") or 0) + 1
             remember_session(state, worker, session_id, session_id == relay.get("external_session"), opts=opts)
             save_state(thread, state)
-        rounds += 1
+        run_rounds += 1
         quota_retries = 0
         shares.record(ws.root, worker, thread.name)
         if before != changed:
@@ -1858,6 +2200,10 @@ def cmd_status(ws: Workspace, args):
         return
     blocks = progress_blocks(thread)
     code = relay_exit_code(relay, alive)
+    req_scope = (requested_scope(thread, relay.get("allowed_paths"))
+                 if not alive and relay.get("dispatch_id") and relay.get("status") != "done"
+                 and relay.get("commit_status") != "committed" and not relay.get("commit_sha") else [])
+    scope_hint = resume_scope_hint(thread, relay, req_scope) if req_scope else None
     if args.json:
         print(json.dumps({"status": relay.get("status"), "worker": relay.get("worker"), "alive": alive,
                           "rounds": relay.get("rounds", 0), "timed_out": timed_out,
@@ -1866,12 +2212,15 @@ def cmd_status(ws: Workspace, args):
                           "blocked_reason": relay.get("blocked_reason"),
                           "denied": relay.get("denied") or [], "denied_summary": denial_summary(relay),
                           "warning": unverified_warning(relay), "last_progress": blocks[-1].strip() if blocks else None,
+                          "resume_count": relay.get("resume_count") or 0, "resumes": relay.get("resumes") or [],
+                          "requested_scope": req_scope, "resume_hint": scope_hint,
                           **relay_model_fields(relay), "exit_code": code}, ensure_ascii=False, indent=2))
     else:
         if timed_out:
             print(f"⏳ 等待 {args.wait} 秒逾時，接手方仍在進行（狀態：{relay['status']}）")
         waiting = f"，等到 {quota.fmt_time(relay['waiting_until'])}" if relay.get("waiting_until") else ""
-        print(f"接手方：{NAMES[relay['worker']]}｜狀態：{relay['status']}{waiting}｜已跑 {relay.get('rounds', 0)} 輪｜"
+        resumed = f"｜續跑第 {relay['resume_count']} 次" if relay.get("resume_count") else ""
+        print(f"接手方：{NAMES[relay['worker']]}｜狀態：{relay['status']}{waiting}｜已跑 {relay.get('rounds', 0)} 輪{resumed}｜"
               f"背景程序：{'執行中' if alive else '已結束'}｜更新：{relay.get('updated')}")
         print(relay_model_line(relay))
         if relay.get("worktree"):
@@ -1881,6 +2230,9 @@ def cmd_status(ws: Workspace, args):
             print(f"⛔ 需要人工處理：{NAMES[relay['worker']]} {relay.get('blocked_reason') or ''}".rstrip())
         if relay.get("error") and not alive:
             print(f"原因：{relay['error']}")
+        if scope_hint:
+            print(f"💡 進度檔請求擴大範圍：{', '.join(req_scope)}（不自動核准）")
+            print(f"   建議指令：{scope_hint}")
         for line in (denial_summary(relay), unverified_warning(relay)):
             if line:
                 print(f"⚠️ {line}")
@@ -3033,8 +3385,9 @@ def main(argv=None):
         p.add_argument("--from", dest="sender", required=True, choices=who)
         p.add_argument("--to", help="指定接手方（預設省略：額度篩選後依比例輪流）")
         p.add_argument("--dispatch-id", help="派工識別碼；同工作單以相同 ID 重試不重計，未給時建立新 ID")
-        p.add_argument("--allow", action="append", help="允許修改的相對路徑或 glob（必填，可重複，或以逗號分隔；提交前核對）")
-        p.add_argument("--reason", help="--to 必填的指定理由；零權重時須記錄使用者明確指定")
+        p.add_argument("--resume", metavar="分派ID", help="沿用既有 branch／worktree 續跑未提交的隔離分派（已提交者不可續跑）")
+        p.add_argument("--allow", action="append", help="允許修改的相對路徑或 glob（新分派必填；--resume 用於擴大範圍並須加 --reason；可重複或以逗號分隔）")
+        p.add_argument("--reason", help="--to 指定分派或 --resume --allow 擴大範圍必填的理由；零權重時須記錄使用者明確指定")
         p.add_argument("--user-override", action="store_true", help="聲明使用者已明確指定零權重 AI 實作，須搭配 --reason")
         p.add_argument("--tier", choices=config.TIER_LEVELS,
                        help="等級：依專案設定（agora parties --tier）選模型；沒給時用標準等級，但不覆蓋討論串明確指定的模型")
@@ -3160,6 +3513,7 @@ def main(argv=None):
     p = sub.add_parser("_work", help=argparse.SUPPRESS)
     p.add_argument("thread")
     p.add_argument("--dispatch-id")
+    p.add_argument("--run-id")
     p.set_defaults(func=cmd_work)
 
     p = sub.add_parser("list", help="列出討論串")

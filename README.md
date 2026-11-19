@@ -90,6 +90,7 @@ $A send <id> --from human --message "..."           # 使用者插話（只記�
 $A reply <id> --party antigravity                   # 不發言，直接請某方回覆
 $A auto <id> --rounds 6 [--order codex,claude]      # AI 依序自動發言（各方都表示【已達成共識】時提前結束）
 $A assign <id> --from claude [--tier standard] [--to codex --reason "指定理由"] --allow "src/**" [--allow ...] --file 工作單.md   # 分派工作（--to 留空則依比例輪流挑選）
+$A assign <id> --resume <分派ID> --from claude [--allow "新路徑" --reason "理由"] [--to <AI>] [--message "補充"]  # 沿用原 branch/worktree 續跑未提交的分派
 $A summarize <id> --by claude                       # 用新對話讀完整逐字稿，產出共識、取捨、異議與工作單（summary.md）
 $A assign <id> --from human --from-summary --allow "src/**" [--yes]  # 用總結的工作單分派；總結過期時要 --yes 確認
 $A status <id> [--wait 900] [--json]                # 分派狀態與最新進度（見下方 exit code）
@@ -136,6 +137,15 @@ VSCode 面板分派狀態與終端皆會顯示獨立 branch、worktree 位置與
 不提供跳過驗證或接受失敗的選項；範圍不符、驗證失敗或新停止要求都不提交，也不刪除或搬移成果。
 舊停止要求會在確認程序結束後解除並記入 manifest；執行中仍可用 `recall` 再次停止。
 已提交的分派再次 finalize 只回報既有 SHA。這是主持方的收尾指令，不加入接手方的指令白名單。
+
+若停止、暫停或驗證失敗後需要繼續修改（而非直接收尾），主持方可在主工作區執行
+`agora assign <討論串> --resume <分派ID> --from <你> [--allow 新增路徑 --reason 理由] [--to <AI>] [--file／--message 補充說明]`：
+- 沿用原 branch、worktree、base SHA、凍結的 check 指令與模型等級設定，不重跑 `worktree.prepare()`，也不重複計入自動派工件數；
+- 前置檢查與 `finalize` 共用：原接手與收尾程序必須已結束、worktree 存在、manifest 一致；**已提交（committed）的分派不可 resume**，須改開新分派；
+- 擴大範圍（`--allow`）**必須加 `--reason`**（同樣經機密規則預檢），併入 `allowed_paths` 並記入 manifest `scope_extensions`，同時使舊 `check_result`／`checked_tree` 失效、`commit_status` 回到 `pending`；
+- 若 `stop_requested` 為 true，確認舊程序結束後才解除並記入 manifest `stop_clearances`（`by: resume`），續跑期間新的 `recall` 照常生效；
+- 預設續跑同一方並續接原對話（`CONTINUE_PROMPT`）；`--to` 改派他方時開新對話並附原工作單與 `progress.md` 路徑；補充說明會附進提示並記入 `progress.md`；
+- 接手方因範圍不足暫停時，可在進度檔以獨立一行 `需要範圍：a.py, tests/b.py` 列出需要的路徑；`agora status`（與失敗訊息）讀到時會提示可用的 `assign --resume … --allow …` 指令（不自動核准）。
 
 - 剛 `assign` 的工作在背景程序記下 PID 前（狀態 `starting` 未滿 60 秒）一律視為進行中，`status`、`activity` 與其他同時執行的指令不會把它判成中斷。
   assign 必須先寫入狀態再啟動背景程序（背景程序一啟動就讀取它），所以用這段緩衝，而不是先啟動再寫入。

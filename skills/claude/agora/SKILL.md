@@ -75,6 +75,7 @@ description: 透過 Agora 與 Antigravity（Gemini）、Codex 進行多輪技術
 
 ```bash
 python D:/github/agora/agora.py assign "$T" --from claude --tier standard --allow "<允許修改的路徑或 glob>" --file 工作單.md
+python D:/github/agora/agora.py assign "$T" --resume "<分派ID>" --from claude [--allow "<新增路徑>" --reason "擴大範圍理由"] [--message "補充說明"]
 python D:/github/agora/agora.py summarize "$T" --by codex      # 或：先總結
 python D:/github/agora/agora.py assign "$T" --from claude --tier standard --allow "<允許修改的路徑或 glob>" --from-summary
 python D:/github/agora/agora.py watch                          # 同時有分派或背景討論時，一律用 run_in_background 執行
@@ -99,6 +100,7 @@ python D:/github/agora/agora.py watch                          # 同時有分派
 - **由 Agora 代做 Commit**：接手方完成後將 commit 訊息（任務目的、測試範圍）寫成檔案，宣告完成後由 Agora 核對分派、branch 與檔案範圍，執行實際 `agora check`，附上真實結果後代為 commit。接手方不要自行 git commit。不自動 push / merge，成果保留由使用者另行指派 merge。
 - **驗證排隊與不要中斷**：`agora check` 跨分派依控制根目錄 `.agora/config.json` 的 `check_concurrency`（預設 1）FIFO 排隊，可能排隊等待或執行耗時很長；排隊或執行中不要中斷，也不要因為耗時久就改判失敗。
 - **保留成果收尾（主持方）**：停止、暫停或驗證失敗後，確認接手程序已結束、`commit-message.md` 已寫好，可在主工作區用 `python D:/github/agora/agora.py finalize <討論串> [--dispatch-id <分派ID>]` 收尾（預設最近一次）。一定重跑完整驗證，不提供跳過或接受失敗；失敗保留檔案、不提交。舊停止要求解除時會記錄，執行中新的 `recall` 仍有效；已 committed 只回報既有 SHA。這不是 resume，也不擴大範圍，接手方不可自行執行。
+- **保留成果續跑與擴大範圍（主持方）**：停止、暫停或驗證失敗後需繼續修改時，可在主工作區用 `python D:/github/agora/agora.py assign <討論串> --resume <分派ID> --from claude [--allow "<新增路徑>" --reason "理由"] [--to <AI>] [--file／--message 補充說明]` 沿用原 branch／worktree／base SHA 與凍結設定續跑，不重複計件。**擴大範圍（`--allow`）必須加 `--reason`**（仍經機密預檢，擴大後舊 check 失效且 `commit_status` 回到 `pending`）；**已提交（committed）的分派不可 resume**，須改開新分派。預設續跑同一方並續接原對話，`--to` 改派他方開新對話並附原工作單與 `progress.md`。若進度檔有 `需要範圍：a.py, tests/b.py`，`status` 會提示建議續跑指令（不自動核准）。
 - **子代理非強制隔離**：子代理預設關閉；僅在顯式 `--subagents on` 時加入並行指引。**子代理在同一 worktree 執行**，由父代理負責整合驗證；這不是強制隔離，也不承諾子代理有獨立 worktree。
 
 ### 等級選擇準則（--tier）

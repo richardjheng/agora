@@ -46,6 +46,8 @@ def event(thread, kind, record, topic=""):
     identity = identity or record.get("started_ts") or record.get("started") or record.get("pid") or "legacy"
     if record.get("finalize_id"):
         identity = [identity, record["finalize_id"]]
+    elif record.get("resume_id"):
+        identity = [identity, record["resume_id"]]
     key = hashlib.sha256(json.dumps([thread.name, kind, identity], ensure_ascii=False).encode()).hexdigest()
     return {"id": key, "thread": thread.name, "topic": topic, "type": kind,
             **{k: record.get(k) for k in ("dispatch_id", "job_id", "worker", "kind", "status", "branch",

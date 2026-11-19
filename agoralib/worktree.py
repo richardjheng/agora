@@ -91,6 +91,29 @@ def scope_patterns(values):
     return result
 
 
+def extend_scope(meta, values, reason, by, at=""):
+    """Validate and merge additional allowed_paths, record audit entry, and invalidate prior check."""
+    reason = (reason or "").strip()
+    if not reason:
+        raise WorktreeError("擴大範圍（--allow）時必須用 --reason 記錄理由")
+    incoming = scope_patterns(values)
+    existing = list(meta.get("allowed_paths") or [])
+    added = [item for item in incoming if item not in existing]
+    if not added:
+        return []
+    meta["allowed_paths"] = existing + added
+    meta.setdefault("scope_extensions", []).append({
+        "paths": added,
+        "reason": reason,
+        "at": at,
+        "by": by,
+    })
+    meta["check_result"] = None
+    meta["checked_tree"] = None
+    meta["commit_status"] = "pending"
+    return added
+
+
 def save(meta):
     path = Path(meta["manifest"])
     tmp = path.with_suffix(".tmp")
