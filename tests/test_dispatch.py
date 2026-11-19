@@ -9,7 +9,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 from agoralib import checkqueue, cli, completions, config, parties, quota, quota_hook, routing, shares, worktree
 
@@ -241,13 +241,13 @@ class TestDispatch(unittest.TestCase):
     def test_elapsed_reset_keeps_main_model_and_worker_does_not_wait(self):
         now = time.time()
         usage = {"remaining_pct": 1, "resets_at": now - 1, "updated_at": now - 720}
-        plan = {"model": "main", "source": "測試", "fallback": {"model": "fallback"}}
-        with patch.object(cli, "party_usage", return_value=usage) as query:
-            chosen, _ = cli.choose_model("antigravity", plan)
-        self.assertEqual(chosen["model"], "main")
-        query.assert_called_once_with("antigravity", "main")
         ws, thread = self.make()
-        assign(ws, args_for("t1"))
+        config.update_parties(self.root, shares={"codex": "0"}, tiers={"antigravity.heavy": "main"})
+        with patch.object(cli, "party_usage", return_value=usage) as query:
+            worker, plan, _ = cli.pick_worker(ws, "claude", ws.enabled(), cli.load_state(thread), "heavy")
+        self.assertEqual((worker, plan["model"]), ("antigravity", "main"))
+        query.assert_called_once_with("antigravity", "main")
+        assign(ws, args_for("t1", tier="heavy"), usages={"antigravity": usage})
         relay = cli.load_state(thread)["relay"]
         with patch.object(cli, "party_usage", return_value=usage), \
                 patch.object(cli, "sleep_until") as sleep, \
@@ -257,6 +257,31 @@ class TestDispatch(unittest.TestCase):
         sleep.assert_not_called()
         self.assertEqual(call.call_count, 1)
         self.assertEqual(cli.load_state(thread)["relay"]["status"], "done")
+
+    def test_legacy_tier_models_are_not_tried_in_auto_or_explicit_assignment(self):
+        ws, thread = self.make()
+        data = config.load(self.root)
+        worker_models = {"antigravity": "agy-main", "codex": "codex-main"}
+        for party, model in worker_models.items():
+            data["parties"][party]["tiers"] = {
+                "heavy": {"model": model, "fallback": {"model": "legacy-model"}},
+            }
+        config.save(self.root, data)
+
+        def usage(party, model):
+            return {"remaining_pct": 1 if model == worker_models[party] else 99}
+
+        for to, expected in (
+            (None, [call(party, model) for party, model in worker_models.items()]),
+            ("codex", [call("codex", "codex-main")]),
+        ):
+            with self.subTest(to=to), patch.dict(os.environ, {cli.NESTED_ENV: ""}), \
+                    patch.object(cli, "party_usage", side_effect=usage) as query, \
+                    patch.object(cli.jobs, "spawn") as spawn, self.assertRaisesRegex(SystemExit, "不等待重置"):
+                cli.cmd_assign(ws, args_for(thread.name, to=to, tier="heavy", reason="使用者指定" if to else None))
+            self.assertCountEqual(query.call_args_list, expected)
+            spawn.assert_not_called()
+        self.assertFalse(cli.load_state(thread).get("relay"))
 
     def test_all_zero_and_low_exit_without_spawn_or_wait(self):
         ws, _ = self.make()

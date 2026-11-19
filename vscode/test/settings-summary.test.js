@@ -51,7 +51,7 @@ test("discussionSummary: Antigravity 無 efforts 時不顯示思考深度", () =
   assert.equal(discussionSummary({ model: "gemini-4-neon-medium" }, agyCatalog), "gemini-4-neon-medium");
 });
 
-test("tiersSummary: 完整設定、未設等級沿用、無努力值、備用模型標記", () => {
+test("tiersSummary: 完整設定、未設等級沿用、無推理強度、忽略舊欄位", () => {
   assert.equal(
     tiersSummary({
       tiers: {
@@ -70,18 +70,7 @@ test("tiersSummary: 完整設定、未設等級沿用、無努力值、備用模
         heavy: { model: "opus", effort: "high", fallback: { model: "sonnet", effort: "medium" } },
       },
     }),
-    "輕量 haiku · 標準 沿用討論設定 · 重度 opus/high · 備用 1",
-  );
-
-  assert.equal(
-    tiersSummary({
-      tiers: {
-        light: { model: "gemini-4-neon-low", fallback: { model: "gemini-3.8-flash" } },
-        standard: { model: "gemini-4-neon-medium", fallback: { model: "gemini-3.8-flash" } },
-        heavy: { model: "gemini-4-argon-high" },
-      },
-    }),
-    "輕量 gemini-4-neon-low · 標準 gemini-4-neon-medium · 重度 gemini-4-argon-high · 備用 2",
+    "輕量 haiku · 標準 沿用討論設定 · 重度 opus/high",
   );
 
   assert.equal(
@@ -90,7 +79,7 @@ test("tiersSummary: 完整設定、未設等級沿用、無努力值、備用模
   );
 });
 
-test("open/close state: 預設收合、各 AI 獨立、持久化與還原、備用模型手動收合不被重開", () => {
+test("open/close state: 預設收合、各 AI 獨立、持久化與還原", () => {
   const openMap = loadOpenState(undefined);
   assert.equal(isSectionOpen(openMap, "claude.discussion", false), false);
   assert.equal(isSectionOpen(openMap, "claude.tiers", false), false);
@@ -101,12 +90,6 @@ test("open/close state: 預設收合、各 AI 獨立、持久化與還原、備�
   assert.equal(isSectionOpen(openMap, "claude.discussion", false), true);
   assert.equal(isSectionOpen(openMap, "codex.discussion", false), false);
 
-  // 備用模型：未操作時若有備用模型預設展開；使用者手動收合後應保持收合
-  assert.equal(isSectionOpen(openMap, "claude.heavy", true), true);
-  assert.equal(isSectionOpen(openMap, "claude.light", false), false);
-  setSectionOpen(openMap, "claude.heavy", false);
-  assert.equal(isSectionOpen(openMap, "claude.heavy", true), false);
-
   // 模擬 webview setState -> 重新載入 getState，並保留其他 state 欄位
   const saved = mergeOpenState({ otherKey: 123 }, openMap);
   assert.equal(saved.otherKey, 123);
@@ -114,7 +97,6 @@ test("open/close state: 預設收合、各 AI 獨立、持久化與還原、備�
   assert.equal(isSectionOpen(restored, "claude.discussion", false), true);
   assert.equal(isSectionOpen(restored, "claude.tiers", false), false);
   assert.equal(isSectionOpen(restored, "codex.discussion", false), false);
-  assert.equal(isSectionOpen(restored, "claude.heavy", true), false);
 });
 
 function createMockNode(tag) {
@@ -232,7 +214,7 @@ function sampleState() {
         effort: "",
         share: 1,
         tiers: {
-          heavy: { model: "opus", effort: "high", fallback: { model: "sonnet", effort: "medium" } },
+          heavy: { model: "opus", effort: "high" },
         },
       },
       antigravity: {
@@ -253,27 +235,24 @@ function sampleState() {
   };
 }
 
-test("panel.js: 預設收合、重繪與重載保持、各 AI 獨立、停用 AI 保留可收合討論區塊、備用模型手動收合不被重開", () => {
-  const env1 = runPanel(undefined);
+test("panel.js: 預設收合、重繪與重載保持、各 AI 獨立、停用 AI 保留討論區塊、忽略舊開合鍵", () => {
+  const saved = { openSections: { "claude.heavy": true } };
+  const env1 = runPanel(saved);
   env1.pushState(sampleState());
 
   const cards1 = findAll(env1.app, (n) => n.tagName === "SECTION");
   assert.equal(cards1.length, 3);
 
-  // Claude: 討論與接手工作區塊預設收合；heavy 備用模型預設展開
+  // Claude: 討論與接手工作區塊預設收合
   const claudeDisc1 = findAll(cards1[0], (n) => n.className.includes("discussion-section"))[0];
   const claudeTiers1 = findAll(cards1[0], (n) => n.className.includes("tiers-section"))[0];
-  const claudeFbs1 = findAll(cards1[0], (n) => n.className === "tier-fallback");
   assert.equal(claudeDisc1.open, false);
   assert.equal(claudeTiers1.open, false);
-  assert.equal(claudeFbs1.length, 3);
-  assert.equal(claudeFbs1[0].open, false); // light 無備用模型
-  assert.equal(claudeFbs1[1].open, false); // standard 無備用模型
-  assert.equal(claudeFbs1[2].open, true);  // heavy 有備用模型，首次預設展開
+  assert.equal(findAll(claudeTiers1, (n) => n.tagName === "DETAILS").length, 1);
+  assert.equal(findAll(claudeTiers1, (n) => n.className === "tier-item").length, 3);
 
-  // 模擬瀏覽器對初始 open 的 <details> 補發同狀態 toggle：不應被誤記為使用者操作
-  claudeFbs1[2].toggleTo(true);
-  assert.equal(env1.getPersisted(), undefined);
+  claudeTiers1.toggleTo(false);
+  assert.deepEqual(env1.getPersisted(), saved);
 
   // Antigravity（停用）：沒有接手工作區塊，但討論區塊仍存在且可收合
   const agyDisc1 = findAll(cards1[1], (n) => n.className.includes("discussion-section"))[0];
@@ -286,16 +265,15 @@ test("panel.js: 預設收合、重繪與重載保持、各 AI 獨立、停用 AI
   const codexDisc1 = findAll(cards1[2], (n) => n.className.includes("discussion-section"))[0];
   assert.equal(codexDisc1.open, false);
 
-  // 使用者展開 Claude 討論區塊、手動收合 Claude heavy 備用模型
+  // 使用者展開 Claude 討論與接手工作區塊
   claudeDisc1.toggleTo(true);
-  claudeFbs1[2].toggleTo(false);
+  claudeTiers1.toggleTo(true);
 
   // 重繪後保持狀態，且不影響 Codex
   env1.pushState(sampleState());
   const cards2 = findAll(env1.app, (n) => n.tagName === "SECTION");
   assert.equal(findAll(cards2[0], (n) => n.className.includes("discussion-section"))[0].open, true);
-  assert.equal(findAll(cards2[0], (n) => n.className.includes("tiers-section"))[0].open, false);
-  assert.equal(findAll(cards2[0], (n) => n.className === "tier-fallback")[2].open, false);
+  assert.equal(findAll(cards2[0], (n) => n.className.includes("tiers-section"))[0].open, true);
   assert.equal(findAll(cards2[2], (n) => n.className.includes("discussion-section"))[0].open, false);
 
   // 模擬 webview 重新載入：使用剛剛 setState 存下的資料
@@ -303,7 +281,6 @@ test("panel.js: 預設收合、重繪與重載保持、各 AI 獨立、停用 AI
   env2.pushState(sampleState());
   const cards3 = findAll(env2.app, (n) => n.tagName === "SECTION");
   assert.equal(findAll(cards3[0], (n) => n.className.includes("discussion-section"))[0].open, true);
-  assert.equal(findAll(cards3[0], (n) => n.className.includes("tiers-section"))[0].open, false);
-  assert.equal(findAll(cards3[0], (n) => n.className === "tier-fallback")[2].open, false);
+  assert.equal(findAll(cards3[0], (n) => n.className.includes("tiers-section"))[0].open, true);
   assert.equal(findAll(cards3[2], (n) => n.className.includes("discussion-section"))[0].open, false);
 });

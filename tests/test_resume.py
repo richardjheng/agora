@@ -145,7 +145,9 @@ class ResumeTests(unittest.TestCase):
         orig_worktree = meta["worktree"]
         orig_base = meta["base_sha"]
         orig_commands = dict(meta["commands"])
-        orig_model = paused["model"]
+        state = cli.load_state(self.thread)
+        state["relay"].update(model="codex-old-model", effort="low", fallback_used=True)
+        cli.save_state(self.thread, state)
         orig_tier = paused["tier"]
 
         # Acknowledge initial stopped completion so we can verify resume emits a new completion.
@@ -164,7 +166,8 @@ class ResumeTests(unittest.TestCase):
         self.assertEqual(resumed["branch"], orig_branch)
         self.assertEqual(resumed["worktree"], orig_worktree)
         self.assertEqual(resumed["base_sha"], orig_base)
-        self.assertEqual(resumed["model"], orig_model)
+        self.assertEqual((resumed["model"], resumed["effort"]), ("codex-old-model", "low"))
+        self.assertIs(resumed["fallback_used"], True)
         self.assertEqual(resumed["tier"], orig_tier)
         self.assertEqual(resumed["session_id"], "sess-orig-1")
         self.assertEqual(resumed["resume_count"], 1)

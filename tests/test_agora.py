@@ -820,7 +820,7 @@ def pct(value, reset_in=3600):
 
 
 class TestTiers(unittest.TestCase):
-    """輕量／標準／重度：先定等級再挑 AI；模型在分派時凍結；額度不足只用使用者設定的替代模型，不擅自降級"""
+    """輕量／標準／重度：先定等級再挑 AI，模型在分派時凍結。"""
 
     def setUp(self):
         # 不讀這台電腦的模型清單快取（CLI 預設模型）；需要時各測試自己寫入
@@ -834,23 +834,21 @@ class TestTiers(unittest.TestCase):
         ws = cli.Workspace(Path(tmp))
         config.update_parties(ws.root, models={"antigravity": "gemini-3.8-flash-high"},
                               tiers={"antigravity.heavy": "gemini-4-argon-high", "claude.heavy": "opus:max",
-                                     "claude.standard": "sonnet"},
-                              tier_fallbacks={"claude.heavy": "sonnet:high"})
+                                     "claude.standard": "sonnet"})
         return ws
 
     def test_config_tiers(self):
         with tempfile.TemporaryDirectory() as tmp:
             ws = self.setup(tmp)
             tiers = config.party_settings(ws.root)["claude"]["tiers"]
-            self.assertEqual(tiers["heavy"], {"model": "opus", "effort": "max", "fallback": {"model": "sonnet", "effort": "high"}})
+            self.assertEqual(tiers["heavy"], {"model": "opus", "effort": "max"})
             self.assertIsNone(tiers["light"])
-            config.update_parties(ws.root, tiers={"claude.heavy": "fable"})          # 換模型保留替代模型
-            self.assertEqual(config.party_settings(ws.root)["claude"]["tiers"]["heavy"]["fallback"]["model"], "sonnet")
+            config.update_parties(ws.root, tiers={"claude.heavy": "fable"})
+            self.assertEqual(config.party_settings(ws.root)["claude"]["tiers"]["heavy"], {"model": "fable", "effort": None})
             config.update_parties(ws.root, tiers={"claude.heavy": "default"})
             self.assertIsNone(config.party_settings(ws.root)["claude"]["tiers"]["heavy"])
-            for bad in ({"tiers": {"claude.huge": "x"}}, {"tier_fallbacks": {"codex.heavy": "x"}}):
-                with self.assertRaises(ValueError):
-                    config.update_parties(ws.root, **bad)
+            with self.assertRaises(ValueError):
+                config.update_parties(ws.root, tiers={"claude.huge": "x"})
 
     def test_plan_model_precedence(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -864,21 +862,6 @@ class TestTiers(unittest.TestCase):
             s["parties"]["claude"]["model"] = "fable"                                           # 討論串明確指定
             self.assertEqual(cli.plan_model(ws, s, "claude", None, None, None)["model"], "fable")
             self.assertEqual(cli.plan_model(ws, s, "claude", "heavy", None, None)["model"], "opus")
-
-    def test_fallback_only_when_configured_and_available(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            ws = self.setup(tmp)
-            s = state_with(["claude"])
-            plan = cli.plan_model(ws, s, "claude", "heavy", None, None)
-            with patch.object(cli, "party_usage", side_effect=lambda p, m=None: pct(2 if m == "opus" else 50)):
-                chosen, _ = cli.choose_model("claude", plan)
-            self.assertEqual((chosen["model"], chosen["effort"], chosen["fallback_used"]), ("sonnet", "high", True))
-            with patch.object(cli, "party_usage", side_effect=lambda p, m=None: pct(2)):
-                chosen, u = cli.choose_model("claude", plan)
-            self.assertEqual(chosen["model"], "opus")   # 替代模型也不足：不降級，維持原等級（之後等重置）
-            plan = cli.plan_model(ws, s, "claude", "standard", None, None)   # 沒設定替代模型
-            with patch.object(cli, "party_usage", return_value=pct(2)):
-                self.assertEqual(cli.choose_model("claude", plan)[0]["model"], "sonnet")
 
     def test_auto_pick_uses_the_tier_pool(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -934,6 +917,8 @@ class TestTiers(unittest.TestCase):
                              ("gemini-4-argon-high", "heavy", "explicit", True, True))
             log = [json.loads(x) for x in shares.log_path(ws.root).read_text(encoding="utf-8").splitlines()]
             self.assertEqual([(e["kind"], e["party"], e["selection"]) for e in log], [("dispatch", "antigravity", "explicit")])
+            self.assertNotIn("fallback_used", relay)
+            self.assertNotIn("fallback_used", log[0])
             self.assertIn("📋 指定 Antigravity（重度等級：gemini-4-argon-high", (thread / "transcript.md").read_text(encoding="utf-8"))
             usage = shares.recent_usage(ws.root, parties.AI_PARTIES)
             self.assertEqual((usage["antigravity"]["dispatch_explicit"], usage["antigravity"]["rounds_7d"]), (1, 0))
@@ -992,13 +977,28 @@ class TestTiers(unittest.TestCase):
     def test_parties_tier_options_are_registered(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = io.StringIO()
-            with patch("sys.stdout", out):
-                os.environ.pop(cli.NESTED_ENV, None)
-                cli.main(["--workspace", tmp, "parties", "--tier", "claude.heavy=opus:max",
-                          "--tier-fallback", "claude.heavy=sonnet", "--json"])
+            with patch("sys.stdout", out), patch.dict(os.environ, {cli.NESTED_ENV: ""}):
+                cli.main(["--workspace", tmp, "parties", "--tier", "claude.heavy=opus:max", "--json"])
             tiers = json.loads(out.getvalue())["parties"]["claude"]["tiers"]
-            self.assertEqual(tiers["heavy"]["model"], "opus")
-            self.assertEqual(tiers["heavy"]["fallback"]["model"], "sonnet")
+            self.assertEqual(tiers["heavy"], {"model": "opus", "effort": "max"})
+
+    def test_removed_tier_option_is_hidden_and_rejected_before_any_write(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = self.setup(tmp)
+            path = config.config_path(ws.root)
+            before = path.read_bytes()
+            command = ["--workspace", tmp, "parties"]
+            out = io.StringIO()
+            with patch("sys.stdout", out), self.assertRaises(SystemExit) as ctx:
+                cli.main([*command, "--help"])
+            self.assertEqual(ctx.exception.code, 0)
+            self.assertNotIn("--tier-fallback", out.getvalue())
+            for other_args in ([], ["--tier", "claude.heavy=fable", "--share", "codex=2"]):
+                with self.subTest(other_args=other_args), self.assertRaises(SystemExit) as ctx:
+                    cli.main([*command, *other_args, "--tier-fallback", "claude.heavy=sonnet"])
+                self.assertEqual(ctx.exception.code,
+                                 "等級的備用模型（--tier-fallback）功能已取消，請改用 --tier 調整主模型。")
+                self.assertEqual(path.read_bytes(), before)
 
     def test_effort_only_keeps_the_tier_model(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1030,11 +1030,10 @@ class TestTiers(unittest.TestCase):
             thread.mkdir(parents=True)
             cli.save_state(thread, state_with(["claude", "codex"]))
             (thread / "transcript.md").write_text("", encoding="utf-8")
-            with patch.object(cli, "party_usage", return_value=pct(1)):   # 額度不足也不換替代模型
-                self.assign(ws, sender="codex", to="claude", session="s-old")
+            self.assign(ws, sender="codex", to="claude", session="s-old")
             relay = cli.load_state(thread)["relay"]
-            self.assertEqual((relay["model"], relay["effort"], relay["tier"], relay["fallback_used"], relay["model_known"]),
-                             ("opus", "max", None, False, True))
+            self.assertEqual((relay["model"], relay["effort"], relay["tier"], relay["model_known"]),
+                             ("opus", "max", None, True))
             cli.save_state(thread, state_with(["claude", "codex"]))
             self.assign(ws, sender="codex", to="claude", session="s-unknown")
             relay = cli.load_state(thread)["relay"]
@@ -1087,23 +1086,6 @@ class TestTiers(unittest.TestCase):
             self.assertIsNone(quota.usage_for("antigravity", "gemini-4-argon-high"))
         with patch.object(quota, "usage", return_value={"remaining_pct": 97.0}):   # 沒有任何池的資料
             self.assertIsNone(quota.usage_for("antigravity", "gemini-4-argon-high"))
-
-    def test_fallback_only_after_all_primaries_are_low(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            ws = self.setup(tmp)
-            config.update_parties(ws.root, models={"codex": "gpt-6.1-sol"})
-            s = state_with(["claude", "codex", "antigravity"])
-            pools = {("antigravity", "gemini-4-argon-high"): 30, ("codex", "gpt-6.1-sol"): 65,
-                     ("claude", "opus"): 2, ("claude", "sonnet"): 99}
-            with patch.object(cli, "party_usage", side_effect=lambda p, m=None: pct(pools[(p, m)])), \
-                    patch("sys.stdout", io.StringIO()):
-                worker, plan, _ = cli.pick_worker(ws, "antigravity", ["claude", "codex", "antigravity"], s, "heavy")
-            self.assertEqual((worker, plan.get("fallback_used")), ("codex", None))   # Codex 主模型 65% 優先於 Claude 替代模型 99%
-            pools[("codex", "gpt-6.1-sol")] = 1
-            with patch.object(cli, "party_usage", side_effect=lambda p, m=None: pct(pools[(p, m)])), \
-                    patch("sys.stdout", io.StringIO()):
-                worker, plan, _ = cli.pick_worker(ws, "antigravity", ["claude", "codex", "antigravity"], s, "heavy")
-            self.assertEqual((worker, plan["model"], plan["fallback_used"]), ("claude", "sonnet", True))
 
     def test_usage_source_and_failed_calls_are_saved(self):
         with tempfile.TemporaryDirectory() as tmp:

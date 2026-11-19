@@ -653,25 +653,18 @@ class PartiesView {
       case "tier":
         await m.update(["--tier", `${msg.party}.${msg.level}=${msg.value || "default"}`]);
         break;
-      case "tierFallback":
-        await m.update(["--tier-fallback", `${msg.party}.${msg.level}=${msg.value || "default"}`]);
-        break;
       case "customTier": {
         const tiers = (m.parties && m.parties[msg.party] && m.parties[msg.party].tiers) || {};
         const curTier = tiers[msg.level];
-        const curObj = msg.fallback ? (curTier && curTier.fallback) : curTier;
-        const curModel = curObj ? curObj.model : "";
-        const role = msg.fallback ? "額度不足時的備用模型" : "模型";
         const levelNames = { light: "輕量", standard: "標準", heavy: "重度" };
         const levelLabel = levelNames[msg.level] || msg.level;
         const value = await vscode.window.showInputBox({
-          prompt: `${NAMES[msg.party]} ${levelLabel}等級的${role}名稱（CLI 接受的完整名稱或別名）`,
-          value: curModel || "",
+          prompt: `${NAMES[msg.party]} ${levelLabel}等級的模型名稱（CLI 接受的完整名稱或別名）`,
+          value: (curTier && curTier.model) || "",
         });
         if (value !== undefined) {
           const val = value.trim() || "default";
-          const flag = msg.fallback ? "--tier-fallback" : "--tier";
-          await m.update([flag, `${msg.party}.${msg.level}=${val}`]);
+          await m.update(["--tier", `${msg.party}.${msg.level}=${val}`]);
         } else {
           this.post();
         }
