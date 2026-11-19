@@ -97,6 +97,45 @@ class TestAgyDiagnostics(unittest.TestCase):
         self.assertEqual(parties.error_kind(None, TELEMETRY + "connection refused"), "network")
         self.assertIsNone(parties.error_kind({"session_id": "401", "duration_seconds": 429}))
 
+    def test_auth_401_and_credentials_narrowing(self):
+        non_auth = [
+            ("line 401", None),
+            ("exit=401", None),
+            ("tests/test_401.py", None),
+            ("401 tests passed", None),
+            ("SyntaxError at line 401 in tests/test_401.py (exit=401)", None),
+            ("credentials.py: argument required", None),
+            ("load credentials from disk; config required", None),
+        ]
+        for text, expected in non_auth:
+            with self.subTest(non_auth=text):
+                self.assertEqual(parties.error_kind({"error": text}), expected)
+                self.assertEqual(parties.error_kind(None, text), expected)
+        self.assertIsNone(parties.error_kind({"exit_code": 401}))
+
+        http_auth = [
+            "HTTP 401",
+            "HTTP/1.1 401",
+            "status 401",
+            "status code 401",
+            "statusCode: 401",
+            "401 Unauthorized",
+            '{"code": 401, "message": "invalid token"}',
+            "credentials are required",
+            "credentials have expired",
+        ]
+        for text in http_auth:
+            with self.subTest(http_auth=text):
+                self.assertEqual(parties.error_kind({"error": text}), "auth")
+                self.assertEqual(parties.error_kind(None, text), "auth")
+        self.assertEqual(parties.error_kind({"code": 401}), "auth")
+
+        # Claude / Codex style error payloads
+        self.assertEqual(parties.error_kind({"type": "result", "is_error": True, "result": "API Error: 401 Unauthorized"}), "auth")
+        self.assertEqual(parties.error_kind({"type": "error", "message": "unexpected status 401 Unauthorized"}), "auth")
+        self.assertIsNone(parties.error_kind({"type": "result", "is_error": True, "result": "failed at line 401 (exit=401)"}))
+        self.assertIsNone(parties.error_kind({"type": "error", "message": "401 tests passed in tests/test_401.py"}))
+
     def test_auth_evidence_before_long_telemetry_is_not_truncated_before_classification(self):
         error, _ = self.fail(stderr="not logged in\n" + "warning\n" * 400 + TELEMETRY)
         self.assertEqual(error.kind, "auth")

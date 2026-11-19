@@ -60,10 +60,14 @@ QUOTA_ERROR = re.compile(r"quota|exhaust|rate.?limit|usage limit|\b429\b|resourc
 BILLING_ERROR = re.compile(r"out of credits|\bcredits?\b|billing|payment|insufficient_quota|subscription|workspace owner",
                            re.I)
 NOISE_KEYS = re.compile(r"(^|_)id$|Id$|uuid|usage|duration|cost|tokens", re.I)
-AUTH_ERROR = re.compile(r"auth(?:entication|orization)?\s+(?:failed|failure|timed?\s*out|required)|"
-                        r"not logged in|not authenticated|unauthenticated|invalid.?grant|"
-                        r"(?:missing|invalid|expired|no (?:available|valid))\s+credentials?|"
-                        r"no credentials?|credentials?[^\n]*(?:missing|invalid|expired|not found|unavailable|required)|\b401\b", re.I)
+AUTH_ERROR = re.compile(r"\bauth(?:entication|orization)?\s+(?:failed|failure|timed?\s*out|required)\b|"
+                        r"\b(?:not logged in|not authenticated|unauthenticated|invalid[\s_-]?grant)\b|"
+                        r"\b(?:missing|invalid|expired|no(?:\s+(?:available|valid))?)\s+credentials?\b|"
+                        r"\bcredentials?\s+(?:(?:is|are|were|was|have|has)\s+)?(?:missing|invalid|expired|not found|unavailable|required)\b|"
+                        r"\bhttp(?:/\d(?:\.\d)?)?\s+401\b|"
+                        r"\bstatus(?:[\s_-]?code)?(?:\\?[\"'])?\s*[:=]?\s*401\b|"
+                        r"\b401\s+unauthorized\b|"
+                        r"\\?[\"']code\\?[\"']\s*:\s*401\b", re.I)
 NETWORK_ERROR = re.compile(r"connection (?:refused|reset|timed out)|connect(?:ion)? timeout|"
                            r"failed to (?:connect|resolve)|could not resolve|name resolution|"
                            r"no such host|dns (?:error|failure)|getaddrinfo|econnrefused|enotfound|"
