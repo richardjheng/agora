@@ -606,6 +606,8 @@ def unavailable(usage: dict | None) -> bool:
 def billing_reason(message: str) -> str:
     """帳務或權限錯誤的簡短說明（顯示用）"""
     m = (message or "").lower()
+    if "（auth）" in m or "authentication failed" in m:
+        return "驗證失敗（auth）"
     if "credit" in m:
         return "workspace 沒有 credits" if "workspace" in m else "credits 已用完"
     if "insufficient_quota" in m:
@@ -625,10 +627,10 @@ def blocked(party: str) -> dict | None:
     return blocked_all().get(party)
 
 
-def mark_blocked(party: str, message: str) -> dict:
+def mark_blocked(party: str, message: str, reason: str | None = None) -> dict:
     """記下這一方暫時不能用（直到下一次成功呼叫，或 agora quota --unblock）"""
     data = blocked_all()
-    data[party] = {"reason": billing_reason(message), "message": (message or "")[:500], "at": int(time.time())}
+    data[party] = {"reason": reason or billing_reason(message), "message": (message or "")[:500], "at": int(time.time())}
     try:
         _write_json(BLOCKED_FILE, data)
     except OSError:
@@ -676,7 +678,7 @@ def usage_for(party: str, model: str | None = None) -> dict | None:
         key = None   # _match_agy_pool 對不到時退回通用的 gemini 池，不能當成這個模型的池
     pool = pools.get(key) if key else None
     if not pool:
-        return None
+        return {**u, "remaining_pct": 0.0, "window": None, "window_label": None} if u.get("blocked") else None
     return {**u, "remaining_pct": pool["remaining_pct"], "resets_at": pool.get("resets_at"), "window": key,
             "window_label": pool.get("short_label") or pool.get("label")}
 

@@ -435,11 +435,16 @@ DENIED_RETRY = ("上一輪你使用了不被允許的工具或終端指令，整
 
 def call_party(party: str, *args, **kwargs):
     """呼叫某一方的 CLI；帳務或權限錯誤時記下它暫時不能用，成功時清除這個標記"""
+    mark = quota.blocked(party)
+    if mark and mark.get("reason") == "auth":
+        raise CallError(f"{NAMES[party]} 因 auth 暫停呼叫：{mark.get('message') or '驗證失敗'}\n"
+                        f"請先在一般終端重新登入（Antigravity 執行 agy），再執行 agora quota --unblock {party} 解除標記。",
+                        blocked=True, kind="auth")
     try:
         result = CALLERS[party](*args, **kwargs)
     except CallError as e:
         if e.blocked:
-            quota.mark_blocked(party, str(e))
+            quota.mark_blocked(party, str(e), reason="auth" if e.kind == "auth" else None)
         raise
     quota.clear_blocked(party)
     return result
@@ -943,6 +948,9 @@ def describe_candidate(party: str, info: dict) -> str:
         text += f"，{info['quota_note']}"
     if info.get("reset_elapsed"):
         text += "，重置時間已過，視為已重置"
+    if info.get("excluded") == "被封鎖（auth）":
+        text += (f"，驗證失敗；請先在一般終端重新登入（Antigravity 執行 agy），"
+                 f"再執行 agora quota --unblock {party} 解除標記")
     return text + (f"，不挑：{info['excluded']}" if info.get("excluded") else "")
 
 

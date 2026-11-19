@@ -2712,7 +2712,8 @@ class TestBuildAndSandbox(unittest.TestCase):
                 self.assertNotIn("終端指令", retry)
             self.assertEqual(relay["status"], "done")
             self.assertEqual([(d["round"], d["action"], d["target"]) for d in relay["denied"]],
-                             [(1, "read_url", url), (1, "read_url", url)])
+                             [(1, "read_url", f"推定目標：{url}"), (1, "read_url", f"推定目標：{url}")])
+            self.assertTrue(all(d["target_inferred"] for d in relay["denied"]))
             self.assertIn("工具被拒", (thread / "progress.md").read_text(encoding="utf-8"))
             self.assertIn("請查證", (thread / "transcript.md").read_text(encoding="utf-8"))
             out = io.StringIO()
