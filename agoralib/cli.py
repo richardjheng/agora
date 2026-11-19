@@ -930,7 +930,7 @@ def plan_model(ws: Workspace, state: dict, party: str, tier: Optional[str], mode
     spec = tiers.get(level) if level else None
     if spec:   # --effort 只覆蓋推理強度，模型仍依等級；level 是實際套用的等級（沒給 --tier 但套用標準等級時為 standard）
         return resolve_default(party, {"model": spec["model"], "effort": effort or spec.get("effort"), "level": level,
-                                       "fallback": spec.get("fallback"), "source": f"{config.TIER_LABELS[level]}等級"})
+                                       "source": f"{config.TIER_LABELS[level]}等級"})
     return resolve_default(party, {"model": base.get("model"), "effort": effort or base.get("effort"),
                                    "source": "討論串設定" if explicit else "專案設定" if base.get("model") else "CLI 預設"})
 
@@ -961,26 +961,13 @@ def session_config(ws: Workspace, party: str, session_id: str) -> Optional[dict]
 
 
 def session_plan(ws: Workspace, party: str, session_id: str) -> dict:
-    """延續既有對話（--session）：不套等級、不換替代模型，沿用這段對話原本的模型與推理強度。
+    """延續既有對話（--session）：沿用這段對話原本的模型與推理強度。
     Agora 沒記錄過它的設定時不指定模型與推理強度（讓 CLI 沿用該對話自己的設定），標記為未知，
     不拿目前的專案設定冒充，避免隱性換模型"""
     known = session_config(ws, party, session_id)
     if known is not None:   # 記錄過、但模型仍是 CLI 預設且沒有回報實際模型時，仍算未知
         return {**known, "model_known": bool(known.get("model")), "source": "延續對話（原本的設定）"}
     return {"model": None, "effort": None, "model_known": False, "source": "延續對話（原本的設定未知，不指定模型）"}
-
-
-def choose_model(party: str, plan: dict) -> Tuple[dict, Optional[dict]]:
-    """這個等級的額度池不足、而使用者設定了替代模型且它的額度足夠時，改用替代模型（不擅自降成較低等級）；
-    回傳 (計畫, 對應的額度)"""
-    u = party_usage(party, plan.get("model"))
-    fb = plan.get("fallback")
-    if shares.quota_info(u).get("excluded", "").startswith("額度不足") and fb:
-        fu = party_usage(party, fb["model"])
-        if shares.eligible([party], {party: 1}, {party: fu}):
-            return {**plan, "model": fb["model"], "effort": fb.get("effort"), "fallback_used": True,
-                    "source": plan["source"] + "的替代模型"}, fu
-    return plan, u
 
 
 def usage_info(plan: dict, u: Optional[dict]) -> dict:
@@ -1016,17 +1003,10 @@ def pick_worker(ws: Workspace, owner: str, candidates: List[str], state: dict, t
         shares.save_dispatch_state(ws.root, data)
         sys.exit("沒有可自動分派的 AI（其他勾選中 AI 的分配比例都是 0）。已退出，不由主持人自行實作。")
     plans, usages, infos = {}, {}, {}
-    for p in others:   # 先只看各方這個等級的主模型
+    for p in others:
         plans[p] = plan_model(ws, state, p, tier, model, effort)
         usages[p] = party_usage(p, plans[p].get("model"))
         infos[p] = usage_info(plans[p], usages[p])
-    if not shares.eligible(others, weights, usages):   # 主模型都不足才考慮設定的替代模型
-        for p in others:
-            if plans[p].get("fallback") and not (usages[p] or {}).get("blocked"):
-                fb_plan, fb_usage = choose_model(p, plans[p])
-                if fb_plan.get("fallback_used"):
-                    plans[p], usages[p] = fb_plan, fb_usage
-                    infos[p] = usage_info(fb_plan, fb_usage)
     data = shares.dispatch_state(ws.root)
     worker, schedule = shares.schedule_next(others, weights, usages, data.get("schedule") or {})
     if (data.get("schedule") or {}).get("signature") != schedule["signature"]:
@@ -1236,14 +1216,12 @@ def _cmd_resume_locked(ws: Workspace, args):
         if not switched:
             plan = {"level": relay.get("tier"), "model": relay.get("model"), "effort": relay.get("effort"),
                     "source": relay.get("model_source") or "沿用原分派",
-                    "fallback_used": bool(relay.get("fallback_used")),
                     "model_known": bool(relay.get("model_known"))}
             tier_requested = relay.get("tier_requested")
-            u = party_usage(worker, plan.get("model"))
         else:
-            orig_tier = relay.get("tier_requested") or relay.get("tier")
-            plan, u = choose_model(worker, plan_model(ws, state, worker, orig_tier, None, None))
-            tier_requested = orig_tier
+            tier_requested = relay.get("tier_requested") or relay.get("tier")
+            plan = plan_model(ws, state, worker, tier_requested, None, None)
+        u = party_usage(worker, plan.get("model"))
         cand_info = usage_info(plan, u)
         if not shares.eligible([worker], {worker: 1}, {worker: u}):
             sys.exit(f"續跑接手方 {NAMES[worker]} 不合格：{describe_candidate(worker, cand_info)}。已退出，不等待重置。")
@@ -1337,7 +1315,6 @@ def _cmd_resume_locked(ws: Workspace, args):
                 "model": plan.get("model"),
                 "effort": plan.get("effort"),
                 "model_source": plan.get("source"),
-                "fallback_used": bool(plan.get("fallback_used")),
                 "model_known": bool(plan.get("model_known")),
                 "subagents": subagents,
                 "resume_count": resume_count,
@@ -1479,9 +1456,9 @@ def _cmd_assign_locked(ws: Workspace, args):
             sys.exit(routing.ZERO_SHARE_ROLE + " 指定零權重實作須加 --user-override 與 --reason 記錄使用者明確指定。")
         if args.session:
             plan = session_plan(ws, worker, args.session)
-            u = party_usage(worker, plan.get("model"))
         else:
-            plan, u = choose_model(worker, plan_model(ws, state, worker, tier, model_arg, effort_arg))
+            plan = plan_model(ws, state, worker, tier, model_arg, effort_arg)
+        u = party_usage(worker, plan.get("model"))
         decision = {"selection": "explicit", "candidates": {worker: usage_info(plan, u)}, "waiting": False}
         if not shares.eligible([worker], {worker: 1}, {worker: u}):
             sys.exit(f"指定的 {NAMES[worker]} 不合格：{describe_candidate(worker, decision['candidates'][worker])}。"
@@ -1521,7 +1498,7 @@ def _cmd_assign_locked(ws: Workspace, args):
                     "time": time.time(), "party": worker, "thread": thread.name, "from": owner,
                     "selection": decision["selection"], "trigger": getattr(args, "trigger", None) or "manual",
                     "tier": plan.get("level"), "tier_requested": tier, "model": plan.get("model"), "effort": plan.get("effort"),
-                    "fallback_used": bool(plan.get("fallback_used")), "candidates": decision["candidates"],
+                    "candidates": decision["candidates"],
                     "reason": reason, "user_override": override,
                     **{k: task.get(k) for k in worktree.FIELDS}}
     dispatch_data = shares.dispatch_state(ws.root)
@@ -1549,7 +1526,7 @@ def _cmd_assign_locked(ws: Workspace, args):
                           "tier": plan.get("level"), "tier_requested": tier,
                           "model": plan.get("model"), "effort": plan.get("effort"), "last_model_reported": None,
                           "last_model_requested": None, "last_effort_requested": None,
-                          "model_source": plan.get("source"), "fallback_used": bool(plan.get("fallback_used")),
+                          "model_source": plan.get("source"),
                           "model_known": bool(plan.get("model_known")),
                           "subagents": subagents, "selection": decision["selection"],
                           "trigger": getattr(args, "trigger", None) or "manual"}
@@ -1558,7 +1535,6 @@ def _cmd_assign_locked(ws: Workspace, args):
     add_system_note(thread, f"📋 {'自動挑選' if decision['selection'] == 'auto' else '指定'} {NAMES[worker]}"
                             f"（{level}：{plan.get('model') or 'CLI 預設模型'}"
                             + (f"、{plan['effort']}" if plan.get("effort") else "")
-                            + ("，額度不足改用使用者設定的替代模型" if plan.get("fallback_used") else "")
                             + ("，子代理：" + ("允許" if subagents else "不允許") if subagents is not None else "") + "）"
                             + f"；派工識別碼：{dispatch_id}"
                             + (f"；指定理由：{reason}" if reason else "")
@@ -2672,6 +2648,8 @@ def core_info() -> dict:
 
 def cmd_parties(ws: Workspace, args):
     """查看或修改此專案啟用的 AI、模型與工作分配比例"""
+    if getattr(args, "tier_fallback", None) is not None:
+        sys.exit("等級的備用模型（--tier-fallback）功能已取消，請改用 --tier 調整主模型。")
     split = lambda v: [canonical(p) for p in v.split(",") if p.strip()] if v else []  # noqa: E731
     enable, disable = split(args.enable), split(args.disable)
     bad = [p for p in enable + disable if p not in AI_PARTIES]
@@ -2680,12 +2658,12 @@ def cmd_parties(ws: Workspace, args):
     models_, efforts, shares_ = parse_pairs(args.model), parse_pairs(args.effort), parse_pairs(args.share)
     subagents = parse_pairs(args.subagents)
     sandboxes = parse_pairs(args.sandbox)
-    tiers, tier_fallbacks = parse_tier_pairs(getattr(args, "tier", None)), parse_tier_pairs(getattr(args, "tier_fallback", None))
-    if enable or disable or models_ or efforts or shares_ or subagents or sandboxes or tiers or tier_fallbacks:
+    tiers = parse_tier_pairs(getattr(args, "tier", None))
+    if enable or disable or models_ or efforts or shares_ or subagents or sandboxes or tiers:
         guard_nested()
         try:
             settings = config.update_parties(ws.root, enable, disable, models_, efforts, shares_, subagents, sandboxes,
-                                             tiers, tier_fallbacks)
+                                             tiers)
         except ValueError as e:
             sys.exit(str(e))
     else:
@@ -2716,7 +2694,6 @@ def cmd_parties(ws: Workspace, args):
                 line += f"｜沙箱：{s['sandbox']}"
         print(line)
         levels = [f"{config.TIER_LABELS[k]} {t['model']}" + (f"、{t['effort']}" if t.get("effort") else "")
-                  + (f"（替代 {t['fallback']['model']}）" if t.get("fallback") else "")
                   for k, t in s["tiers"].items() if t]
         if levels:
             print(f"      等級：{'；'.join(levels)}")
@@ -3575,8 +3552,7 @@ def main(argv=None):
     p.add_argument("--tier", action="append",
                    help="分派等級的模型，例如 --tier antigravity.heavy=gemini-4-argon-high --tier claude.light=haiku:low"
                         "（light / standard / heavy；值為 default 表示清除、沿用目前模型）")
-    p.add_argument("--tier-fallback", action="append",
-                   help="等級的替代模型（該等級額度不足、其他 AI 的主模型也不足時才用），例如 --tier-fallback claude.heavy=sonnet:high")
+    p.add_argument("--tier-fallback", action="append", help=argparse.SUPPRESS)
     p.add_argument("--sandbox", action="append",
                    help="Codex 接手工作時的沙箱，例如 --sandbox codex=danger-full-access"
                         "（workspace-write / danger-full-access / read-only，default 改回 workspace-write；討論一律唯讀）")

@@ -77,7 +77,6 @@ A=agora    # 或 A="python D:/github/agora/agora.py"
 $A parties                                          # 此專案參與的 AI 與模型
 $A parties --disable antigravity --model codex=gpt-6.1-sol --effort claude=high
 $A parties --tier codex.heavy=gpt-5 --tier claude.light=haiku:low  # 各等級模型（light/standard/heavy，default 清除）
-$A parties --tier-fallback codex.heavy=gpt-4.5:medium               # 各等級替代模型（fallback）
 $A parties --share claude=5 --share codex=3          # 自動派工比例（件數權重）
 $A parties --subagents codex=off                    # 被 Agora 呼叫時能否啟動自己的內建子代理（on / off，預設 off）
 $A parties --sandbox codex=danger-full-access       # Codex 接手工作時的沙箱（預設 workspace-write）
@@ -279,9 +278,8 @@ skills 建議的流程：決策、設計、取捨類問題用中立開場（不�
 - **設定指令**：
   ```bash
   agora parties --tier codex.heavy=gpt-5 --tier claude.light=haiku:low   # 各等級模型（default 恢復沿用目前模型）
-  agora parties --tier-fallback codex.heavy=gpt-4.5:medium                # 各等級替代模型（default 清除）
   ```
-- **VSCode 面板**：每個 AI 卡片提供可收合的「討論時用的模型」（模型與思考深度，對應 `--effort`）與「接手工作時用的模型」（對應 `assign --tier` 的輕量／標準／重度三列，未設定時沿用討論設定；各列可展開設定「額度不足時的備用模型」）。
+- **VSCode 面板**：每個 AI 卡片提供可收合的「討論時用的模型」（模型與思考深度，對應 `--effort`）與「接手工作時用的模型」（對應 `assign --tier` 的輕量／標準／重度三列，未設定時沿用討論設定）。
 
 ### 怎麼看用的是哪個模型
 
@@ -323,7 +321,7 @@ AI 回覆時使用的模型依三種情況決定與記錄：
 `assign` 沒指定 `--to` 時，交由 Agora 自動挑選接手方：
 
 - **依比例輪流派工（加權輪詢）**：採用平滑加權輪詢（Smooth Weighted Round-Robin），在合格候選者中依設定的比例輪流分派，取代早期的剩餘額度最高者優先。
-- **額度僅作為資格篩選**：候選 AI 該等級額度充足且未被標記無法使用（blocked）才具備候選資格；額度高低不影響輪流順序。各方主模型全部不合格時才考慮設定的替代模型（fallback）；若仍沒有合格接手方時 agora 會回報退出（不等待重置，也不由主持人自行實作），並告知使用者，**絕不擅自降級**至較低等級模型執行。
+- **額度僅作為資格篩選**：候選 AI 該等級額度充足且未被標記無法使用（blocked）才具備候選資格；額度高低不影響輪流順序。沒有合格接手方時，Agora 會回報各方的資格並退出，不等待重置，不由主持人自行實作，也不降級。
 - **等級不足回報（【需要升級】）**：接手方在執行期間若評估當前等級模型無法勝任，會在進度檔寫明理由，回覆最後一行寫「【需要升級】」（Agora 會把狀態設為 `needs_upgrade`）；分派方看到後以較高等級重新分派（開啟新 session）。
 - **明確指定接手方（`--to <AI>`）**：明確指定時不受比例與輪流限制，但接手方仍須符合額度資格；預設不寫 `--to`，只有特定理由（例如使用者明確指定或專長要求）才寫 `--to`，且必須以 `--reason "<理由>"` 記錄原因；若指定的接手方分配比例為 0，另需加上 `--user-override` 記錄使用者明確指定。
 

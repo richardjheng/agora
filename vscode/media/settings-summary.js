@@ -52,13 +52,12 @@
 
   /**
    * 接手工作時用的模型摘要（僅呈現專案設定，不推算執行結果）。
-   * 例：「輕量 opus/low · 標準 opus/medium · 重度 opus/high · 備用 2」
+   * 例：「輕量 opus/low · 標準 opus/medium · 重度 opus/high」
    * 未設定的等級寫「沿用討論設定」。
    */
   function tiersSummary(setting) {
     const tiers = (setting && setting.tiers) || {};
     const parts = [];
-    let fallbackCount = 0;
 
     for (const lvl of TIER_DEFS) {
       const cfg = tiers[lvl.id] || null;
@@ -66,14 +65,8 @@
       const effort = cfg && cfg.effort ? cfg.effort : "";
       const value = model ? (effort ? `${model}/${effort}` : model) : "沿用討論設定";
       parts.push(`${lvl.label} ${value}`);
-      if (cfg && cfg.fallback && cfg.fallback.model) {
-        fallbackCount += 1;
-      }
     }
 
-    if (fallbackCount > 0) {
-      parts.push(`備用 ${fallbackCount}`);
-    }
     return parts.join(" · ");
   }
 

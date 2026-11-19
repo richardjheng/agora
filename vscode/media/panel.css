@@ -337,58 +337,6 @@ input.share {
   width: 5.5em;
 }
 
-.tier-fallback {
-  margin-left: 2.8em;
-  font-size: 0.85em;
-  min-width: 0;
-}
-
-.tier-fallback > summary {
-  display: flex;
-  align-items: center;
-  min-width: 0;
-  cursor: pointer;
-  color: var(--vscode-textLink-foreground, var(--vscode-descriptionForeground));
-  user-select: none;
-  list-style: none;
-  margin-bottom: 4px;
-}
-
-.tier-fallback > summary::-webkit-details-marker {
-  display: none;
-}
-
-.tier-fallback > summary::before {
-  content: "▸";
-  flex-shrink: 0;
-  width: 1em;
-}
-
-.tier-fallback[open] > summary::before {
-  content: "▾";
-}
-
-.tier-fallback-summary-text {
-  min-width: 0;
-  flex: 1 1 auto;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.tier-fallback-content {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 6px;
-  align-items: center;
-  padding: 4px 0 2px;
-  min-width: 0;
-}
-
-.tier-fallback-content.no-effort {
-  grid-template-columns: minmax(0, 1fr);
-}
-
 .usage-block {
   display: flex;
   flex-direction: column;

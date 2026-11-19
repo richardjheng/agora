@@ -67,13 +67,7 @@ def _model_spec(value) -> Optional[dict]:
 
 def _tiers(item: dict) -> Dict[str, Optional[dict]]:
     raw = item.get("tiers") if isinstance(item.get("tiers"), dict) else {}
-    out = {}
-    for level in TIER_LEVELS:
-        spec = _model_spec(raw.get(level))
-        if spec:
-            spec["fallback"] = _model_spec(raw[level].get("fallback"))
-        out[level] = spec
-    return out
+    return {level: _model_spec(raw.get(level)) for level in TIER_LEVELS}
 
 
 def party_settings(root: Path, data: Optional[dict] = None) -> Dict[str, dict]:
@@ -117,8 +111,7 @@ def update_parties(root: Path, enable: Iterable[str] = (), disable: Iterable[str
                    shares: Optional[Dict[str, str]] = None,
                    subagents: Optional[Dict[str, str]] = None,
                    sandboxes: Optional[Dict[str, str]] = None,
-                   tiers: Optional[Dict[str, str]] = None,
-                   tier_fallbacks: Optional[Dict[str, str]] = None) -> Dict[str, dict]:
+                   tiers: Optional[Dict[str, str]] = None) -> Dict[str, dict]:
     """更新參與方設定；模型、推理強度、沙箱給空字串或 default 表示改回 CLI 預設，比例給 default 表示改回 1，
     子代理給 on / off（default 表示改回不允許）。等級的鍵是「AI.等級」（例如 antigravity.heavy），值是「模型[:推理強度]」，
     default 清除。至少要保留一個 AI。"""
@@ -164,23 +157,14 @@ def update_parties(root: Path, enable: Iterable[str] = (), disable: Iterable[str
             item.pop("subagents", None)
         else:
             raise ValueError(f"子代理設定只能是 on 或 off：{p}={value}")
-    for key, value, fallback in [(k, v, False) for k, v in (tiers or {}).items()] \
-            + [(k, v, True) for k, v in (tier_fallbacks or {}).items()]:
+    for key, value in (tiers or {}).items():
         p, _, level = key.partition(".")
         if p not in AI_PARTIES or level not in TIER_LEVELS:
             raise ValueError(f"等級的格式是 <AI>.<{'|'.join(TIER_LEVELS)}>=<模型>[:<推理強度>]：{key}={value}")
         item_tiers = parties.setdefault(p, {}).setdefault("tiers", {})
         spec = parse_model_spec(value)
-        if fallback:
-            if not (item_tiers.get(level) or {}).get("model"):
-                raise ValueError(f"先設定 {p}.{level} 的模型，才能設定替代模型")
-            if spec:
-                item_tiers[level]["fallback"] = spec
-            else:
-                item_tiers[level].pop("fallback", None)
-        elif spec:
-            item_tiers[level] = {**spec, **({"fallback": item_tiers[level]["fallback"]}
-                                            if (item_tiers.get(level) or {}).get("fallback") else {})}
+        if spec:
+            item_tiers[level] = spec
         else:
             item_tiers.pop(level, None)
         if not item_tiers:
@@ -188,6 +172,12 @@ def update_parties(root: Path, enable: Iterable[str] = (), disable: Iterable[str
     settings = party_settings(root, data)
     if not any(s["enabled"] for s in settings.values()):
         raise ValueError("至少要啟用一個 AI。")
+    for item in parties.values():
+        item_tiers = item.get("tiers") if isinstance(item, dict) else None
+        if isinstance(item_tiers, dict):
+            for spec in item_tiers.values():
+                if isinstance(spec, dict):
+                    spec.pop("fallback", None)
     save(root, data)
     return settings
 
