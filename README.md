@@ -94,6 +94,7 @@ $A summarize <id> --by claude                       # 用新對話讀完整逐�
 $A assign <id> --from human --from-summary --allow "src/**" [--yes]  # 用總結的工作單分派；總結過期時要 --yes 確認
 $A status <id> [--wait 900] [--json]                # 分派狀態與最新進度（見下方 exit code）
 $A changes <id> [--json]                            # 分派期間的變更（相對於分派當下的工作區快照）
+$A finalize <id> [--dispatch-id <分派ID>]             # 程序結束後，完整驗證保留成果並提交
 $A recall <id> [--wait [秒數]]                       # 請接手方停止；--wait 等到真的停止（預設最多 600 秒）
 $A check                                            # 工作區驗證（語法檢查＋測試）
 $A build                                            # 專案建置（.agora/config.json 的 build 指令）
@@ -128,6 +129,13 @@ $A keep <id> [--off]                                # 標記保留，prune 不�
 沒加 `--wait` 時只報告狀態，exit code 一律是 0。`--json` 輸出
 `{status, worker, alive, rounds, branch, worktree, commit, timed_out, waiting_until, updated, started, error, denied, denied_summary, warning, last_progress, exit_code}`。
 VSCode 面板分派狀態與終端皆會顯示獨立 branch、worktree 位置與 commit 結果。
+
+停止、暫停或驗證失敗後，若成果仍保留在隔離 worktree，主持方可在主工作區執行
+`agora finalize <討論串> [--dispatch-id <分派ID>]`（預設最近一次）。接手程序必須已結束，
+且分派目錄的 `commit-message.md` 必須寫明任務目的與測試範圍。finalize 一定重跑完整驗證，
+不提供跳過驗證或接受失敗的選項；範圍不符、驗證失敗或新停止要求都不提交，也不刪除或搬移成果。
+舊停止要求會在確認程序結束後解除並記入 manifest；執行中仍可用 `recall` 再次停止。
+已提交的分派再次 finalize 只回報既有 SHA。這是主持方的收尾指令，不加入接手方的指令白名單。
 
 - 剛 `assign` 的工作在背景程序記下 PID 前（狀態 `starting` 未滿 60 秒）一律視為進行中，`status`、`activity` 與其他同時執行的指令不會把它判成中斷。
   assign 必須先寫入狀態再啟動背景程序（背景程序一啟動就讀取它），所以用這段緩衝，而不是先啟動再寫入。

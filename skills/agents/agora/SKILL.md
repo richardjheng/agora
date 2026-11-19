@@ -102,6 +102,7 @@ python D:/github/agora/agora.py watch                          # 同時有分派
 - **獨立環境與建置**：每個 worktree 各建 `.venv`，建置輸出留在該 worktree。
 - **由 Agora 代做 Commit**：接手方完成後將 commit 訊息（任務目的、測試範圍）寫成檔案，宣告完成後由 Agora 核對分派、branch 與檔案範圍，執行實際 `agora check`，附上真實結果後代為 commit。接手方不要自行 git commit。不自動 push / merge，成果保留由使用者另行指派 merge。
 - **驗證排隊與不要中斷**：`agora check` 跨分派依控制根目錄 `.agora/config.json` 的 `check_concurrency`（預設 1）FIFO 排隊，可能排隊等待或執行耗時很長；排隊或執行中不要中斷，也不要因為耗時久就改判失敗。
+- **保留成果收尾（主持方）**：停止、暫停或驗證失敗後，確認接手程序已結束、`commit-message.md` 已寫好，可在主工作區用 `python D:/github/agora/agora.py finalize <討論串> [--dispatch-id <分派ID>]` 收尾（預設最近一次）。一定重跑完整驗證，不提供跳過或接受失敗；失敗保留檔案、不提交。舊停止要求解除時會記錄，執行中新的 `recall` 仍有效；已 committed 只回報既有 SHA。這不是 resume，也不擴大範圍，接手方不可自行執行。
 - **子代理非強制隔離**：子代理預設關閉；僅在顯式 `--subagents on` 時加入並行指引。**子代理在同一 worktree 執行**，由父代理負責整合驗證；這不是強制隔離，也不承諾子代理有獨立 worktree。
 
 ### 等級選擇準則（--tier）

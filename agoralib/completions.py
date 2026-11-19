@@ -44,6 +44,8 @@ def event(thread, kind, record, topic=""):
         return None
     identity = (record.get("dispatch_id") if kind == "relay" else record.get("job_id"))
     identity = identity or record.get("started_ts") or record.get("started") or record.get("pid") or "legacy"
+    if record.get("finalize_id"):
+        identity = [identity, record["finalize_id"]]
     key = hashlib.sha256(json.dumps([thread.name, kind, identity], ensure_ascii=False).encode()).hexdigest()
     return {"id": key, "thread": thread.name, "topic": topic, "type": kind,
             **{k: record.get(k) for k in ("dispatch_id", "job_id", "worker", "kind", "status", "branch",
@@ -73,7 +75,8 @@ def snapshot(root):
             except (OSError, ValueError):
                 records.append({})  # damage to one record must not hide the other
         state, job = records
-        for kind, record in (("relay", state.get("relay") or {}), ("discussion", job)):
+        for kind, record in (("relay", state.get("relay") or {}),
+                             ("relay", state.get("finalizer") or {}), ("discussion", job)):
             if not isinstance(record, dict):
                 continue
             running = RELAY_ACTIVE if kind == "relay" else jobs.RUNNING

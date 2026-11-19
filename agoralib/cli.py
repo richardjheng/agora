@@ -817,8 +817,18 @@ def update_relay(thread: Path, **fields) -> dict:
         state = load_state(thread)
         state.setdefault("relay", {}).update(fields, updated=now_str())
         save_state(thread, state)
+        archive_relay(thread, state["relay"])
         completions.archive(thread, "relay", state["relay"], state.get("topic", ""))
         return state["relay"]
+
+
+def archive_relay(thread: Path, relay: dict):
+    """Keep PID evidence when a later assignment replaces the latest relay."""
+    key = relay.get("dispatch_id") or ""
+    if re.fullmatch(r"[A-Za-z0-9_-]{1,128}", key):
+        directory = thread / "dispatches" / key
+        if (directory / "manifest.json").is_file():
+            completions.atomic_write(directory / "relay.json", relay)
 
 
 RELAY_ACTIVE = ("starting", "running", "waiting", "checking")
@@ -846,7 +856,11 @@ def relay_alive(relay: dict) -> bool:
 
 def current_relay(thread: Path) -> Optional[dict]:
     """分派紀錄；狀態仍是進行中、背景程序卻已不在（被強制終止）的改記為 interrupted"""
-    relay = load_state(thread).get("relay")
+    state = load_state(thread)
+    finalizer = state.get("finalizer") or {}
+    if jobs.pid_alive(finalizer.get("pid"), finalizer.get("pid_started")):
+        return finalizer
+    relay = state.get("relay")
     if relay and relay.get("status") in RELAY_ACTIVE and not relay_alive(relay):
         relay = update_relay(thread, status="interrupted")
     return relay
@@ -855,8 +869,11 @@ def current_relay(thread: Path) -> Optional[dict]:
 def stop_requested(thread: Path) -> bool:
     try:
         return bool(json.loads(relay_paths(thread)["control"].read_text(encoding="utf-8")).get("stop_requested"))
-    except Exception:
+    except FileNotFoundError:
+        # Old threads and checks outside a running assignment have no control file.
         return False
+    except (OSError, ValueError, AttributeError):
+        return True
 
 
 def party_usage(party: str, model: Optional[str] = None) -> Optional[dict]:
@@ -1021,6 +1038,9 @@ def _cmd_assign_locked(ws: Workspace, args):
     thread = ws.resolve_thread(args.thread)
     owner = canonical(args.sender)
     state = load_state(thread)
+    finalizer = state.get("finalizer") or {}
+    if jobs.pid_alive(finalizer.get("pid"), finalizer.get("pid_started")):
+        sys.exit("此討論串正在 finalize，請等待收尾完成後再分派。")
     if args.from_summary:
         if args.message is not None or args.file:
             sys.exit("--from-summary 不能和 --message / --file 一起使用。")
@@ -1117,6 +1137,7 @@ def _cmd_assign_locked(ws: Workspace, args):
         if previous.get("status") in RELAY_ACTIVE:
             previous = {**previous, "status": "interrupted"}  # old worker was confirmed dead above
         completions.archive(thread, "relay", previous, state.get("topic", ""))
+        archive_relay(thread, previous)
         # 模型在分派時凍結：之後各輪都用這裡記的，專案設定中途改了也不會悄悄換模型（model 為 None 表示 CLI 預設）
         state["relay"] = {"from": owner, "worker": worker, "status": "starting", "rounds": 0,
                           **{k: task.get(k) for k in worktree.FIELDS},
@@ -1161,6 +1182,103 @@ def _cmd_assign_locked(ws: Workspace, args):
         print(f"⚠️ 沒有記錄分派基準，無法用 changes 檢視變更：{baseline['error']}")
     print(f"進度：{paths['progress']}")
     print(f"查詢：{agora_cmd()} status {thread.name} --wait 900")
+
+
+def finish_finalize(thread: Path, relay: dict, meta: dict, error=None):
+    """Update this dispatch without replacing a newer assignment's relay."""
+    result = {**relay, **{k: meta.get(k) for k in worktree.FIELDS},
+              "status": ("stopped" if stop_requested(thread) else "failed") if error else "done",
+              "error": str(error) if error else None, "updated": now_str(), "waiting_until": None}
+    if "finalize_previous_pid" in relay:
+        result.update(pid=relay["finalize_previous_pid"], pid_started=relay.get("finalize_previous_pid_started"))
+    with thread_lock(thread, wait=WORKER_LOCK_WAIT):
+        state = load_state(thread)
+        if (state.get("relay") or {}).get("dispatch_id") == meta["dispatch_id"]:
+            state["relay"] = result
+        if (state.get("finalizer") or {}).get("finalize_id") == relay.get("finalize_id"):
+            state.pop("finalizer", None)
+        save_state(thread, state)
+        archive_relay(thread, result)
+        completions.archive(thread, "relay", result, state.get("topic", ""))
+    detail = str(error) if error else f"branch：{meta['branch']}；commit：{meta.get('commit_sha') or meta.get('commit_status')}"
+    append_progress(thread, "finalize", f"分派：{meta['dispatch_id']}；{detail}")
+
+
+def cmd_finalize(ws: Workspace, args):
+    """Host-only recovery of retained work, always through the checked commit path."""
+    guard_nested()
+    thread = ws.resolve_thread(args.thread)
+    started = False
+    try:
+        # Serialize setup with assign, but release both locks throughout the check.
+        # recall can then write a NEW stop request while checks run or queue.
+        with shares.dispatch_lock(ws.control_root), thread_lock(thread, wait=WORKER_LOCK_WAIT):
+            state = load_state(thread)
+            latest = state.get("relay") or {}
+            key = getattr(args, "dispatch_id", None) or latest.get("dispatch_id")
+            if not key or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", key):
+                raise worktree.WorktreeError("沒有有效的隔離分派 ID，請確認討論串或 --dispatch-id")
+            directory = thread / "dispatches" / key
+            meta = completions.read_object(directory / "manifest.json")
+            if (meta.get("dispatch_id") != key or meta.get("control_root") != str(ws.control_root.resolve())
+                    or meta.get("thread") != str(thread.resolve())
+                    or meta.get("manifest") != str(directory / "manifest.json")
+                    or meta.get("commit_message") != str(directory / "commit-message.md")):
+                raise worktree.WorktreeError("隔離分派紀錄與工作區／討論串不符，請檢查 manifest")
+            relay = latest if latest.get("dispatch_id") == key else completions.read_object(directory / "relay.json")
+            if relay:
+                meta = worktree.load(relay)
+            # A recorded commit is already complete; do not rerun checks or Git.
+            if meta.get("commit_status") == "committed" and meta.get("commit_sha"):
+                relay = {**meta, **relay, **{k: meta.get(k) for k in worktree.FIELDS}}
+                relay.setdefault("finalize_id", "committed-" + meta["commit_sha"])
+            else:
+                if not relay or not relay.get("pid"):
+                    raise worktree.WorktreeError("缺少原 relay 的 PID 紀錄，無法確認接手程序已結束；請先查明程序狀態")
+                for record in (relay, latest, state.get("finalizer") or {}):
+                    if jobs.pid_alive(record.get("pid"), record.get("pid_started")):
+                        raise worktree.WorktreeError("接手或收尾程序仍在執行，請先 recall 並等待程序結束")
+                    if record.get("status") == "starting" and relay_alive(record):
+                        raise worktree.WorktreeError("程序正在啟動、PID 尚未確認，請稍後再試")
+                if not Path(meta["worktree"]).is_dir():
+                    raise worktree.WorktreeError("worktree 不存在，請先查明保留成果的位置")
+                worktree.recover_commit(meta)
+                if not meta.get("commit_sha"):
+                    worktree.validate(meta)
+                    message = Path(meta["commit_message"])
+                    if not message.is_file() or not message.read_text(encoding="utf-8").strip():
+                        raise worktree.WorktreeError("缺少非空的 commit-message.md；請先寫明任務目的與測試範圍")
+                control_path = relay_paths(thread)["control"]
+                try:
+                    control = completions.read_object(control_path)
+                except (OSError, ValueError) as exc:
+                    raise worktree.WorktreeError("control.json 無法讀取或解析，視為停止；請先修復控制檔") from exc
+                if control.get("stop_requested"):
+                    meta.setdefault("stop_clearances", []).append({"cleared_at": now_str(),
+                        "stop_at": control.get("at"), "by": "finalize"})
+                    worktree.save(meta)  # Save audit evidence before clearing the old stop.
+                    completions.atomic_write(control_path, {**control, "stop_requested": False})
+                relay = {**relay, "finalize_id": uuid.uuid4().hex, "status": "checking",
+                         "finalize_previous_pid": relay.get("pid"),
+                         "finalize_previous_pid_started": relay.get("pid_started"),
+                         "pid": os.getpid(), "pid_started": jobs.pid_started(os.getpid()),
+                         "updated": now_str(), "error": None}
+                state["finalizer"] = relay
+                if latest.get("dispatch_id") == key:
+                    state["relay"] = relay
+                save_state(thread, state)
+                archive_relay(thread, relay)
+                started = True
+        if started:
+            meta = worktree.finalize(meta, run_task_check, lambda: not stop_requested(thread))
+        finish_finalize(thread, relay, meta)
+    except (worktree.WorktreeError, OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
+        if started:
+            finish_finalize(thread, relay, meta, exc)
+        else:
+            append_progress(thread, "finalize", f"未提交：{exc}")
+        sys.exit(f"finalize 未提交：{exc}。成果保留；請修正上述原因後重新執行 finalize，停止時請先確認可重新收尾。")
+    print(f"finalize 完成：{meta['branch']}｜{meta.get('commit_sha') or meta.get('commit_status')}")
 
 
 def cmd_changes(ws: Workspace, args):
@@ -1683,8 +1801,11 @@ def cmd_work(ws: Workspace, args):
 def wait_relay(thread: Path, seconds: Optional[int]):
     """等到接手結束或超過 seconds 秒，回傳 (relay, 是否仍在進行, 是否等待逾時)；starting 緩衝期間視為進行中"""
     deadline = time.time() + (seconds or 0)
+    watched = current_relay(thread) or {}
     while True:
         relay = current_relay(thread)
+        if watched.get("finalize_id") and (relay or {}).get("dispatch_id") != watched.get("dispatch_id"):
+            relay = completions.read_object(thread / "dispatches" / watched["dispatch_id"] / "relay.json") or relay
         alive = bool(relay) and relay_alive(relay)
         if not alive or time.time() >= deadline:
             return relay, alive, bool(seconds) and alive
@@ -1788,7 +1909,8 @@ def cmd_recall(ws: Workspace, args):
     if not relay or relay.get("status") not in RELAY_ACTIVE or not relay_alive(relay):
         print("目前沒有進行中的接手" + (f"（狀態：{relay['status']}）" if relay else "") + "，不需要收回。")
         return
-    relay_paths(thread)["control"].write_text(json.dumps({"stop_requested": True, "at": now_str()}), encoding="utf-8")
+    with thread_lock(thread, wait=WORKER_LOCK_WAIT):
+        completions.atomic_write(relay_paths(thread)["control"], {"stop_requested": True, "at": now_str()})
     eta = f"{NAMES[relay['worker']]} {recall_eta(relay)}"
     add_system_note(thread, f"🔁 已要求停止接手：{eta}。")
     print(f"已要求停止接手：{eta}。")
@@ -2233,7 +2355,8 @@ def activity(ws: Workspace) -> List[dict]:
             items.append({"thread": thread.name, "topic": state["topic"], "type": "discussion", "kind": job.get("kind"),
                           "current": job.get("current"), "since": job.get("since"), "started": job.get("started"),
                           "pid": job.get("pid"), "live": str(live) if live.exists() else None})
-        relay = state.get("relay") or {}
+        finalizer = state.get("finalizer") or {}
+        relay = finalizer if jobs.alive(finalizer) else state.get("relay") or {}
         if relay.get("status") in RELAY_ACTIVE:
             if relay_alive(relay):
                 live = live_path(thread, "work")
@@ -2942,6 +3065,11 @@ def main(argv=None):
     p.add_argument("--dispatch-id", help="查看指定分派；預設最近一次")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_changes)
+
+    p = sub.add_parser("finalize", help="接手程序結束後，重新完整驗證保留成果並由 Agora 提交")
+    p.add_argument("thread")
+    p.add_argument("--dispatch-id", help="收尾指定的隔離分派；預設最近一次")
+    p.set_defaults(func=cmd_finalize)
 
     p = sub.add_parser("recall", help="請接手方在下一個檢查點暫停")
     p.add_argument("thread")
