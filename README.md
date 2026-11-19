@@ -331,6 +331,12 @@ VSCode 面板各 AI 卡片底端與 `agora parties --json`（頂層 `usage` 欄�
 
 快取在 `~/.agora/`。`agoralib/quota_hook.py` 是給 Claude Code（UserPromptSubmit、PostToolUse）與 Antigravity（PreInvocation）用的 hook：每次附上參與中 AI 的額度，自己低於 5% 時提醒把工作交給額度最多的一方。
 
+### Antigravity 呼叫疑難排解
+
+`authentication failed or timed out` 表示驗證失敗，單憑此訊息無法判定是缺少憑證或驗證逾時。在一般終端執行 `agy` 重新登入，再用 `agora quota --unblock antigravity` 解除 auth 標記；解除前 send／assign 不會再次呼叫它。成功呼叫會清除標記。Agora 不會在每次 send 前額外送出線上探測。
+
+必要連線的 DNS／拒絕／連線逾時會分類為 network；證據不足則標「原因未明」。`Failed to shutdown telemetry client` 僅作附註，不會單獨判為 network，也不會蓋掉 auth 失敗。失敗診斷追加到該次討論／工作的 `progress.md`，包含快取的 agy 版本、exit code（無法取得時為 null）、error 與遮蔽敏感內容後的 stderr 摘要。工具被拒時另保留原始 `denied_actions` 結構、cwd、`--add-dir`／`--mode`；由最後一次同名工具配出的路徑會明確標示「推定目標」。
+
 ## 清理
 
 討論串與各 CLI 的對話紀錄不會自動刪除。`prune` 預設只列出，加 `--yes` 才刪除。

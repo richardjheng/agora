@@ -19,6 +19,7 @@ import subprocess
 import sys
 import threading
 import time
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Dict, Optional, Tuple
 
@@ -59,6 +60,39 @@ QUOTA_ERROR = re.compile(r"quota|exhaust|rate.?limit|usage limit|\b429\b|resourc
 BILLING_ERROR = re.compile(r"out of credits|\bcredits?\b|billing|payment|insufficient_quota|subscription|workspace owner",
                            re.I)
 NOISE_KEYS = re.compile(r"(^|_)id$|Id$|uuid|usage|duration|cost|tokens", re.I)
+AUTH_ERROR = re.compile(r"auth(?:entication|orization)?\s+(?:failed|failure|timed?\s*out|required)|"
+                        r"not logged in|not authenticated|unauthenticated|invalid.?grant|"
+                        r"(?:missing|invalid|expired|no (?:available|valid))\s+credentials?|"
+                        r"no credentials?|credentials?[^\n]*(?:missing|invalid|expired|not found|unavailable|required)|\b401\b", re.I)
+NETWORK_ERROR = re.compile(r"connection (?:refused|reset|timed out)|connect(?:ion)? timeout|"
+                           r"failed to (?:connect|resolve)|could not resolve|name resolution|"
+                           r"no such host|dns (?:error|failure)|getaddrinfo|econnrefused|enotfound|"
+                           r"network (?:is unreachable|error)|connectex:|"
+                           r"(?:dial tcp|https?://)[^\n]*(?:timed out|access permissions|forbidden)", re.I)
+
+
+def without_telemetry(text: str) -> str:
+    """Telemetry shutdown errors are ancillary, never evidence of a required connection failure."""
+    return re.sub(r"(?:Failed to (?:shutdown|shut down|flush) telemetry|telemetry[^\n]*(?:shutdown|failed))[^\n]*",
+                  "", text, flags=re.I)
+
+
+def redact(value):
+    """Sanitize diagnostics before truncation or persistence; retain event structure."""
+    if isinstance(value, dict):
+        return {k: "[REDACTED]" if re.search(r"authorization|cookie|token|password|secret|credential|api.?key", str(k), re.I)
+                else redact(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [redact(v) for v in value]
+    if not isinstance(value, str):
+        return value
+    value = re.sub(r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+", r"\1 [REDACTED]", value)
+    value = re.sub(r'''(?ix)(["']?(?:authorization|cookie|access_token|refresh_token|id_token|token|password|secret|credentials?|api[_-]?key)["']?\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s,;&]+)''',
+                   r"\1[REDACTED]", value)
+    value = re.sub(r"(https?://)[^\s/@]+:[^\s/@]+@", r"\1[REDACTED]@", value)
+    value = re.sub(r"([?&][\w.-]+=)[^\s&#\"']+", r"\1[REDACTED]", value)
+    value = re.sub(r"\b(?:sk-[\w-]{12,}|AIza[\w-]{20,}|eyJ[\w-]+\.[\w-]+\.[\w-]+)\b", "[REDACTED]", value)
+    return value
 
 HUMAN = "human"
 AI_PARTIES = ("claude", "antigravity", "codex")
@@ -114,19 +148,27 @@ def canonical(name: str) -> str:
 
 
 def error_kind(result, *texts: str) -> Optional[str]:
-    """失敗的種類："billing"（帳務、credits、權限，要人處理）、"quota"（速率或週期額度，會自己恢復）或 None。
+    """失敗的種類：auth、billing、quota、network 或 None（原因未明）。
     只比對錯誤訊息，略過 result 裡的 ID、用量、耗時等欄位（UUID 與數字常剛好含 429）"""
     def strip(x):
         if isinstance(x, dict):
             return {k: strip(v) for k, v in x.items() if not NOISE_KEYS.search(str(k))}
         if isinstance(x, list):
             return [strip(v) for v in x]
+        if isinstance(x, str):
+            return without_telemetry(x)
         return x
-    text = "\n".join([json.dumps(strip(result), ensure_ascii=False) if result is not None else "", *texts])
+    text = "\n".join([json.dumps(strip(result), ensure_ascii=False) if result is not None else "",
+                       *(without_telemetry(t) for t in texts)])
+    # Authentication evidence takes precedence over ancillary warnings and quota-looking IDs.
+    if AUTH_ERROR.search(text):
+        return "auth"
     if BILLING_ERROR.search(text):
         return "billing"
     if QUOTA_ERROR.search(text):
         return "quota"
+    if NETWORK_ERROR.search(text):
+        return "network"
     return None
 
 
@@ -136,8 +178,11 @@ def quota_error(result, *texts: str) -> bool:
 
 class CallError(RuntimeError):
     def __init__(self, message: str, quota_exhausted: bool = False, denied: bool = False,
-                 session_id: Optional[str] = None, denials: Optional[list] = None, blocked: bool = False):
+                 session_id: Optional[str] = None, denials: Optional[list] = None, blocked: bool = False,
+                 kind: Optional[str] = None, diagnostics: Optional[dict] = None):
         super().__init__(message)
+        self.kind = kind
+        self.diagnostics = diagnostics or {}
         self.quota_exhausted = quota_exhausted   # 速率或週期額度用盡：等重置後再試
         self.blocked = blocked                   # 帳務或權限問題（例如 workspace 沒有 credits）：要人處理，不重試
         # 被權限拒絕的工具呼叫 [{"action": 種類, "target": 網址、指令、路徑或 None}]（agy 非互動模式會因此整輪中斷）
@@ -149,7 +194,7 @@ class CallError(RuntimeError):
 def call_error(message: str, result, *texts: str, **kwargs) -> CallError:
     """依錯誤訊息分類的 CallError"""
     kind = error_kind(result, *texts)
-    return CallError(message, quota_exhausted=kind == "quota", blocked=kind == "billing", **kwargs)
+    return CallError(message, quota_exhausted=kind == "quota", blocked=kind in ("billing", "auth"), kind=kind, **kwargs)
 
 
 # ───────────────────────── 被拒的工具呼叫 ─────────────────────────
@@ -169,15 +214,17 @@ def tool_target(params: dict) -> Optional[str]:
 
 
 def agy_denials(denied: list, steps: list) -> list:
-    """Antigravity 的 denied_actions 只有種類（action、display_name），目標從同一輪最後一次同名的工具動作找"""
+    """同名工具的最後一次呼叫只能作為推定目標，不能證明該次呼叫被拒。"""
     out = []
     for d in denied or []:
         if not isinstance(d, dict):
             continue
         names = {_norm(d.get("action")), _norm(d.get("display_name"))} - {""}
         step = next((params for name, params in reversed(steps) if _norm(name) in names), None)
+        target = tool_target(redact(step or d))
         out.append({"action": d.get("action") or d.get("display_name") or "unknown",
-                    "target": tool_target(step or d)})
+                    "target": f"推定目標：{redact(target)}" if target and step is not None else redact(target),
+                    "target_inferred": bool(target and step is not None)})
     return out
 
 
@@ -256,6 +303,23 @@ class _RunTimeout(subprocess.TimeoutExpired):
     def __str__(self):
         detail = super().__str__()
         return detail + (f"\n{self.stderr[-1500:]}" if self.stderr else "")
+
+
+class _RunEvents(list):
+    """Keep the runner's two-value API while preserving the actual process exit code."""
+    exit_code = None
+
+
+class _AgyTimeout(subprocess.TimeoutExpired):
+    """Preserve TimeoutExpired for callers while displaying only sanitized diagnostics."""
+    def __init__(self, failure: CallError, timeout):
+        super().__init__("agy", timeout, stderr=failure.diagnostics.get("stderr_summary"))
+        self.diagnostics = failure.diagnostics
+        self.kind = failure.kind
+        self.message = str(failure)
+
+    def __str__(self):
+        return self.message
 
 
 def _run(cmd: list, workspace: Path, stdin_text: Optional[str], timeout: int,
@@ -356,7 +420,11 @@ def _run(cmd: list, workspace: Path, stdin_text: Optional[str], timeout: int,
             events = [json.loads(stdout)]
         except json.JSONDecodeError:
             detail = f"(exit={proc.returncode})\n{stdout[-1500:]}\n{stderr[-1500:]}"
-            raise call_error(f"無法解析輸出 {detail}", None, detail)
+            error = call_error(f"無法解析輸出 {detail}", None, detail)
+            error.diagnostics = {"exit_code": proc.returncode, "stderr": stderr, "output": stdout}
+            raise error
+    events = _RunEvents(events)
+    events.exit_code = proc.returncode
     return events, stderr
 
 
@@ -589,6 +657,65 @@ def stream_interrupted(result: dict, reply: str) -> bool:
             and bool(reply) and not result.get("denied_actions"))
 
 
+@lru_cache(maxsize=8)
+def agy_version(executable: str) -> str:
+    """Local version query only, cached per executable; never send an online prompt probe."""
+    try:
+        proc = subprocess.run([executable, "--version"], capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=3, **quota.NO_WINDOW)
+        return (redact(proc.stdout.strip())[:200] or "未知") if proc.returncode == 0 else "未知"
+    except (OSError, subprocess.TimeoutExpired):
+        return "未知"
+
+
+AGY_ADVICE = {
+    "auth": "在一般終端執行 agy 重新登入後，執行 agora quota --unblock antigravity 解除標記再試。",
+    "network": "請檢查必要服務的 DNS、代理伺服器與防火牆連線；telemetry 警告不代表必要服務被擋。",
+    "timeout": "呼叫已逾時；請檢查 agy 是否能在一般終端回覆及必要連線，再視情況調整逾時上限。",
+    "denied": "請核對被拒工具、工作區與 --add-dir／--mode 權限；推定目標不是確證。",
+    "unknown": "原因未明；請依下列診斷在一般終端查證，勿重複送出等價請求。",
+    "quota": "請等額度重置或改用其他可用的 AI。",
+    "billing": "請檢查帳務或訂閱權限，處理後再解除無法使用標記。",
+}
+
+
+def agy_failure(result: dict, stderr: str, cmd: list, workspace: Path, scratch: Path,
+                steps: list, exit_code=None, kind=None) -> CallError:
+    denials = agy_denials(result.get("denied_actions"), steps)
+    kind = error_kind({"error": result.get("error")}, stderr) or kind or ("denied" if denials else "unknown")
+    diagnostics = redact({
+        "kind": kind, "agy_version": agy_version(cmd[0]), "exit_code": exit_code,
+        "result_error": result.get("error"), "stderr_summary": redact(stderr)[-2000:],
+        "denied_actions": result.get("denied_actions") or [], "denials": denials,
+        "cwd": str(workspace),
+        "args": {flag: [cmd[i + 1] for i, arg in enumerate(cmd[:-1]) if arg == flag]
+                 for flag in ("--add-dir", "--mode")},
+    })
+    if kind == "auth":
+        evidence = without_telemetry(str(result.get("error") or "") + "\n" + stderr)
+        diagnostics["auth_cause"] = ("原因未明（驗證失敗或逾時，CLI 未區分）" if re.search(r"failed or timed out", evidence, re.I)
+                                     else "沒有可用憑證" if re.search(r"(?:no|missing|invalid|expired).*credentials?|credentials?.*(?:missing|invalid|expired|not found|unavailable)", evidence, re.I)
+                                     else "驗證逾時" if re.search(r"timed?\s*out", evidence, re.I)
+                                     else "驗證失敗，原因未明")
+    if "telemetry" in stderr.lower() and stderr != without_telemetry(stderr):
+        diagnostics["telemetry_note"] = "telemetry 關閉失敗僅作附註，無法證明必要網路被擋"
+    # Keep the event structure, including original denied_actions (with secrets masked),
+    # in the existing per-task progress record rather than relocating any handoff files.
+    body = json.dumps(diagnostics, ensure_ascii=False, indent=2)
+    try:
+        if scratch.resolve() == workspace.resolve():
+            raise OSError("暫存目錄與工作區相同，未寫入根目錄；診斷保留於例外物件")
+        with (scratch / "progress.md").open("a", encoding="utf-8") as record:
+            record.write(f"\n## {time.strftime('%Y-%m-%d %H:%M:%S')} · Agora：Antigravity 呼叫診斷\n\n```json\n{body}\n```\n")
+    except OSError as exc:
+        diagnostics["record_error"] = redact(str(exc))
+    label = "原因未明" if kind == "unknown" else kind
+    message = f"Antigravity 未產生回覆（{label}）：{AGY_ADVICE[kind]}\n診斷：{json.dumps(diagnostics, ensure_ascii=False)}"
+    return CallError(message, kind=kind, diagnostics=diagnostics, blocked=kind in ("auth", "billing"),
+                     quota_exhausted=kind == "quota", denials=denials if kind != "auth" else [],
+                     session_id=result.get("conversation_id"))
+
+
 def call_antigravity(prompt: str, session_id: Optional[str], opts: dict, work: bool, workspace: Path,
                      timeout: int, scratch: Path, live: Optional[Live] = None) -> Tuple[str, str, str]:
     stats = _CallStats(opts, "antigravity")
@@ -623,22 +750,41 @@ def call_antigravity(prompt: str, session_id: Optional[str], opts: dict, work: b
             if live:
                 antigravity_event(live, e)
 
-        events, stderr = _run(cmd, workspace, None, timeout, on_event,
-                              {**(opts.get("env") or {}), SUBAGENTS_ENV: "1" if opts.get("subagents", True) else "0"})
+        try:
+            events, stderr = _run(cmd, workspace, None, timeout, on_event,
+                                  {**(opts.get("env") or {}), SUBAGENTS_ENV: "1" if opts.get("subagents", True) else "0"})
+        except subprocess.TimeoutExpired as exc:
+            stderr = exc.stderr or ""
+            if isinstance(stderr, bytes):
+                stderr = stderr.decode("utf-8", errors="replace")
+            failure = agy_failure({"error": "呼叫逾時"}, stderr, cmd, workspace, scratch, steps, kind="timeout")
+            if failure.blocked:
+                raise failure from None
+            raise _AgyTimeout(failure, exc.timeout) from None
+        except CallError as exc:
+            raise agy_failure({"error": exc.diagnostics.get("output") or str(exc)},
+                              exc.diagnostics.get("stderr", ""), cmd, workspace, scratch, steps,
+                              exit_code=exc.diagnostics.get("exit_code")) from None
+        except OSError as exc:
+            failure = agy_failure({"error": str(exc)}, "", cmd, workspace, scratch, steps)
+            if failure.blocked:
+                raise failure from None
+            error = type(exc)(str(failure))
+            error.diagnostics = failure.diagnostics
+            raise error from None
         for e in events:
             stats.event(e)   # 也支援非串流 JSON fallback；重播不增加計數
         result = next((e["result"] for e in reversed(events) if e.get("event") == "result" and e.get("result")),
                       events[-1])
         reply = (result.get("response") or "").strip()
         interrupted = stream_interrupted(result, reply)
-        if (result.get("status") != "SUCCESS" or not reply) and not interrupted:
-            detail = json.dumps(result, ensure_ascii=False)[:1500] + stderr[-500:]
-            raise call_error(f"Antigravity 未產生回覆：{detail}", result, stderr[-500:],
-                             denials=agy_denials(result.get("denied_actions"), steps),
-                             session_id=result.get("conversation_id"))
+        if ((result.get("status") != "SUCCESS" or not reply) and not interrupted) or result.get("denied_actions"):
+            raise agy_failure(result, stderr, cmd, workspace, scratch, steps, getattr(events, "exit_code", None))
         meta = f"{result.get('duration_seconds', 0):.0f}s, {result.get('usage', {}).get('total_tokens', '?')} tokens"
         if interrupted:
             meta += f", {STREAM_INTERRUPTED}"
+        if stderr != without_telemetry(stderr):
+            meta += ", 附註：telemetry 關閉失敗（不影響本次回覆）"
         return reply, result.get("conversation_id") or session_id, meta
     finally:
         if overflow:
