@@ -607,6 +607,7 @@ class PartiesView {
     view.webview.options = { enableScripts: true, localResourceRoots: [media] };
     const nonce = Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
     const quotaJs = view.webview.asWebviewUri(vscode.Uri.joinPath(media, "quota-display.js"));
+    const summaryJs = view.webview.asWebviewUri(vscode.Uri.joinPath(media, "settings-summary.js"));
     const js = view.webview.asWebviewUri(vscode.Uri.joinPath(media, "panel.js"));
     const css = view.webview.asWebviewUri(vscode.Uri.joinPath(media, "panel.css"));
     view.webview.html = `<!DOCTYPE html>
@@ -614,7 +615,7 @@ class PartiesView {
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${view.webview.cspSource}; script-src 'nonce-${nonce}';">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link rel="stylesheet" href="${css}"></head>
-<body><div id="app">載入中…</div><script nonce="${nonce}" src="${quotaJs}"></script><script nonce="${nonce}" src="${js}"></script></body></html>`;
+<body><div id="app">載入中…</div><script nonce="${nonce}" src="${quotaJs}"></script><script nonce="${nonce}" src="${summaryJs}"></script><script nonce="${nonce}" src="${js}"></script></body></html>`;
     view.webview.onDidReceiveMessage((msg) => this.onMessage(msg).catch(showError));
     view.onDidChangeVisibility(() => view.visible && this.post());
   }
@@ -660,7 +661,7 @@ class PartiesView {
         const curTier = tiers[msg.level];
         const curObj = msg.fallback ? (curTier && curTier.fallback) : curTier;
         const curModel = curObj ? curObj.model : "";
-        const role = msg.fallback ? "替代模型" : "模型";
+        const role = msg.fallback ? "額度不足時的備用模型" : "模型";
         const levelNames = { light: "輕量", standard: "標準", heavy: "重度" };
         const levelLabel = levelNames[msg.level] || msg.level;
         const value = await vscode.window.showInputBox({

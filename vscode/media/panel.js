@@ -1,9 +1,30 @@
-// 「AI 與模型」面板：勾選參與的 AI、選模型與推理強度、顯示額度。狀態由擴充套件推送，變更送回擴充套件執行 agora parties。
+// 「AI 與模型」面板：勾選參與的 AI、選討論與接手工作模型（含思考深度）、顯示額度。狀態由擴充套件推送，變更送回擴充套件執行 agora parties。
 (function () {
   const vscode = acquireVsCodeApi();
   const app = document.getElementById("app");
   let state = null;
-  const openFallbacks = new Set();
+  const openSections = AgoraSettingsSummary.loadOpenState(vscode.getState());
+
+  function persistOpenState() {
+    vscode.setState(AgoraSettingsSummary.mergeOpenState(vscode.getState(), openSections));
+  }
+
+  function makeDetails({ key, defaultOpen, className, summary, children }) {
+    const initialOpen = AgoraSettingsSummary.isSectionOpen(openSections, key, defaultOpen);
+    let lastOpen = initialOpen;
+    return el("details", {
+      class: className,
+      open: initialOpen,
+      ontoggle: (e) => {
+        if (e.target !== e.currentTarget) return;
+        const nextOpen = Boolean(e.target.open);
+        if (nextOpen === lastOpen) return;
+        lastOpen = nextOpen;
+        AgoraSettingsSummary.setSectionOpen(openSections, key, nextOpen);
+        persistOpenState();
+      },
+    }, summary, ...children);
+  }
 
   function el(tag, attrs, ...children) {
     const node = document.createElement(tag);
@@ -85,7 +106,7 @@
       else vscode.postMessage({ type: "set", party: p, field: "model", value: v });
     }, disabled);
 
-    // 推理強度：Codex 依所選模型支援的等級；Antigravity 的強度已包含在模型名稱裡
+    // 思考深度（原推理強度／--effort）：Codex 依所選模型支援的等級；Antigravity 的強度已包含在模型名稱裡
     const effectiveModel = models.find((m) => m.id === (setting.model || def.model));
     const efforts = (effectiveModel && effectiveModel.efforts && effectiveModel.efforts.length)
       ? effectiveModel.efforts : (cat.efforts || []);
@@ -96,19 +117,36 @@
       if (setting.effort && !efforts.includes(setting.effort)) {
         effortOptions.push({ value: setting.effort, label: `${setting.effort}（此模型不支援）` });
       }
-      effortRow = el("label", { class: "row" }, el("span", { class: "label" }, "推理強度"),
+      effortRow = el("label", { class: "row", title: "推理強度／--effort" },
+        el("span", { class: "label" }, "思考深度"),
         select(effortOptions, setting.effort || "", (v) => vscode.postMessage({ type: "set", party: p, field: "effort", value: v }), disabled));
     }
 
-    // 等級區塊：輕量／標準／重度，各列模型下拉與推理強度，選「沿用目前模型」表示清除；可展開設定替代模型（fallback）
+    const discSummary = AgoraSettingsSummary.discussionSummary(setting, cat);
+    const discussionSection = makeDetails({
+      key: `${p}.discussion`,
+      defaultOpen: false,
+      className: "settings-section discussion-section",
+      summary: el("summary", { class: "settings-summary", title: `討論時用的模型：${discSummary}` },
+        el("span", { class: "settings-summary-title" }, "討論時用的模型"),
+        el("span", { class: "settings-summary-sep" }, "："),
+        el("span", { class: "settings-summary-value" }, discSummary)),
+      children: [
+        el("div", { class: "settings-body" },
+          el("div", { class: "muted small section-hint" },
+            "Agora 叫它參與討論時使用；不影響你直接在對話框聊天。討論串或指令可覆蓋；分派時等級沒設定也會沿用。"),
+          el("label", { class: "row" }, el("span", { class: "label" }, "模型"), modelSelect),
+          el("div", { class: "muted small" }, `模型清單：${models.length} 項 · ${state.catalog && state.catalog.fetched_at ? fmtReset(state.catalog.fetched_at) + " 更新" : "更新時間未知"}`),
+          effortRow),
+      ],
+    });
+
+    // 接手工作時用的模型：輕量／標準／重度，各列模型下拉與思考深度，選「沿用討論設定」表示清除；可展開設定額度不足時的備用模型
     let tiersSection = null;
     if (!disabled) {
-      const TIER_DEFS = [
-        { id: "light", label: "輕量" },
-        { id: "standard", label: "標準" },
-        { id: "heavy", label: "重度" },
-      ];
+      const TIER_DEFS = AgoraSettingsSummary.TIER_DEFS;
       const tiers = setting.tiers || {};
+      const fbRuleHint = "自動派工時會先檢查各 AI 此等級的主模型；全部不合格時才考慮備用模型，且備用模型也須通過額度檢查。";
 
       const tierItems = TIER_DEFS.map((lvl) => {
         const tierCfg = tiers[lvl.id] || null;
@@ -118,8 +156,8 @@
         const curFbModel = curTierFb ? (curTierFb.model || "") : "";
         const curFbEffort = curTierFb ? (curTierFb.effort || "") : "";
 
-        // 等級模型選項：沿用目前模型 + catalog 模型 + 自訂值 + 自訂…
-        const tModelOptions = [{ value: "", label: "沿用目前模型" }];
+        // 等級模型選項：沿用討論設定 + catalog 模型 + 自訂值 + 自訂…
+        const tModelOptions = [{ value: "", label: "沿用討論設定" }];
         for (const m of models) {
           tModelOptions.push({ value: m.id, label: m.label === m.id ? m.id : `${m.label} · ${m.id}` });
         }
@@ -141,13 +179,13 @@
           }
         }, disabled);
 
-        // 等級推理強度（所選模型有 efforts 才顯示）
+        // 等級思考深度（所選模型有 efforts 才顯示）
         const effectiveTierModel = models.find((m) => m.id === curTierModel);
         const tierEfforts = (effectiveTierModel && effectiveTierModel.efforts && effectiveTierModel.efforts.length)
           ? effectiveTierModel.efforts : (curTierModel ? (cat.efforts || []) : []);
         let tEffortSelect = null;
         if (tierEfforts.length && curTierModel) {
-          const tEffortOptions = [{ value: "", label: "預設強度" }].concat(tierEfforts.map((e) => ({ value: e, label: e })));
+          const tEffortOptions = [{ value: "", label: "預設深度" }].concat(tierEfforts.map((e) => ({ value: e, label: e })));
           if (curTierEffort && !tierEfforts.includes(curTierEffort)) {
             tEffortOptions.push({ value: curTierEffort, label: `${curTierEffort}（不支援）` });
           }
@@ -155,10 +193,11 @@
             vscode.postMessage({ type: "tier", party: p, level: lvl.id, value: v ? `${curTierModel}:${v}` : curTierModel });
           }, disabled);
           tEffortSelect.className = "tier-effort";
+          tEffortSelect.title = "推理強度／--effort";
         }
 
-        // 替代模型（fallback）選項
-        const fbModelOptions = [{ value: "", label: "無替代模型" }];
+        // 額度不足時的備用模型（fallback）選項
+        const fbModelOptions = [{ value: "", label: "無備用模型" }];
         for (const m of models) {
           fbModelOptions.push({ value: m.id, label: m.label === m.id ? m.id : `${m.label} · ${m.id}` });
         }
@@ -185,7 +224,7 @@
           ? effectiveFbModel.efforts : (curFbModel ? (cat.efforts || []) : []);
         let fbEffortSelect = null;
         if (fbEfforts.length && curFbModel) {
-          const fbEffortOptions = [{ value: "", label: "預設強度" }].concat(fbEfforts.map((e) => ({ value: e, label: e })));
+          const fbEffortOptions = [{ value: "", label: "預設深度" }].concat(fbEfforts.map((e) => ({ value: e, label: e })));
           if (curFbEffort && !fbEfforts.includes(curFbEffort)) {
             fbEffortOptions.push({ value: curFbEffort, label: `${curFbEffort}（不支援）` });
           }
@@ -193,24 +232,26 @@
             vscode.postMessage({ type: "tierFallback", party: p, level: lvl.id, value: v ? `${curFbModel}:${v}` : curFbModel });
           }, disabled);
           fbEffortSelect.className = "tier-effort";
+          fbEffortSelect.title = "推理強度／--effort";
         }
 
         const fbKey = `${p}.${lvl.id}`;
         const hasFallback = !!curFbModel;
-        const isFbOpen = openFallbacks.has(fbKey) || hasFallback;
-        const fbSummaryText = hasFallback ? `：${curFbModel}${curFbEffort ? ` (${curFbEffort})` : ""}` : "";
-        const fbDetails = el("details", {
-          class: "tier-fallback",
-          open: isFbOpen,
-          ontoggle: (e) => {
-            if (e.target.open) openFallbacks.add(fbKey);
-            else openFallbacks.delete(fbKey);
-          },
-        },
-          el("summary", {}, `替代模型（fallback）${fbSummaryText}`),
-          el("div", { class: `tier-fallback-content${fbEffortSelect ? "" : " no-effort"}` },
-            fbModelSelect,
-            fbEffortSelect));
+        const fbSummaryText = hasFallback
+          ? `額度不足時的備用模型：${curFbModel}${curFbEffort ? ` (${curFbEffort})` : ""}`
+          : "額度不足時的備用模型";
+        const fbDetails = makeDetails({
+          key: fbKey,
+          defaultOpen: hasFallback,
+          className: "tier-fallback",
+          summary: el("summary", { title: `${fbSummaryText}。${fbRuleHint}` },
+            el("span", { class: "tier-fallback-summary-text" }, fbSummaryText)),
+          children: [
+            el("div", { class: `tier-fallback-content${fbEffortSelect ? "" : " no-effort"}` },
+              fbModelSelect,
+              fbEffortSelect),
+          ],
+        });
 
         return el("div", { class: "tier-item" },
           el("div", { class: `tier-main${tEffortSelect ? "" : " no-effort"}` },
@@ -220,9 +261,22 @@
           fbDetails);
       });
 
-      tiersSection = el("div", { class: "tiers-block" },
-        el("div", { class: "tiers-title" }, "工作分派等級"),
-        ...tierItems);
+      const tiersSummaryText = AgoraSettingsSummary.tiersSummary(setting);
+      tiersSection = makeDetails({
+        key: `${p}.tiers`,
+        defaultOpen: false,
+        className: "settings-section tiers-section",
+        summary: el("summary", { class: "settings-summary", title: `接手工作時用的模型：${tiersSummaryText}` },
+          el("span", { class: "settings-summary-title" }, "接手工作時用的模型"),
+          el("span", { class: "settings-summary-sep" }, "："),
+          el("span", { class: "settings-summary-value" }, tiersSummaryText)),
+        children: [
+          el("div", { class: "settings-body" },
+            el("div", { class: "muted small section-hint" },
+              "依工作複雜度、風險與驗證難度選擇（對應 assign --tier light/standard/heavy）"),
+            ...tierItems),
+        ],
+      });
     }
 
     // 自動派工比例：0 表示不自動分派給它（只討論與審查）；其他值為自動派工件數權重（依比例輪流，不保證 token 比例）
@@ -308,9 +362,7 @@
         el("span", { class: "name" }, names[p]),
         disabled ? el("span", { class: "badge" }, "未參與") : null),
       quotaBar(quota, (state.quota && state.quota.threshold_pct) || 5),
-      el("label", { class: "row" }, el("span", { class: "label" }, "模型"), modelSelect),
-      el("div", { class: "muted small" }, `模型清單：${models.length} 項 · ${state.catalog && state.catalog.fetched_at ? fmtReset(state.catalog.fetched_at) + " 更新" : "更新時間未知"}`),
-      effortRow,
+      discussionSection,
       tiersSection,
       shareRow,
       subagentRow,
@@ -386,7 +438,7 @@
         "勾選表示同意該 AI 參與此專案接下來的討論與分派：進行中的討論串在下一次輪到發言時就會加入它（先讀完前面的討論），"
         + "取消勾選後不再請它回覆；已在背景進行的分派工作不會換人，用「新增討論串」時指定參與者的討論串也不會自動加入。"
         + "設定存在 .agora/config.json；未參與的 AI 不會被呼叫，也不會成為接手方。"
-        + "各 AI 可依工作等級（輕量／標準／重度）設定對應的模型與替代模型（fallback）；分派時依比例輪流，額度只作為資格篩選。"
+        + "各 AI 可在「討論時用的模型」與「接手工作時用的模型」（輕量／標準／重度，含額度不足時的備用模型）設定對應模型；分派時依比例輪流，額度只作為資格篩選。"
         + "分派工作時建立獨立 branch（agora/<分派 ID>）與 git worktree，接手方完成後由 Agora 核對並代做 commit（不自動 push/merge）。"
         + "內建子代理預設關閉（評估中），被呼叫時盡量由主模型完成；開啟時在同一 worktree 執行，由父代理整合驗證，這不是強制隔離。"
         + "自動派工比例為 0 表示只負責討論、主持、交接與審查（不自己實作），大於 0 為自動派工件數的加權比例（依比例輪流，不保證 token 比例）；指定接手方仍須符合額度資格，零權重接手方需使用者明確覆寫。"));

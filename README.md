@@ -279,7 +279,7 @@ skills 建議的流程：決策、設計、取捨類問題用中立開場（不�
   agora parties --tier codex.heavy=gpt-5 --tier claude.light=haiku:low   # 各等級模型（default 恢復沿用目前模型）
   agora parties --tier-fallback codex.heavy=gpt-4.5:medium                # 各等級替代模型（default 清除）
   ```
-- **VSCode 面板**：每個 AI 卡片提供「工作分派等級」區塊，三列分別下拉選擇模型與推理強度（有 efforts 時顯示），選「沿用目前模型」表示清除；可展開設定替代模型（fallback）。
+- **VSCode 面板**：每個 AI 卡片提供可收合的「討論時用的模型」（模型與思考深度，對應 `--effort`）與「接手工作時用的模型」（對應 `assign --tier` 的輕量／標準／重度三列，未設定時沿用討論設定；各列可展開設定「額度不足時的備用模型」）。
 
 ### 怎麼看用的是哪個模型
 
