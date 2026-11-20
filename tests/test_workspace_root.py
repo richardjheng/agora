@@ -64,6 +64,19 @@ class TestUnifiedRootResolution(unittest.TestCase):
             self.assertEqual(cli_ws.control_root, outer)
             self.assertEqual(hook_root, outer)
 
+    def test_auto_search_keeps_dispatch_worktree_without_env(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = Path(tmp).resolve() / "proj"
+            wt = proj / ".agora" / "worktrees" / "task1"
+            nested = wt / "src" / "pkg"
+            nested.mkdir(parents=True)
+            _init_git(wt)
+
+            with patch.dict(os.environ, _clean_env(), clear=True):
+                for cwd in (wt, nested):
+                    with self.subTest(cwd=cwd), patch.object(Path, "cwd", return_value=cwd):
+                        self.assertEqual(cli.resolve_workspace(None), wt)
+
     def test_auto_search_excludes_global_home_agora_but_explicit_allows_it(self):
         with tempfile.TemporaryDirectory() as tmp:
             fake_home = Path(tmp).resolve() / "home"

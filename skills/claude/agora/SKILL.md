@@ -8,7 +8,7 @@ description: 透過 Agora 與 Antigravity（Gemini）、Codex 進行多輪技術
 > Codex 與 Antigravity（Gemini）是本機上的其他 CLI，只能透過下面的 Agora 指令聯絡。Claude Code 內建的 ListAgents／SendMessage 只會列出其他 Claude 工作階段，用它們找不到 Codex 或 Antigravity 是正常的；使用者要求它們參與時，直接用 Agora，不要改用 subagent 模擬它們的意見。
 
 工具：`python D:/github/agora/agora.py`（說明：D:/github/agora/README.md）。討論串在工作區的 `.agora/threads/<id>/`，
-`transcript.md` 是給使用者看的逐字稿。工作區預設為目前資料夾的 git 根目錄。
+`transcript.md` 是給使用者看的逐字稿。工作區依序採用 `--workspace`、`AGORA_WORKTREE`、`AGORA_WORKSPACE`、目前所在的分派 worktree 根目錄、往上最近含有 `.agora` 的專案目錄（排除全域 `~/.agora`）、git 根目錄，最後退回目前目錄。
 每次呼叫可能需要數分鐘，Bash timeout 設 600000；討論在背景程序執行，等待被中斷時仍會繼續，之後用 `python D:/github/agora/agora.py wait <id>` 接上，`activity` 查看所有進行中的討論與分派，`watch` 監控任一分派或討論結束。
 
 ## 依勾選分工
