@@ -478,6 +478,8 @@ class Model {
     this.quota = null;     // agora quota --json
     this.coreVersion = null;   // agora --version
     this.errors = {};
+    this.partiesQueue = Promise.resolve();
+    this.quotaRequest = 0;
     this.emitter = new vscode.EventEmitter();
     this.onDidChange = this.emitter.event;
   }
@@ -491,14 +493,23 @@ class Model {
     return this.parties ? PARTIES.filter((p) => this.parties[p].enabled) : PARTIES;
   }
 
-  async loadParties() {
-    try {
-      this.setParties(await runJson(["parties", "--json"]));
-      delete this.errors.parties;
-    } catch (e) {
-      this.errors.parties = e.message;
-    }
-    this.emitter.fire();
+  enqueueParties(task) {
+    // Reads share the queue so a refresh cannot publish a snapshot older than a completed write.
+    const request = this.partiesQueue.then(task);
+    this.partiesQueue = request.catch(() => {});
+    return request;
+  }
+
+  loadParties() {
+    return this.enqueueParties(async () => {
+      try {
+        this.setParties(await runJson(["parties", "--json"]));
+        delete this.errors.parties;
+      } catch (e) {
+        this.errors.parties = e.message;
+      }
+      this.emitter.fire();
+    });
   }
 
   setParties(data) {
@@ -532,23 +543,30 @@ class Model {
   }
 
   async loadQuota(refresh = false) {
+    const request = ++this.quotaRequest;
     try {
-      this.quota = await runJson(["quota", "--json", ...(refresh ? ["--refresh"] : [])]);
+      const quota = await runJson(["quota", "--json", ...(refresh ? ["--refresh"] : [])]);
+      if (request !== this.quotaRequest) return;
+      this.quota = quota;
       delete this.errors.quota;
     } catch (e) {
+      if (request !== this.quotaRequest) return;
       this.errors.quota = e.message;
     }
     this.emitter.fire();
   }
 
-  async update(args) {
-    try {
-      this.setParties(await runJson(["parties", ...args, "--json"]));
-      if (args.includes("--model")) this.loadQuota();   // 切換模型可能改變對應的額度池（如 Antigravity 的 Argon / Flash 3.8）
-    } catch (e) {
-      showError(e);
-    }
-    this.emitter.fire();
+  update(args) {
+    return this.enqueueParties(async () => {
+      try {
+        this.setParties(await runJson(["parties", ...args, "--json"]));
+        delete this.errors.parties;
+        if (args.includes("--model")) this.loadQuota();   // 切換模型可能改變對應的額度池（如 Antigravity 的 Argon / Flash 3.8）
+      } catch (e) {
+        showError(e);
+      }
+      this.emitter.fire();
+    });
   }
 
   snapshot() {
