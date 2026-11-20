@@ -10,6 +10,7 @@ MESSAGE = ("目前在 Codex 沙箱（網路受限）中執行，無法呼叫其�
            "請讓 Codex 以沙箱外執行此 agora 指令（核准提權），"
            "或改由 Claude Code／VSCode 面板發起。")
 AUTH_NOTE = "以 Codex 沙箱身分執行，可能與沙箱有關（未證實）"
+NETWORK_DISABLED_ENV = "CODEX_SANDBOX_NETWORK_DISABLED"
 
 
 def token_username() -> Optional[str]:
@@ -30,12 +31,22 @@ def is_codex_sandbox() -> bool:
     return (token_username() or "").startswith("CodexSandbox")
 
 
+def _network_restriction_reason() -> Optional[str]:
+    username = token_username()
+    if username:
+        if username.startswith("CodexSandboxOffline"):
+            return f"token={username}"
+    elif os.environ.get(NETWORK_DISABLED_ENV) == "1":
+        return f"環境變數 {NETWORK_DISABLED_ENV}=1"
+    return None
+
+
 def network_restricted() -> bool:
-    return (os.environ.get("CODEX_SANDBOX_NETWORK_DISABLED") == "1"
-            or (token_username() or "").startswith("CodexSandboxOffline"))
+    return _network_restriction_reason() is not None
 
 
 def require_network():
     if network_restricted():
         from agoralib.parties import CallError
-        raise CallError(MESSAGE, kind="sandbox")
+        reason = _network_restriction_reason() or "判斷後狀態已變更"
+        raise CallError(f"{MESSAGE}（依據：{reason}）", kind="sandbox")
