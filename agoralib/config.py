@@ -260,9 +260,97 @@ def check_concurrency(root: Path, data: Optional[dict] = None) -> int:
     return raw
 
 
+def _same_path(a: Path, b: Path) -> bool:
+    import os
+    try:
+        return os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b))
+    except OSError:
+        return a.as_posix().lower() == b.as_posix().lower()
+
+
+def _resolve_home_agora() -> Optional[Path]:
+    try:
+        return (Path.home() / ".agora").resolve()
+    except (OSError, RuntimeError):
+        return None
+
+
+_DEFAULT_GLOBAL_AGORA = _resolve_home_agora()
+
+
+def is_global_agora_dir(path: Path) -> bool:
+    """判斷 path 是否為全域安裝目錄 ~/.agora。"""
+    for global_agora in (_resolve_home_agora(), _DEFAULT_GLOBAL_AGORA):
+        if global_agora is not None and _same_path(path, global_agora):
+            return True
+    return False
+
+
 def find_root(start: Path) -> Optional[Path]:
-    """從 start 往上找含有 .agora 的資料夾（hook 用來判斷目前專案啟用了哪些 AI）"""
+    """從 start 往上找最近含有 .agora 的專案資料夾，自動排除全域安裝目錄 ~/.agora。"""
+    start = Path(start).resolve()
     for p in [start, *start.parents]:
-        if (p / ".agora").is_dir():
+        candidate = p / ".agora"
+        if candidate.is_dir():
+            if is_global_agora_dir(candidate):
+                continue
             return p
     return None
+
+
+def _git_root(start: Path) -> Optional[Path]:
+    import subprocess
+    from agoralib import quota
+    try:
+        top = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=start,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=10,
+            **quota.NO_WINDOW,
+        ).stdout.strip()
+        if top:
+            return Path(top).resolve()
+    except Exception:
+        pass
+    return None
+
+
+def resolve_root(workspace: Optional[str] = None, start: Optional[Path] = None) -> Path:
+    """統一解析工作區根目錄（CLI 與 hook 共用）。
+
+    優先順序：
+    1. 明確傳入的 workspace（例如 CLI 的 --workspace）
+    2. worktree 環境變數 AGORA_WORKTREE
+    3. 環境變數 AGORA_WORKSPACE
+    4. 自動搜尋（從 start 或目前工作目錄開始）：
+       a. 往上找最近含有 .agora 的專案目錄（find_root，排除全域 ~/.agora）
+       b. git 倉庫根目錄（git rev-parse --show-toplevel）
+       c. 退回起點目錄（start 或 cwd）
+    """
+    import os
+    if workspace:
+        return Path(workspace).resolve()
+    worktree_dir = os.getenv("AGORA_WORKTREE")
+    if worktree_dir:
+        return Path(worktree_dir).resolve()
+    env_workspace = os.getenv("AGORA_WORKSPACE")
+    if env_workspace:
+        return Path(env_workspace).resolve()
+    base = Path(start).resolve() if start is not None else Path.cwd().resolve()
+    return find_root(base) or _git_root(base) or base
+
+
+def resolve_control_root(root: Path) -> Path:
+    """在隔離 worktree 內執行時映射回控制根目錄（AGORA_CONTROL_ROOT），否則維持 root。"""
+    import os
+    worktree_dir = os.getenv("AGORA_WORKTREE")
+    control_dir = os.getenv("AGORA_CONTROL_ROOT")
+    if worktree_dir and control_dir:
+        resolved = Path(root).resolve()
+        wt = Path(worktree_dir).resolve()
+        if _same_path(resolved, wt) or any(_same_path(p, wt) for p in resolved.parents):
+            return Path(control_dir).resolve()
+    return root

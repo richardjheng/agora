@@ -63,11 +63,16 @@ def advice(me: str, usages: dict, weights: dict | None = None, work: dict | None
 
 
 def project_root() -> Path | None:
-    start = os.getenv("CLAUDE_PROJECT_DIR") or os.getenv("AGORA_WORKSPACE") or os.getcwd()
-    if (os.getenv("AGORA_WORKTREE") and os.getenv("AGORA_CONTROL_ROOT")
-            and Path(start).resolve() == Path(os.environ["AGORA_WORKTREE"]).resolve()):
-        return Path(os.environ["AGORA_CONTROL_ROOT"]).resolve()
-    return config.find_root(Path(start).resolve())
+    start = os.getenv("CLAUDE_PROJECT_DIR") or None
+    explicit = bool(os.getenv("AGORA_WORKTREE") or os.getenv("AGORA_WORKSPACE"))
+    root = config.resolve_control_root(config.resolve_root(start=Path(start) if start else None))
+    if os.getenv("AGORA_WORKTREE") and os.getenv("AGORA_CONTROL_ROOT"):
+        return root
+    if not (root / ".agora").is_dir():
+        return None
+    if not explicit and config.is_global_agora_dir(root / ".agora"):
+        return None
+    return root
 
 
 def project_parties() -> list:

@@ -131,30 +131,18 @@ CONTINUE_PROMPT = """\
 # ───────────────────────── 工作區與討論串 ─────────────────────────
 
 def resolve_workspace(arg: Optional[str]) -> Path:
-    if arg:
-        return Path(arg).resolve()
-    if os.getenv(worktree.WORK_ENV):
-        return Path(os.environ[worktree.WORK_ENV]).resolve()
-    if os.getenv("AGORA_WORKSPACE"):
-        return Path(os.environ["AGORA_WORKSPACE"]).resolve()
-    try:
-        top = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True,
-                             encoding="utf-8", timeout=10, **quota.NO_WINDOW).stdout.strip()
-        if top:
-            return Path(top).resolve()
-    except Exception:
-        pass
-    return Path.cwd().resolve()
+    return config.resolve_root(arg)
 
 
 class Workspace:
     def __init__(self, root: Path):
         self.root = root
-        self.control_root = (Path(os.environ[worktree.CONTROL_ENV]).resolve()
-                             if os.getenv(worktree.WORK_ENV) and os.getenv(worktree.CONTROL_ENV)
-                             and root.resolve() == Path(os.environ[worktree.WORK_ENV]).resolve() else root)
+        self.control_root = config.resolve_control_root(root)
         self.home = self.control_root / ".agora"
         self.threads = self.home / "threads"
+
+    def config_path(self) -> Path:
+        return config.config_path(self.control_root)
 
     def config(self) -> dict:
         return config.load(self.control_root)
@@ -396,7 +384,7 @@ def require_enabled(ws: Workspace, party: str) -> str:
         sys.exit(f"未知的 AI：{party}，可用：{list(AI_PARTIES)}")
     if party not in enabled:
         sys.exit(f"{NAMES[party]} 未在此專案啟用（目前啟用：{', '.join(enabled)}；"
-                 f"可用 agora parties --enable {party} 加入）。")
+                 f"設定檔：{ws.config_path()}；可用 agora parties --enable {party} 加入）。")
     return party
 
 
@@ -404,7 +392,7 @@ def call_opts(ws: Workspace, state: dict, party: str) -> dict:
     """模型與推理強度：討論串自己指定的優先，其次是專案設定，都沒有就用 CLI 預設；
     沙箱、額外可寫目錄、能否啟動內建子代理只看專案設定"""
     info = state["parties"].get(party) or {}
-    settings = config.party_settings(ws.root)[party]
+    settings = config.party_settings(ws.control_root)[party]
     return {**{f: info.get(f) or settings.get(f) for f in config.FIELDS},
             "sandbox": settings["sandbox"], "subagents": settings["subagents"],
             "add_dirs": ws.config().get("add_dirs") or []}
@@ -426,7 +414,7 @@ def build_prompt(ws: Workspace, state: dict, party: str, upto: Optional[int] = N
     unseen = [m for m in state["messages"][info["seen"]:upto]
               if not (m["speaker"] == party and m["via_cli"])]
     parts = []
-    if config.shares(ws.root)[party] == 0:
+    if config.shares(ws.control_root)[party] == 0:
         parts.append(routing.ZERO_SHARE_ROLE)
     if not info["session_id"]:
         # 對話框所在的 AI 沒被勾選時只主持、不在參與者名單，但也是討論對象
@@ -568,7 +556,8 @@ def cmd_new(ws: Workspace, args):
     print(thread.name)
 
 
-def targets_for(state: dict, sender: str, to: Optional[str], enabled=AI_PARTIES) -> List[str]:
+def targets_for(state: dict, sender: str, to: Optional[str], enabled=AI_PARTIES,
+                config_path: Optional[Path] = None) -> List[str]:
     parties = thread_parties(state, enabled)
     if to == "none":
         return []
@@ -578,7 +567,8 @@ def targets_for(state: dict, sender: str, to: Optional[str], enabled=AI_PARTIES)
         return []
     target = canonical(to)
     if target not in enabled:
-        sys.exit(f"{to} 未在此專案啟用：{list(enabled)}")
+        cfg = f"（設定檔：{config_path}）" if config_path else ""
+        sys.exit(f"{to} 未在此專案啟用：{list(enabled)}{cfg}")
     if target == sender:
         sys.exit("不能請自己回覆。")
     return [target]
@@ -613,7 +603,7 @@ def state_relay_active(thread: Path) -> bool:
 def cmd_send(ws: Workspace, args):
     thread = ws.resolve_thread(args.thread)
     sender = canonical(args.sender)
-    if targets_for(load_state(thread), sender, args.to, ws.enabled()):
+    if targets_for(load_state(thread), sender, args.to, ws.enabled(), ws.config_path()):
         guard_network()
     guard_nested()
     text = read_message(args)
@@ -625,7 +615,7 @@ def cmd_send(ws: Workspace, args):
         add_message(thread, state, sender, text)
         save_state(thread, state)
         cutoff = len(state["messages"])
-    targets = targets_for(state, sender, args.to, ws.enabled())
+    targets = targets_for(state, sender, args.to, ws.enabled(), ws.config_path())
     if not targets:
         print("已記錄，尚未請任何一方回覆。")
         return
@@ -924,7 +914,7 @@ def plan_model(ws: Workspace, state: dict, party: str, tier: Optional[str], mode
     base = call_opts(ws, state, party)
     if model:
         return resolve_default(party, {"model": model, "effort": effort or base.get("effort"), "source": "指定"})
-    tiers = config.party_settings(ws.root)[party]["tiers"]
+    tiers = config.party_settings(ws.control_root)[party]["tiers"]
     explicit = (state["parties"].get(party) or {}).get("model")
     level = tier or (None if explicit else "standard")
     spec = tiers.get(level) if level else None
@@ -995,7 +985,7 @@ def describe_candidate(party: str, info: dict) -> str:
 def pick_worker(ws: Workspace, owner: str, candidates: List[str], state: dict, tier: Optional[str] = None,
                 model: Optional[str] = None, effort: Optional[str] = None) -> Tuple[str, dict, dict]:
     """額度篩選後依比例輪流；回傳預覽排程，成功建立才提交。assign 已持有專案鎖。"""
-    weights = config.shares(ws.root)
+    weights = config.shares(ws.control_root)
     others = [p for p in candidates if p != owner and weights[p] > 0]
     if not others:
         data = shares.dispatch_state(ws.root)
@@ -1199,7 +1189,7 @@ def _cmd_resume_locked(ws: Workspace, args):
             raise worktree.WorktreeError("找不到原分派的接手方紀錄")
         worker = require_enabled(ws, canonical(args.to)) if getattr(args, "to", None) else require_enabled(ws, orig_worker)
         switched = worker != orig_worker
-        if config.shares(ws.root)[worker] == 0:
+        if config.shares(ws.control_root)[worker] == 0:
             if not switched and relay.get("user_override") and relay.get("reason"):
                 effective_override = True
                 effective_reason = reason or relay.get("reason", "")
@@ -1432,7 +1422,7 @@ def _cmd_assign_locked(ws: Workspace, args):
     override = bool(getattr(args, "user_override", False))
     if (reason or override) and not args.to:
         sys.exit("--reason 與 --user-override 只用於 --to 指定分派。")
-    if args.to and not reason and config.shares(ws.root).get(canonical(args.to), 1) > 0:
+    if args.to and not reason and config.shares(ws.control_root).get(canonical(args.to), 1) > 0:
         sys.exit("指定分派須用 --reason 記錄使用者指定或專長等理由；預設請省略 --to。")
     request = {"thread": thread.name, "from": owner, "text": text, "to": canonical(args.to) if args.to else None,
                "session": args.session, "tier": tier, "model": model_arg, "effort": effort_arg,
@@ -1452,7 +1442,7 @@ def _cmd_assign_locked(ws: Workspace, args):
         sys.exit(f"此討論串已有進行中的分派（{NAMES[old['worker']]}），請先 recall。")
     if args.to:
         worker = require_enabled(ws, canonical(args.to))
-        if config.shares(ws.root)[worker] == 0 and not (override and reason):
+        if config.shares(ws.control_root)[worker] == 0 and not (override and reason):
             sys.exit(routing.ZERO_SHARE_ROLE + " 指定零權重實作須加 --user-override 與 --reason 記錄使用者明確指定。")
         if args.session:
             plan = session_plan(ws, worker, args.session)
@@ -1953,7 +1943,7 @@ def cmd_work(ws: Workspace, args):
             add_system_note(thread, f"🔁 {NAMES[owner]} 已收回工作，{NAMES[worker]} 停止接手。")
             return
 
-        if config.shares(ws.root)[worker] == 0 and not (relay.get("user_override") and relay.get("reason")):
+        if config.shares(ws.control_root)[worker] == 0 and not (relay.get("user_override") and relay.get("reason")):
             update_relay(thread, status="stopped", error="零權重實作未取得使用者明確覆寫。")
             append_progress(thread, "零權重接手已停止", routing.ZERO_SHARE_ROLE)
             return
@@ -2012,7 +2002,7 @@ def cmd_work(ws: Workspace, args):
         if relay.get("subagents") is True:
             prompt += ("\n能獨立進行的子工作（大量搜尋、讀檔、互不重疊的修改）用子代理並行，小工作自己做。"
                        "寫入子工作須分配互不重疊的檔案，由父代理整合驗證；子代理共用此 worktree，這不是強制隔離。")
-        if config.shares(ws.root)[worker] == 0:
+        if config.shares(ws.control_root)[worker] == 0:
             prompt += "\n" + routing.ZERO_SHARE_ROLE
             if relay.get("user_override"):
                 prompt += "\n本工作已記錄使用者明確指定你實作：" + relay.get("reason", "")
@@ -2024,7 +2014,7 @@ def cmd_work(ws: Workspace, args):
         before = git_status(work_root)
         log(f"第 {relay['rounds'] + 1} 輪：呼叫 {NAMES[worker]}")
         live = Live(live_path(thread, "work"), f"{NAMES[worker]}（接手）", work_root)
-        config_before = read_config_text(ws.root)
+        config_before = read_config_text(ws.control_root)
         files_before, round_ts = protected_files(work_root), time.time()
         opts = call_opts(ws, state, worker)
         if relay.get("frozen"):   # 分派時凍結的模型與子代理設定（cmd_assign）；舊版的分派沒有，沿用每輪讀設定
@@ -2052,7 +2042,7 @@ def cmd_work(ws: Workspace, args):
             live.close()
             remember_failed_call(thread, shares.record_call(ws.root, worker, thread.name, "work", opts["_stats"], False))
             update_relay(thread, **last_requested, last_model_reported=opts["_stats"].get("model") or None)
-            guard_config(ws.root, config_before, thread, worker)
+            guard_config(ws.control_root, config_before, thread, worker)
             guard_files(work_root, files_before, thread, worker, round_ts)
             exhausted = isinstance(e, CallError) and e.quota_exhausted
             log(f"呼叫失敗（額度={exhausted}）：{e}")
@@ -2108,7 +2098,7 @@ def cmd_work(ws: Workspace, args):
             update_relay(thread, status="failed", error=str(e)[:500])
             return
         live.close()
-        guard_config(ws.root, config_before, thread, worker)
+        guard_config(ws.control_root, config_before, thread, worker)
         guard_files(work_root, files_before, thread, worker, round_ts)
         changed = git_status(work_root)
         usage_entry = shares.record_call(ws.root, worker, thread.name, "work", opts["_stats"], True)
@@ -2663,12 +2653,12 @@ def cmd_parties(ws: Workspace, args):
     if enable or disable or models_ or efforts or shares_ or subagents or sandboxes or tiers:
         guard_nested()
         try:
-            settings = config.update_parties(ws.root, enable, disable, models_, efforts, shares_, subagents, sandboxes,
-                                             tiers)
+            settings = config.update_parties(ws.control_root, enable, disable, models_, efforts, shares_, subagents,
+                                             sandboxes, tiers)
         except ValueError as e:
             sys.exit(str(e))
     else:
-        settings = config.party_settings(ws.root)
+        settings = config.party_settings(ws.control_root)
     work = shares.recent_work(ws.root)
     if args.json:
         print(json.dumps({"workspace": str(ws.root), "parties": settings, "work": work,
@@ -2814,11 +2804,14 @@ def cmd_route(ws: Workspace, args):
     """對話框所在的 AI 該怎麼處理使用者這則訊息（依此專案勾選的 AI，見 routing.py）；
     給 hook 沒有執行時（例如 Codex 還沒信任專案 hook）用"""
     me, enabled = canonical(args.me), ws.enabled()
-    text = routing.instruction(me, enabled, config.shares(ws.root))
+    cfg_path = ws.config_path()
+    text = routing.instruction(me, enabled, config.shares(ws.control_root))
     if args.json:
-        print(json.dumps({"me": me, "enabled": enabled, "instruction": text}, ensure_ascii=False))
+        print(json.dumps({"me": me, "enabled": enabled, "instruction": text,
+                          "workspace": str(ws.root), "config": str(cfg_path)}, ensure_ascii=False))
     else:
         print(text)
+        print(f"設定檔：{cfg_path}")
 
 
 def cmd_activity(ws: Workspace, args):
@@ -3436,7 +3429,7 @@ def main(argv=None):
                 pass
     parser = argparse.ArgumentParser(prog="agora", description="Claude Code ⇄ Antigravity ⇄ Codex 討論與分派工作")
     parser.add_argument("-v", "--version", action="version", version=f"%(prog)s {__version__}")
-    parser.add_argument("--workspace", help="工作區（預設：目前資料夾的 git 根目錄）")
+    parser.add_argument("--workspace", help="工作區（預設：往上找最近的 .agora 專案，找不到再退回 git 根目錄或目前資料夾）")
     sub = parser.add_subparsers(dest="command", required=True)
     who = list(AI_PARTIES) + [HUMAN, "richard"]
 
