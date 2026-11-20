@@ -27,7 +27,12 @@ build、check、add_dirs、sandbox 會影響接手方能執行的指令與能寫
 被改動的設定在該輪結束後還原（cli.guard_config）。
 """
 
+import errno
 import json
+import os
+import tempfile
+import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
@@ -45,17 +50,74 @@ def config_path(root: Path) -> Path:
     return root / ".agora" / "config.json"
 
 
-def load(root: Path) -> dict:
+def load(root: Path, *, strict: bool = False) -> dict:
     try:
         return json.loads(config_path(root).read_text(encoding="utf-8"))
-    except Exception:
+    except FileNotFoundError:
         return {}
+    except Exception:
+        if strict:
+            raise
+        return {}
+
+
+@contextmanager
+def _config_lock(path: Path, timeout: float = 5.0):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Keep the lock file in place so every writer locks the same file across replacements.
+    # Closing the handle (including on process exit) releases the OS lock.
+    with path.with_suffix(".lock").open("a+b") as handle:
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as exc:
+                if exc.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                    raise
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ValueError(f"等待設定檔鎖逾時：{path}，請稍後重試。") from exc
+                time.sleep(min(0.05, remaining))
+        yield
+
+
+def _write_config(path: Path, data: dict):
+    content = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix=f".{path.name}.", suffix=".tmp", delete=False) as tmp:
+            temp_path = Path(tmp.name)
+            tmp.write(content)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        for attempt in range(6):
+            try:
+                os.replace(temp_path, path)
+                return
+            except PermissionError as exc:
+                # A Windows reader or scanner may briefly hold the destination open.
+                if getattr(exc, "winerror", None) not in (5, 32, 33) or attempt == 5:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
 
 
 def save(root: Path, data: dict):
     path = config_path(root)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    with _config_lock(path):
+        _write_config(path, data)
 
 
 def _model_spec(value) -> Optional[dict]:
@@ -115,7 +177,16 @@ def update_parties(root: Path, enable: Iterable[str] = (), disable: Iterable[str
     """更新參與方設定；模型、推理強度、沙箱給空字串或 default 表示改回 CLI 預設，比例給 default 表示改回 1，
     子代理給 on / off（default 表示改回不允許）。等級的鍵是「AI.等級」（例如 antigravity.heavy），值是「模型[:推理強度]」，
     default 清除。至少要保留一個 AI。"""
-    data = load(root)
+    path = config_path(root)
+    with _config_lock(path):
+        data = load(root, strict=True)
+        settings = _update_party_data(root, data, enable, disable, models, efforts, shares,
+                                      subagents, sandboxes, tiers)
+        _write_config(path, data)
+        return settings
+
+
+def _update_party_data(root, data, enable, disable, models, efforts, shares, subagents, sandboxes, tiers):
     parties = data.setdefault("parties", {})
     for p, value in [(p, True) for p in enable] + [(p, False) for p in disable]:
         parties.setdefault(p, {})["enabled"] = value
@@ -178,7 +249,6 @@ def update_parties(root: Path, enable: Iterable[str] = (), disable: Iterable[str
             for spec in item_tiers.values():
                 if isinstance(spec, dict):
                     spec.pop("fallback", None)
-    save(root, data)
     return settings
 
 
