@@ -374,7 +374,7 @@ Agora 在建立訊息、背景 job 或派工 worktree 前立即回報 sandbox �
 
 模型清單可讀取既有快取（含過期資料）；`models --refresh` 或無快取時會拒絕線上查詢。`prune --yes` 若需呼叫 `codex delete`，也會在刪除任何討論串前拒絕；只列出候選或使用 `--keep-sessions` 不受此限制。
 
-請讓 Codex 以 `sandbox_permissions="require_escalated"` 或等效核准在沙箱外執行該 agora 指令；`approval_policy=never` 無法提權時，改由 Claude Code、一般終端或 VSCode 面板發起，不要重試。安裝不會預設加入 Codex `prefix_rule` 放行；若自行在 `~/.codex/rules` 加規則，須了解符合規則的 agora 指令將免提示在沙箱外執行，包含可能建立派工及啟動其他 AI 的指令。
+請讓 Codex 以 `sandbox_permissions="require_escalated"` 或等效核准在沙箱外執行該 agora 指令；`approval_policy=never` 無法提權時，改由 Claude Code、一般終端或 VSCode 面板發起，不要重試。若先前對話曾取消某個 AI，而 Codex 審查器（`auto_review`）未承認當前 turn hook 注入的【Agora 勾選】並拒絕提權時，不要重試或繞過；請使用者在對話中明確確認重新加入該 AI，或改由 Claude Code、VSCode 面板或一般終端發起。安裝不會預設加入 Codex `prefix_rule` 放行；若自行在 `~/.codex/rules` 加規則，須了解符合規則的 agora 指令將免提示在沙箱外執行，包含可能建立派工及啟動其他 AI 的指令。
 
 ## 清理
 
