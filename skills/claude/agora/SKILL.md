@@ -13,7 +13,7 @@ description: 透過 Agora 與 Antigravity（Gemini）、Codex 進行多輪技術
 
 ## 依勾選分工
 
-Codex 執行會呼叫其他 AI 的 `send`／`reply`／`auto`／`assign`（含 `--resume`）／`summarize`／`relay` 時，須要求在沙箱外執行（`sandbox_permissions="require_escalated"` 或等效核准）。若 `approval_policy=never` 無法提權，請回報使用者改由 Claude Code、一般終端或 VSCode 面板發起，不要要求 Codex 在沙箱內重試。本機 `quota` 快取讀取、`check`、`build`、`status`、`list` 與沒有回覆目標的 `send --to none` 不需提權。
+Codex 執行會呼叫其他 AI 的 `send`／`reply`／`auto`／`assign`（含 `--resume`）／`summarize`／`relay` 時，須要求在沙箱外執行（`sandbox_permissions="require_escalated"` 或等效核准）。若 `approval_policy=never` 無法提權，請回報使用者改由 Claude Code、一般終端或 VSCode 面板發起，不要要求 Codex 在沙箱內重試；若提權被 Codex 審查器（`auto_review`）以先前已取消為由拒絕，亦不要重試或繞過，請使用者在對話中明確確認重新加入該 AI，或改由 Claude Code、VSCode 面板或一般終端發起。本機 `quota` 快取讀取、`check`、`build`、`status`、`list` 與沒有回覆目標的 `send --to none` 不需提權。
 
 使用者在 VSCode 面板勾選的 AI 決定誰來處理，不需要使用者說特定提示詞。每則使用者訊息都附有 hook 注入的「【Agora 勾選】」指示；
 沒看到時執行 `python D:/github/agora/agora.py route --me claude` 取得。指示說「只勾選你」時直接自己處理，不用 Agora。
