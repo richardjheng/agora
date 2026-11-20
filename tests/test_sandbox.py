@@ -33,20 +33,39 @@ class DetectionTests(unittest.TestCase):
         return dll
 
     def test_environment_requires_exact_one_even_when_token_query_fails(self):
-        with patch.object(sandbox, "token_username", return_value=None):
-            for value, expected in (("1", True), ("0", False), ("true", False), ("", False)):
-                with self.subTest(value=value), patch.dict(os.environ, {"CODEX_SANDBOX_NETWORK_DISABLED": value}):
-                    self.assertEqual(sandbox.network_restricted(), expected)
+        for username in (None, ""):
+            with patch.object(sandbox, "token_username", return_value=username):
+                for value in ("1", "0", "true", ""):
+                    with self.subTest(username=username, value=value), \
+                            patch.dict(os.environ, {"CODEX_SANDBOX_NETWORK_DISABLED": value}):
+                        self.assertEqual(sandbox.network_restricted(), value == "1")
+                        self.assertFalse(sandbox.is_codex_sandbox())
+                        if value == "1":
+                            with self.assertRaises(parties.CallError) as caught:
+                                sandbox.require_network()
+                            self.assertIn("依據：環境變數 CODEX_SANDBOX_NETWORK_DISABLED=1",
+                                          str(caught.exception))
+                        else:
+                            sandbox.require_network()
 
     def test_actual_token_offline_online_and_regular_users(self):
         for name, restricted, identity in (("CodexSandboxOffline", True, True),
                                             ("CodexSandboxOffline123", True, True),
                                             ("CodexSandboxOnline123", False, True), ("Richard", False, False)):
-            with self.subTest(name=name), patch.object(sandbox.sys, "platform", "win32"), \
-                    patch.object(sandbox.ctypes, "windll", self.windows_user(name), create=True):
-                self.assertEqual(sandbox.token_username(), name)
-                self.assertEqual(sandbox.network_restricted(), restricted)
-                self.assertEqual(sandbox.is_codex_sandbox(), identity)
+            for value in ("0", "1"):
+                with self.subTest(name=name, value=value), patch.object(sandbox.sys, "platform", "win32"), \
+                        patch.object(sandbox.ctypes, "windll", self.windows_user(name), create=True), \
+                        patch.dict(os.environ, {"CODEX_SANDBOX_NETWORK_DISABLED": value}):
+                    self.assertEqual(sandbox.token_username(), name)
+                    self.assertEqual(sandbox.network_restricted(), restricted)
+                    self.assertEqual(sandbox.is_codex_sandbox(), identity)
+                    if restricted:
+                        with self.assertRaises(parties.CallError) as caught:
+                            sandbox.require_network()
+                        self.assertEqual(caught.exception.kind, "sandbox")
+                        self.assertIn(f"依據：token={name}", str(caught.exception))
+                    else:
+                        sandbox.require_network()
 
     def test_failed_query_is_unknown_and_does_not_trust_username(self):
         for dll in (self.windows_user(success=False), self.windows_user(error=OSError("unavailable")), object()):
@@ -62,6 +81,9 @@ class DetectionTests(unittest.TestCase):
                 patch.object(sandbox.ctypes, "windll", dll, create=True):
             self.assertIsNone(sandbox.token_username())
             self.assertFalse(sandbox.network_restricted())
+            with patch.dict(os.environ, {"CODEX_SANDBOX_NETWORK_DISABLED": "1"}):
+                self.assertTrue(sandbox.network_restricted())
+                self.assertFalse(sandbox.is_codex_sandbox())
             dll.advapi32.GetUserNameW.assert_not_called()
 
 
@@ -97,7 +119,7 @@ class OperationTests(unittest.TestCase):
         with patch.object(jobs, "start") as start, patch.object(jobs, "spawn") as spawn, \
                 patch.object(cli.worktree, "prepare") as prepare, patch.object(cli, "recover_assignments") as recover, \
                 patch.object(parties.subprocess, "Popen") as popen:
-            with self.assertRaisesRegex(SystemExit, "目前在 Codex 沙箱（網路受限）"):
+            with self.assertRaisesRegex(SystemExit, "依據：環境變數 CODEX_SANDBOX_NETWORK_DISABLED=1"):
                 cli.main(["--workspace", str(self.root)] + command)
             for action in (start, spawn, prepare, recover, popen):
                 action.assert_not_called()
@@ -163,8 +185,7 @@ class OperationTests(unittest.TestCase):
         events = parties._RunEvents([{"event": "result", "result": {
             "status": "ERROR", "error": "authentication failed or timed out"}}])
         events.exit_code = 1
-        with patch.dict(os.environ, {"CODEX_SANDBOX_NETWORK_DISABLED": "0"}), \
-                patch.object(sandbox, "token_username", return_value="CodexSandboxOnline123"), \
+        with patch.object(sandbox, "token_username", return_value="CodexSandboxOnline123"), \
                 patch.object(parties, "_run", return_value=(events, "auth stderr evidence")) as run, \
                 patch.object(parties, "agy_version", return_value="test"), \
                 patch.object(quota, "mark_blocked") as mark:
@@ -183,7 +204,7 @@ class OperationTests(unittest.TestCase):
 
     def test_non_sandbox_auth_still_marks_blocked(self):
         error = parties.CallError("authentication failed", kind="auth", blocked=True)
-        with patch.dict(os.environ, {"CODEX_SANDBOX_NETWORK_DISABLED": "0"}), \
+        with patch.object(sandbox, "token_username", return_value="Richard"), \
                 patch.dict(cli.CALLERS, {"antigravity": Mock(side_effect=error)}):
             with self.assertRaises(parties.CallError):
                 cli.call_party("antigravity")
