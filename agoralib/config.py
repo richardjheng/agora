@@ -326,9 +326,10 @@ def resolve_root(workspace: Optional[str] = None, start: Optional[Path] = None) 
     2. worktree 環境變數 AGORA_WORKTREE
     3. 環境變數 AGORA_WORKSPACE
     4. 自動搜尋（從 start 或目前工作目錄開始）：
-       a. 往上找最近含有 .agora 的專案目錄（find_root，排除全域 ~/.agora）
-       b. git 倉庫根目錄（git rev-parse --show-toplevel）
-       c. 退回起點目錄（start 或 cwd）
+       a. 若位於 .agora/worktrees/<id> 內，使用該分派 worktree 的根目錄
+       b. 往上找最近含有 .agora 的專案目錄（find_root，排除全域 ~/.agora）
+       c. git 倉庫根目錄（git rev-parse --show-toplevel）
+       d. 退回起點目錄（start 或 cwd）
     """
     import os
     if workspace:
@@ -340,6 +341,10 @@ def resolve_root(workspace: Optional[str] = None, start: Optional[Path] = None) 
     if env_workspace:
         return Path(env_workspace).resolve()
     base = Path(start).resolve() if start is not None else Path.cwd().resolve()
+    for candidate in (base, *base.parents):
+        worktrees = candidate.parent
+        if worktrees == worktrees.parent.parent / ".agora" / "worktrees":
+            return candidate
     return find_root(base) or _git_root(base) or base
 
 

@@ -20,7 +20,7 @@
   關掉 VSCode 視窗、終端指令逾時都不會中斷它們，結果照樣寫進逐字稿。
 - 同一個討論串可以一邊討論、一邊有接手方在背景工作：等 AI 回覆期間不鎖住討論串，兩邊的訊息都會寫入，期間新增的訊息下一次再轉給該 AI。
 
-工作區預設為目前資料夾的 git 根目錄，也可用 `--workspace` 指定。
+工作區依序採用 `--workspace`、`AGORA_WORKTREE`、`AGORA_WORKSPACE`、目前所在的分派 worktree 根目錄、往上最近含有 `.agora` 的專案目錄（排除全域 `~/.agora`）、git 根目錄，最後退回目前目錄。
 
 ## 安裝
 
@@ -448,7 +448,7 @@ Agora 在建立訊息、背景 job 或派工 worktree 前立即回報 sandbox �
 
 | 環境變數 | 預設 |
 |---|---|
-| `AGORA_WORKSPACE` | 目前資料夾的 git 根目錄 |
+| `AGORA_WORKSPACE` | 未設定時依序搜尋所在的分派 worktree、最近含有 `.agora` 的專案（排除全域 `~/.agora`）、git 根目錄，最後退回起點目錄 |
 | `AGORA_HUMAN_NAME` | Richard |
 | `CLAUDE_PATH` / `AGY_PATH` / `CODEX_PATH` | 自動尋找 VSCode 擴充套件內建的執行檔 |
 | `AGORA_TIMEOUT` / `AGORA_WORK_TIMEOUT` | 600 / 7200 秒 |
