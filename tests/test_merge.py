@@ -6,6 +6,7 @@ import io
 import json
 import os
 import shutil
+import subprocess
 import sys
 import time
 import unittest
@@ -780,6 +781,288 @@ class TestCleanupAndPruneMerged(MergeTestBase):
             "cleanup_record": {"status": "cleaned", "worktree_removed": True, "branch_deleted": True, "branch_kept": False},
         })
         self.assertIn("已合併並清理 worktree 與分支", desc_del_branch)
+
+
+class TestMergeDependencyPreflight(MergeTestBase):
+    def test_collect_dependencies_filters_expands_and_keeps_constraints_separate(self):
+        tree = {
+            "pyproject.toml": (
+                '[project]\n'
+                'name = "My_Demo_Pkg"\n'
+                'dependencies = ["httpx>=0.24", "my-demo-pkg>=0.1", "direct @ https://example.com/a.whl"]\n'
+                '[project.optional-dependencies]\n'
+                'dev = ["my_demo_pkg[test]", "ruff>=0.1"]\n'
+                'test = ["pytest>=7"]\n'
+                'tests = ["coverage>=7"]\n'
+                'docs = ["sphinx>=7"]\n'
+            ),
+            "requirements.txt": (
+                "# comment\n"
+                "-e .\n"
+                "-e git+https://github.com/org/edit.git#egg=edit\n"
+                "--find-links https://example.com/wheels\n"
+                "--index-url https://pypi.org/simple\n"
+                "git+https://github.com/org/vcs.git\n"
+                "urlpkg @ https://example.com/urlpkg-1.0.whl\n"
+                "./local-pkg\n"
+                "../sibling-pkg\n"
+                "wheel.whl\n"
+                "my.demo.pkg==1.0\n"
+                "-r reqs/base.txt\n"
+                "-c constraints.txt\n"
+                "requests>=2.28 \\\n"
+                "    --hash=sha256:abcdef123456\n"
+            ),
+            "reqs/base.txt": (
+                "-r ../requirements.txt\n"
+                "-r extra.txt\n"
+                "urllib3>=1.26  # inline comment\n"
+            ),
+            "reqs/extra.txt": "click==8.1.7\n",
+            "constraints.txt": (
+                "urllib3<3\n"
+                "constraint-only-pkg==9.9.9\n"
+                "-e .\n"
+            ),
+            "requirements-docs.txt": "mkdocs>=1.5\n",
+        }
+        deps = cli.collect_project_dependencies(tree.get)
+        self.assertEqual(deps["sources"], ["pyproject.toml", "requirements.txt"])
+        self.assertEqual(
+            deps["requirements"],
+            ["httpx>=0.24", "ruff>=0.1", "pytest>=7", "coverage>=7", "click==8.1.7", "urllib3>=1.26", "requests>=2.28"],
+        )
+        self.assertEqual(deps["constraints"], ["urllib3<3", "constraint-only-pkg==9.9.9"])
+        self.assertNotIn("constraint-only-pkg==9.9.9", deps["requirements"])
+        self.assertNotIn("sphinx>=7", deps["requirements"])
+        self.assertNotIn("mkdocs>=1.5", deps["requirements"])
+
+        skipped_reasons = {(item["item"], item["reason"]) for item in deps["skipped"]}
+        self.assertIn(("-e .", "editable 安裝"), skipped_reasons)
+        self.assertIn(("--find-links https://example.com/wheels", "pip 選項行"), skipped_reasons)
+        self.assertIn(("--index-url https://pypi.org/simple", "pip 選項行"), skipped_reasons)
+        self.assertIn(("git+https://github.com/org/vcs.git", "直接 URL／VCS"), skipped_reasons)
+        self.assertIn(("urlpkg @ https://example.com/urlpkg-1.0.whl", "直接 URL／VCS"), skipped_reasons)
+        self.assertIn(("./local-pkg", "本機路徑"), skipped_reasons)
+        self.assertIn(("my.demo.pkg==1.0", "專案本身"), skipped_reasons)
+        self.assertIn(("my_demo_pkg[test]", "專案本身"), skipped_reasons)
+        self.assertIn(("requirements.txt", "循環引用 -r"), skipped_reasons)
+
+    def test_missing_tomllib_skips_pyproject_with_notice_and_checks_requirements(self):
+        tree = {
+            "pyproject.toml": '[project]\nname = "demo"\ndependencies = ["httpx"]\n',
+            "requirements.txt": "requests>=2.0\n",
+        }
+        with patch.object(cli, "tomllib", None):
+            deps = cli.collect_project_dependencies(tree.get)
+        self.assertEqual(deps["requirements"], ["requests>=2.0"])
+        self.assertTrue(any("未預檢依賴" in n and "tomllib" in n for n in deps["notices"]))
+
+    def test_missing_dependency_refuses_merge_without_venv_and_keeps_head(self):
+        ws = cli.Workspace(self.root)
+        (self.root / "tests").mkdir()
+        (self.root / "tests/test_app.py").write_text(
+            "import unittest\nclass T(unittest.TestCase):\n def test_ok(self):\n  self.assertTrue(True)\n",
+            encoding="utf-8",
+        )
+        worktree.git(self.root, "add", "tests/test_app.py")
+        worktree.git(self.root, "commit", "-m", "add unittest")
+        self.make_committed_dispatch(
+            allowed=["requirements.txt"],
+            edit_file="requirements.txt",
+            edit_text="agora-nonexistent-pkg-for-test-99999>=1.0\n",
+        )
+        head = worktree.git(self.root, "rev-parse", "HEAD")
+        self.assertIsNone(cli.project_python(self.root))
+
+        # Test both default check (no config) and custom Python check
+        for check in (None, [sys._base_executable, "-m", "unittest", "discover", "-s", "tests"]):
+            with self.subTest(check=check):
+                config.save(self.root, {"check": check})
+                with patch.object(merge, "run_main_check") as integration:
+                    with self.assertRaisesRegex(
+                        merge.MergeError,
+                        r"整合環境缺失：缺少 agora-nonexistent-pkg-for-test-99999.*python -m venv \.venv.*pip install -r requirements\.txt",
+                    ):
+                        merge.merge_dispatch(ws, self.thread)
+                integration.assert_not_called()
+                self.assertEqual(worktree.git(self.root, "rev-parse", "HEAD"), head)
+
+    def test_pip_report_nonempty_install_refuses_merge(self):
+        ws = cli.Workspace(self.root)
+        self.make_committed_dispatch(
+            allowed=["requirements.txt"],
+            edit_file="requirements.txt",
+            edit_text="mplfinance>=0.12\n",
+        )
+        head = worktree.git(self.root, "rev-parse", "HEAD")
+        fake_report = json.dumps({"install": [{"metadata": {"name": "mplfinance", "version": "0.12.10"}}]})
+        real_run = subprocess.run
+
+        def fake_pip_run(cmd, *args, **kwargs):
+            if isinstance(cmd, list) and cmd[1:3] == ["-m", "pip"]:
+                return subprocess.CompletedProcess(cmd, 0, fake_report, "")
+            return real_run(cmd, *args, **kwargs)
+
+        with patch.object(cli.subprocess, "run", side_effect=fake_pip_run), \
+                patch.object(merge, "run_main_check") as integration:
+            with self.assertRaisesRegex(merge.MergeError, r"整合環境缺失：缺少 mplfinance"):
+                merge.merge_dispatch(ws, self.thread)
+        integration.assert_not_called()
+        self.assertEqual(worktree.git(self.root, "rev-parse", "HEAD"), head)
+
+    def test_installed_dependencies_allow_merge_and_ignore_constraints_only_pkg(self):
+        ws = cli.Workspace(self.root)
+        (self.root / "constraints.txt").write_text("agora-constraint-only-missing-pkg==1.0\n", encoding="utf-8")
+        worktree.git(self.root, "add", "constraints.txt")
+        worktree.git(self.root, "commit", "-m", "add constraints")
+        self.make_committed_dispatch(
+            allowed=["requirements.txt"],
+            edit_file="requirements.txt",
+            edit_text="-c constraints.txt\npip\n",
+        )
+        # Real offline pip dry-run (--no-index): `pip` is installed, constraint-only pkg must NOT be required
+        result = merge.merge_dispatch(ws, self.thread, keep=True, run_check=lambda r: {"exit_code": 0})
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["preflight_warnings"], [])
+
+    def test_merged_requirements_checks_both_main_and_dispatch_additions(self):
+        ws = cli.Workspace(self.root)
+        (self.root / "requirements.txt").write_text("base-1\nbase-2\nbase-3\nbase-4\nbase-5\n", encoding="utf-8")
+        worktree.git(self.root, "add", "requirements.txt")
+        worktree.git(self.root, "commit", "-m", "base requirements")
+        self.make_committed_dispatch(
+            allowed=["requirements.txt"],
+            edit_file="requirements.txt",
+            edit_text="base-1\nbase-2\nbase-3\nbase-4\nbase-5\ndispatch-added-pkg>=1.0\n",
+        )
+        # Main independently adds a package at the top of the same requirements.txt
+        (self.root / "requirements.txt").write_text(
+            "main-added-pkg>=2.0\nbase-1\nbase-2\nbase-3\nbase-4\nbase-5\n",
+            encoding="utf-8",
+        )
+        worktree.git(self.root, "add", "requirements.txt")
+        worktree.git(self.root, "commit", "-m", "main adds requirement")
+
+        captured = {}
+        real_run = subprocess.run
+
+        def fake_run(cmd, *args, **kwargs):
+            if isinstance(cmd, list) and cmd[1:3] == ["-m", "pip"]:
+                r_idx = cmd.index("-r")
+                captured["cmd"] = list(cmd)
+                captured["env"] = dict(kwargs.get("env") or {})
+                captured["reqs"] = Path(cmd[r_idx + 1]).read_text(encoding="utf-8").splitlines()
+                return subprocess.CompletedProcess(cmd, 0, json.dumps({"install": []}), "")
+            return real_run(cmd, *args, **kwargs)
+
+        with patch.object(cli.subprocess, "run", side_effect=fake_run):
+            result = merge.merge_dispatch(ws, self.thread, keep=True, run_check=lambda r: {"exit_code": 0})
+        self.assertTrue(result["ok"])
+        self.assertIn("main-added-pkg>=2.0", captured["reqs"])
+        self.assertIn("dispatch-added-pkg>=1.0", captured["reqs"])
+        self.assertIn("--isolated", captured["cmd"])
+        self.assertIn("--no-index", captured["cmd"])
+        self.assertIn("--dry-run", captured["cmd"])
+        self.assertIn("--no-deps", captured["cmd"])
+        self.assertEqual(captured["env"].get("PYTHONUTF8"), "1")
+        self.assertEqual(captured["env"].get("PIP_DISABLE_PIP_VERSION_CHECK"), "1")
+
+    def test_pip_tool_errors_and_old_git_warn_and_still_merge(self):
+        cases = [
+            ("no_pip", subprocess.CompletedProcess(["pip"], 1, "", "python.exe: No module named pip"), "沒有安裝 pip"),
+            ("old_pip", subprocess.CompletedProcess(["pip"], 2, "", "no such option: --report"), "pip 版本過舊"),
+            ("bad_json", subprocess.CompletedProcess(["pip"], 0, "not-json{{{", ""), "報告解析失敗"),
+        ]
+        for label, fake_proc, expected_text in cases:
+            with self.subTest(case=label):
+                ws = cli.Workspace(self.root)
+                did = f"1122334455667788{label[:6].ljust(6, '0')}"
+                self.make_committed_dispatch(
+                    dispatch_id=did,
+                    allowed=["requirements.txt"],
+                    edit_file="requirements.txt",
+                    edit_text=f"pkg-{label}>=1.0\n",
+                )
+                real_run = subprocess.run
+
+                def fake_pip_run(cmd, *args, _proc=fake_proc, **kwargs):
+                    if isinstance(cmd, list) and cmd[1:3] == ["-m", "pip"]:
+                        return _proc
+                    return real_run(cmd, *args, **kwargs)
+
+                with patch.object(cli.subprocess, "run", side_effect=fake_pip_run):
+                    result = merge.merge_dispatch(ws, self.thread, dispatch_id=did, keep=True, run_check=lambda r: {"exit_code": 0})
+                self.assertTrue(result["ok"])
+                self.assertTrue(any("未預檢依賴" in w and expected_text in w for w in result["preflight_warnings"]), result["preflight_warnings"])
+
+        # Unsupported git merge-tree --write-tree warns and still merges
+        ws = cli.Workspace(self.root)
+        did = "9988776655443322oldgit"
+        self.make_committed_dispatch(
+            dispatch_id=did,
+            allowed=["requirements.txt"],
+            edit_file="requirements.txt",
+            edit_text="pkg-oldgit>=1.0\n",
+        )
+        real_git_run = merge._git_run
+        def fake_git_run(root, *args):
+            if args[:2] == ("merge-tree", "--write-tree"):
+                return subprocess.CompletedProcess(["git", *args], 129, "", "error: unknown option `write-tree'")
+            return real_git_run(root, *args)
+
+        with patch.object(merge, "_git_run", side_effect=fake_git_run):
+            result = merge.merge_dispatch(ws, self.thread, dispatch_id=did, keep=True, run_check=lambda r: {"exit_code": 0})
+        self.assertTrue(result["ok"])
+        self.assertTrue(any("未預檢依賴" in w and "merge-tree" in w for w in result["preflight_warnings"]))
+
+        # cmd_merge prints preflight warnings to stdout
+        out = io.StringIO()
+        with patch.object(merge, "merge_dispatch", return_value=result), patch("sys.stdout", out):
+            merge.cmd_merge(ws, argparse.Namespace(thread=self.thread.name, dispatch_id=did, keep=True, delete_branch=False, json=False))
+        self.assertIn("未預檢依賴", out.getvalue())
+
+    def test_custom_non_python_check_skips_dep_preflight_with_notice(self):
+        ws = cli.Workspace(self.root)
+        self.make_committed_dispatch(
+            allowed=["requirements.txt"],
+            edit_file="requirements.txt",
+            edit_text="agora-nonexistent-pkg-99999>=1.0\n",
+        )
+        # Direct `pytest` (not `python -m pytest`) or shell command skips dependency preflight with notice
+        fake_pytest = self.root / ("pytest.cmd" if os.name == "nt" else "pytest")
+        fake_pytest.write_text("@echo ok\n" if os.name == "nt" else "#!/bin/sh\necho ok\n", encoding="utf-8")
+        if os.name != "nt":
+            fake_pytest.chmod(0o755)
+        config.save(self.root, {"check": [fake_pytest.name, "-q"]})
+        result = merge.merge_dispatch(ws, self.thread, keep=True, run_check=lambda r: {"exit_code": 0})
+        self.assertTrue(result["ok"])
+        self.assertTrue(any("未預檢依賴" in w and "Python 直譯器" in w for w in result["preflight_warnings"]))
+
+    def test_pip_find_links_env_is_ignored_by_isolated_flag(self):
+        ws = cli.Workspace(self.root)
+        wheelhouse = self.root / "wheelhouse"
+        wheelhouse.mkdir()
+        # Create a minimal valid wheel file for a fake package in PIP_FIND_LINKS
+        import zipfile
+        whl = wheelhouse / "agora_fake_isolated_pkg-1.0.0-py3-none-any.whl"
+        with zipfile.ZipFile(whl, "w") as zf:
+            zf.writestr("agora_fake_isolated_pkg-1.0.0.dist-info/METADATA", "Metadata-Version: 2.1\nName: agora-fake-isolated-pkg\nVersion: 1.0.0\n")
+            zf.writestr("agora_fake_isolated_pkg-1.0.0.dist-info/WHEEL", "Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n")
+            zf.writestr("agora_fake_isolated_pkg-1.0.0.dist-info/RECORD", "")
+        self.make_committed_dispatch(
+            allowed=["requirements.txt"],
+            edit_file="requirements.txt",
+            edit_text="agora-fake-isolated-pkg==1.0.0\n",
+        )
+        head = worktree.git(self.root, "rev-parse", "HEAD")
+        # Even with PIP_FIND_LINKS pointing to wheelhouse, --isolated ignores it and refuses merge
+        with patch.dict(os.environ, {"PIP_FIND_LINKS": str(wheelhouse)}), \
+                patch.object(merge, "run_main_check") as integration:
+            with self.assertRaisesRegex(merge.MergeError, r"整合環境缺失：缺少 agora-fake-isolated-pkg"):
+                merge.merge_dispatch(ws, self.thread)
+        integration.assert_not_called()
+        self.assertEqual(worktree.git(self.root, "rev-parse", "HEAD"), head)
 
 
 if __name__ == "__main__":
