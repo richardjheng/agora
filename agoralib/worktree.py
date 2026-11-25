@@ -8,20 +8,32 @@ Checks fail closed; failed checks leave the branch and worktree for review.
 import fnmatch
 import hashlib
 import json
+import math
 import os
 import re
+import shutil
+import stat
 import subprocess
 import sys
 import tempfile
+import time
 import venv
+from contextlib import ExitStack, contextmanager
+from datetime import datetime
 from pathlib import Path
 
-from agoralib import quota, snapshot
+from agoralib import config, jobs, parties, quota, snapshot
+
+try:
+    import tomllib
+except ImportError:  # Python 3.9 and 3.10
+    tomllib = None
 
 CONTROL_ENV = "AGORA_CONTROL_ROOT"
 WORK_ENV = "AGORA_WORKTREE"
 DISPATCH_ENV = "AGORA_DISPATCH_ID"
 MANIFEST_ENV = "AGORA_DISPATCH_MANIFEST"
+RECORD_ENV = "AGORA_CHECK_RECORD"
 FIELDS = ("dispatch_id", "source_branch", "base_sha", "branch", "branch_naming_version", "initial_worker",
           "worktree", "control_root", "manifest", "commit_message", "check_result", "commit_sha",
           "commit_status", "environment_status", "baseline_comparison", "preexisting_approval",
@@ -33,6 +45,19 @@ SLUG_MAX_LEN = 30
 SHORT_ID_LEN = 7
 _SLUG_DISALLOWED_RE = re.compile(r"[^A-Za-z0-9\u3400-\u4dbf\u4e00-\u9fff]+")
 _SLUG_VALID_RE = re.compile(r"[A-Za-z0-9\u3400-\u4dbf\u4e00-\u9fff]+(?:-[A-Za-z0-9\u3400-\u4dbf\u4e00-\u9fff]+)*")
+
+
+_PROJECT_DECLARATIONS = ("pyproject.toml", "setup.py", "setup.cfg")
+_TRANSIENT_PIP_ERROR = re.compile(
+    r"winerror\s*32\b|being used by another process|file is in use|sharing violation|另一個程序正在使用|"
+    r"timed?\s*out|ReadTimeout|ConnectTimeout|connection (?:was )?(?:reset|aborted)|"
+    r"ConnectionResetError|WinError\s*10054\b|"
+    r"\bHTTP(?:/\d(?:\.\d)?)?(?:\s+(?:error|status(?: code)?))?[: ]+5\d\d\b|"
+    r"\b5\d\d\s+(?:Server Error|Bad Gateway|Service Unavailable|Gateway Timeout)\b|"
+    r"\btoo many 5\d\d(?: error)? responses\b|"
+    r"Content-Type:\s*Unknown\b",
+    re.IGNORECASE,
+)
 
 
 class WorktreeError(RuntimeError):
@@ -353,34 +378,187 @@ def environment(meta):
     return git_environment(env, (meta["control_root"], target))
 
 
-def setup_environment(meta):
+def project_environment(env):
+    """Keep the project runtime environment and withhold controller state from project code."""
+    controller_keys = (RECORD_ENV, parties.LOCKED_ENV, MANIFEST_ENV, CONTROL_ENV, DISPATCH_ENV, jobs.JOB_ENV)
+    return {key: value for key, value in env.items() if key not in controller_keys}
+
+
+@contextmanager
+def environment_lock(meta):
+    """Serialize setup, rebuild and Agora commands using the same dispatch venv."""
     target = validate(meta)
-    if (target / ".venv").exists():
-        raise WorktreeError(".venv 已存在，拒絕覆用未驗證的環境")
+    lock_key = Path(meta["manifest"]).with_name("environment.json")
+    with ExitStack() as stack:
+        try:
+            stack.enter_context(config._config_lock(lock_key, timeout=0))
+        except ValueError as exc:
+            raise WorktreeError("分派 .venv 正由另一個 Agora 程序使用，請稍後重試。") from exc
+        meta.update(load(meta))
+        yield target
+
+
+def _environment_note(meta, message):
+    log = Path(meta["manifest"]).with_name("environment.log")
+    with log.open("a", encoding="utf-8") as stream:
+        print(f"[{datetime.now().isoformat(timespec='seconds')}] {message}", file=stream)
+    print(message, flush=True)
+
+
+def _dependency_hashes(target):
+    files = [target / name for name in _PROJECT_DECLARATIONS]
+    default_requirements = [target / "requirements.txt", target / "requirements-dev.txt"]
+    files.extend(default_requirements)
+    files.extend(path for path in sorted(target.glob("requirements*.txt"))
+                 if path not in default_requirements)
+    return {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in files if path.is_file()}
+
+
+def _dependencies_changed(meta, target, hashes):
+    if "dependency_hashes" in meta:
+        return meta["dependency_hashes"] != hashes
+    # Legacy dispatches installed at creation. Check against the dispatch base
+    # until an actual reinstall can supply the manifest's first fingerprint.
+    paths = [*(f":(top,literal){name}" for name in _PROJECT_DECLARATIONS),
+             ":(top,glob)requirements*.txt"]
+    if git(target, "diff", "--name-only", meta["base_sha"], "--", *paths):
+        return True
+    if not hashes:
+        return False
+    base_files = git(target, "ls-tree", "--name-only", "-z", meta["base_sha"]).split("\0")
+    return bool(hashes.keys() - set(base_files))
+
+
+def _editable_requirement(meta, target):
+    path = target / "pyproject.toml"
+    if not path.is_file():
+        return "."
+    if tomllib is None:
+        _environment_note(meta, "目前的 Python 缺少 tomllib，這次以 editable 模式安裝基本專案，略過 dev／test／tests extras。")
+        return "."
     try:
-        egg_before = {p.name for p in target.glob("*.egg-info")}
-        venv.EnvBuilder(with_pip=True).create(target / ".venv")
-        commands = []
-        for name in ("requirements.txt", "requirements-dev.txt"):
-            if (target / name).is_file():
-                commands.append([str(python_path(target)), "-m", "pip", "install", "-r", name])
-        if any((target / name).is_file() for name in ("pyproject.toml", "setup.py", "setup.cfg")):
-            commands.append([str(python_path(target)), "-m", "pip", "install", "-e", "."])
-        for command in commands:
-            proc = subprocess.run(command, cwd=target, env=environment(meta), capture_output=True,
+        with path.open("rb") as stream:
+            extras = tomllib.load(stream).get("project", {}).get("optional-dependencies", {})
+    except ValueError as exc:
+        raise WorktreeError(f"無法解析 pyproject.toml：{exc}") from exc
+    names = [name for name in ("dev", "test", "tests") if name in extras]
+    return f".[{','.join(names)}]" if names else "."
+
+
+def _install_dependencies(meta, target, hashes):
+    pip = [str(python_path(target)), "-m", "pip", "install"]
+    specs = [["-r", name] for name in hashes if name not in _PROJECT_DECLARATIONS]
+    if any(name in hashes for name in _PROJECT_DECLARATIONS):
+        specs.append(["-e", _editable_requirement(meta, target)])
+    if not specs:
+        return
+    try:
+        delay = float(os.getenv("AGORA_PIP_RETRY_DELAY", "2"))
+        if not math.isfinite(delay) or delay < 0:
+            raise ValueError
+    except ValueError as exc:
+        raise WorktreeError("AGORA_PIP_RETRY_DELAY 須為非負且有限的秒數。") from exc
+    env = project_environment(environment(meta))
+    env.update(PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
+    for spec in specs:
+        _run_pip(meta, target, pip + spec, env, delay)
+
+
+def _run_pip(meta, target, command, env, delay):
+    retries = 3
+    for attempt in range(retries + 1):
+        try:
+            proc = subprocess.run(command, cwd=target, env=env, capture_output=True,
                                   text=True, encoding="utf-8", errors="replace", timeout=600, **quota.NO_WINDOW)
-            if proc.returncode:
-                raise WorktreeError(f"依賴安裝失敗：{(proc.stdout + proc.stderr)[-2000:]}")
+            if proc.returncode == 0:
+                return
+            output = proc.stdout + proc.stderr
+            transient = _TRANSIENT_PIP_ERROR.search(output) is not None
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            output = str(exc)
+            transient = isinstance(exc, subprocess.TimeoutExpired) or getattr(exc, "winerror", None) == 32
+        if not transient or attempt == retries:
+            raise WorktreeError(f"依賴安裝失敗：{output[-2000:]}")
+        wait = delay * (attempt + 1)
+        _environment_note(meta, f"pip install {' '.join(command[4:])} 遇到暫時性錯誤，"
+                                f"等待 {wait:g} 秒後重試（{attempt + 1}/{retries}）。")
+        time.sleep(wait)
+
+
+def _venv_location(target):
+    path = target / ".venv"
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return path
+    if (not stat.S_ISDIR(info.st_mode) or path.resolve() != path
+            or getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT):
+        raise WorktreeError("分派 .venv 必須是 worktree 內的實體目錄。")
+    return path
+
+
+def _remove_failed_venv(path):
+    # EnvBuilder copies the interpreter by default. On Linux an executable in
+    # use can be unlinked, so check for a running copy before deleting it.
+    if sys.platform.startswith("linux"):
+        for executable in Path("/proc").glob("[0-9]*/exe"):
+            try:
+                running = executable.readlink()
+            except OSError:
+                continue  # Process exited or isn't visible to this user.
+            if path in running.parents:
+                raise WorktreeError(f"分派 .venv 正被程序 {executable.parent.name} 使用，請結束後再續跑。")
+    try:
+        shutil.rmtree(path)
+    except OSError as exc:
+        raise WorktreeError(f"無法刪除分派 .venv，請確認使用此環境的程序已結束：{exc}") from exc
+
+
+def ensure_environment(meta, target, *, refresh=False, recover=False):
+    """Verify or install while the caller holds the dispatch environment lock."""
+    status = meta.get("environment_status")
+    install = status in ("pending", "failed")
+    if install and not recover:
+        raise WorktreeError("分派環境尚未就緒，請用 agora assign --resume 重新建立。")
+    egg_before = {p.name for p in target.glob("*.egg-info")}
+    changed = False
+    try:
+        path = _venv_location(target)
+        hashes = _dependency_hashes(target) if install or refresh else None
+        if install:
+            if path.exists():
+                if status != "failed":
+                    raise WorktreeError(".venv 已存在，拒絕覆用未驗證的環境")
+                _remove_failed_venv(path)
+            venv.EnvBuilder(with_pip=True).create(path)
+        elif refresh and _dependencies_changed(meta, target, hashes):
+            _environment_note(meta, "依賴宣告已變更，重新安裝並驗證分派環境。")
+            install = True
+        if install:
+            _install_dependencies(meta, target, hashes)
+        verify_environment(meta)
+        if install:
+            if _dependency_hashes(target) != hashes:
+                raise WorktreeError("安裝期間依賴宣告已變更，請續跑以重建環境。")
+            meta.update(environment_status="ready", dependency_hashes=hashes)
+            meta.pop("error", None)
+            changed = True
+    except BaseException as exc:
+        meta.update(environment_status="failed", error=str(exc))
+        changed = True
+        raise
+    finally:
         new_eggs = sorted({p.name for p in target.glob("*.egg-info")} - egg_before)
         if new_eggs:
             meta["build_outputs"] = normalize_build_outputs(list(meta.get("build_outputs") or []) + new_eggs)
-        verify_environment(meta)
-        meta["environment_status"] = "ready"
-        save(meta)
-    except BaseException as exc:
-        meta.update(environment_status="failed", error=str(exc))
-        save(meta)
-        raise
+        if changed or new_eggs:
+            save(meta)
+
+
+def setup_environment(meta):
+    with environment_lock(meta) as target:
+        ensure_environment(meta, target, recover=True)
 
 
 def verify_environment(meta):
@@ -413,7 +591,7 @@ for name in json.loads(sys.argv[2]):
 print('worktree imports verified')
 '''
     proc = subprocess.run([str(python), "-c", code, str(target), json.dumps(packages)], cwd=target,
-                          env=environment(meta), capture_output=True, text=True, encoding="utf-8",
+                          env=project_environment(environment(meta)), capture_output=True, text=True, encoding="utf-8",
                           errors="replace", timeout=60, **quota.NO_WINDOW)
     if proc.returncode:
         raise WorktreeError(f"載入來源檢查失敗：{proc.stdout}{proc.stderr}")

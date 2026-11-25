@@ -84,7 +84,8 @@ class WorktreeTests(unittest.TestCase):
         env.start()
         self.addCleanup(env.stop)
         for name in ("AGORA_WORKSPACE", worktree.CONTROL_ENV, worktree.WORK_ENV,
-                     worktree.DISPATCH_ENV, worktree.MANIFEST_ENV, cli.LOCKED_ENV):
+                     worktree.DISPATCH_ENV, worktree.MANIFEST_ENV, cli.LOCKED_ENV,
+                     cli.failure_baseline.RECORD_ENV, cli.jobs.JOB_ENV):
             os.environ.pop(name, None)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)

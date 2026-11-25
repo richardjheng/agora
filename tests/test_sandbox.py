@@ -95,7 +95,8 @@ class OperationTests(unittest.TestCase):
         for patcher in (
                 patch.dict(os.environ, {"CODEX_SANDBOX_NETWORK_DISABLED": "1", parties.NESTED_ENV: "",
                                         jobs.JOB_ENV: "", cli.worktree.WORK_ENV: "", cli.worktree.CONTROL_ENV: "",
-                                        cli.worktree.MANIFEST_ENV: "", parties.LOCKED_ENV: ""}),
+                                        cli.worktree.MANIFEST_ENV: "", cli.worktree.DISPATCH_ENV: "",
+                                        parties.LOCKED_ENV: "", cli.failure_baseline.RECORD_ENV: ""}),
                 patch.object(sandbox, "token_username", return_value=None),
                 patch.object(quota, "BLOCKED_FILE", self.root / "blocked.json")):
             patcher.start()
@@ -240,7 +241,7 @@ class OperationTests(unittest.TestCase):
                 patch.object(cli, "check_slot_context", return_value=(self.root, None, "test")), \
                 patch.object(cli.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")), \
                 patch.object(cli, "run_configured_command", return_value=subprocess.CompletedProcess([], 0, "", "")) as run, \
-                patch("sys.stdout", io.StringIO()), patch.dict(os.environ, {cli.failure_baseline.RECORD_ENV: ""}):
+                patch("sys.stdout", io.StringIO()):
             with self.assertRaises(SystemExit) as caught:
                 cli.cmd_check(self.ws, argparse.Namespace(task=None))
             self.assertEqual(caught.exception.code, 0)

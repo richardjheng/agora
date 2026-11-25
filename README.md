@@ -154,6 +154,7 @@ manifest 保存兩份診斷結果、時間、log 及核准理由；commit 記錄
 `agora assign <討論串> --resume <分派ID> --from <你> [--allow 新增路徑 --reason 理由] [--to <AI>] [--file／--message 補充說明]`：
 - 沿用原 branch、worktree、base SHA、凍結的 check 指令與模型等級設定，不重跑 `worktree.prepare()`，也不重複計入自動派工件數；
 - 前置檢查與 `finalize` 共用：原接手與收尾程序必須已結束、worktree 存在、manifest 一致；**已提交（committed）的分派不可 resume**，須改開新分派；
+- 若分派環境建立或驗證失敗，`status` 會建議用 `assign --resume`。續跑會鎖住分派環境、確認 `.venv` 是該 worktree 內的實體目錄，再刪除殘留環境、重建及驗證。若鎖衝突或目錄被程序占用，會回報失敗。續跑前請先結束手動啟動、仍在使用該 `.venv` 的程序。
 - 擴大範圍（`--allow`）**必須加 `--reason`**（同樣經機密規則預檢），併入 `allowed_paths` 並記入 manifest `scope_extensions`，同時使舊 `check_result`／`checked_tree` 失效、`commit_status` 回到 `pending`；
 - 若 `stop_requested` 為 true，確認舊程序結束後才解除並記入 manifest `stop_clearances`（`by: resume`），續跑期間新的 `recall` 照常生效；
 - 預設續跑同一方並續接原對話（`CONTINUE_PROMPT`）；`--to` 改派他方時開新對話並附原工作單與 `progress.md` 路徑；補充說明會附進提示並記入 `progress.md`；
@@ -474,12 +475,20 @@ Agora 在建立訊息、背景 job 或派工 worktree 前立即回報 sandbox �
 接手方受指令白名單限制，只能執行不帶參數的 `agora check` 與 `agora build`，不能自己改跑 `.venv\Scripts\python -m pytest`。
 所以測試在哪個 Python、用什麼工具跑，完全由 `.agora/config.json` 的 `check`／`build` 決定；接手當輪用的是該輪開始時的設定，接手方改了也不會生效。
 
+Agora 建立分派的 `.venv` 時，會安裝專案根目錄的 `requirements*.txt`，並以 editable 模式安裝 Python 專案及已宣告的 `dev`、`test`、`tests` extras。Python 3.9／3.10 缺少 `tomllib` 時會安裝基本專案，並留下紀錄。
+
+分派的 `agora check` 會比對 `pyproject.toml`、`setup.py`、`setup.cfg`、`requirements*.txt` 的安裝指紋。宣告變動時，先重新安裝並驗證載入來源，再選擇及執行測試，讓接手方與收尾驗證共用同一流程。環境安裝、check 與 build 共用分派鎖，遇到鎖衝突時可稍後重試。
+
+pip 使用 UTF-8，遇到暫時性錯誤最多重試三次。重試間隔預設為 2、4、6 秒，設定 `AGORA_PIP_RETRY_DELAY` 可調整基準秒數。重試與 extras 退路會記在分派 manifest 旁的 `environment.log`。
+
 沒有設定 `check` 時，`agora check` 自動偵測：
 
 1. Python：工作區有 `.venv` 或 `venv`（Windows 為 `Scripts\python.exe`，其他平台為 `bin/python`）就用它，否則用 Agora 自己的 Python。
 2. 測試工具：專案有 pytest 設定（`pyproject.toml` 的 `[tool.pytest…]`、`pytest.ini`、`conftest.py`、`setup.cfg`、`tox.ini`）、而且上面那個 Python 裝了 pytest，就執行 `python -m pytest -q`；否則有 `tests/` 才執行 `python -m unittest discover -s tests`。
 
-`agora check` 輸出的第一行是實際執行的指令、Python 路徑與來源（設定檔、分派當輪的設定或自動偵測），環境不對時一眼就看得出來。
+`agora check` 在測試前會顯示實際執行的指令、Python 路徑與來源（設定檔、分派當輪的設定或自動偵測）。
+
+驗證紀錄與凍結指令由 Agora 的父程序管理。check／build 的專案指令會沿用 `PATH`、`VIRTUAL_ENV` 等執行環境，控制檔、分派識別與凍結指令的環境變數會在啟動專案程序前移除。
 
 - 偵測不到正確環境時（例如虛擬環境在別處、要用 tox 或 nox），請明確設定 `check`。
 - `install` 偵測到 `.venv`／`venv` 但沒有設定 `check`，或 `check` 用的是舊版 install 寫入的 Agora 自己的 Python 時，會印出建議的設定。新的 install 不再把 `check` 寫進設定檔。

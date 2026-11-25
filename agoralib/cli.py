@@ -1925,9 +1925,7 @@ def cmd_work(ws: Workspace, args):
                 update_relay(thread, status="done", **{k: task.get(k) for k in worktree.FIELDS})
                 append_progress(thread, "恢復已完成的提交", task["commit_sha"] + "；不重複呼叫 AI 或提交。")
                 return
-            if task.get("environment_status") == "pending":
-                worktree.setup_environment(task)
-            worktree.verify_environment(task)
+            worktree.setup_environment(task)
             update_relay(thread, environment_status=task["environment_status"])
         except (worktree.WorktreeError, OSError, subprocess.SubprocessError) as exc:
             update_relay(thread, status="failed", error=str(exc), environment_status="failed")
@@ -2236,6 +2234,16 @@ def cmd_status(ws: Workspace, args):
                  if not alive and relay.get("dispatch_id") and relay.get("status") != "done"
                  and relay.get("commit_status") != "committed" and not relay.get("commit_sha") else [])
     scope_hint = resume_scope_hint(thread, relay, req_scope) if req_scope else None
+    environment_hint = None
+    if not alive and relay.get("worktree") and not relay.get("commit_sha"):
+        environment_status = relay.get("environment_status")
+        try:
+            environment_status = worktree.load(relay).get("environment_status", environment_status)
+        except worktree.WorktreeError:
+            pass
+        if environment_status == "failed":
+            sender = relay.get("from") or HUMAN
+            environment_hint = f"{agora_cmd()} assign {thread.name} --resume {relay['dispatch_id']} --from {sender}"
     if args.json:
         print(json.dumps({"status": relay.get("status"), "worker": relay.get("worker"), "alive": alive,
                           "rounds": relay.get("rounds", 0), "timed_out": timed_out,
@@ -2245,7 +2253,7 @@ def cmd_status(ws: Workspace, args):
                           "denied": relay.get("denied") or [], "denied_summary": denial_summary(relay),
                           "warning": unverified_warning(relay), "last_progress": blocks[-1].strip() if blocks else None,
                           "resume_count": relay.get("resume_count") or 0, "resumes": relay.get("resumes") or [],
-                          "requested_scope": req_scope, "resume_hint": scope_hint,
+                          "requested_scope": req_scope, "resume_hint": environment_hint or scope_hint,
                           "baseline_comparison": relay.get("baseline_comparison"),
                           "failure_summary": failure_baseline.describe({**relay, "thread": str(thread)}),
                           **relay_model_fields(relay), "exit_code": code}, ensure_ascii=False, indent=2))
@@ -2275,6 +2283,8 @@ def cmd_status(ws: Workspace, args):
             print(f"⛔ 需要人工處理：{NAMES[relay['worker']]} {relay.get('blocked_reason') or ''}".rstrip())
         if relay.get("error") and not alive:
             print(f"原因：{relay['error']}")
+        if environment_hint:
+            print(f"💡 建議續跑以重建分派環境：{environment_hint}")
         if scope_hint:
             print(f"💡 進度檔請求擴大範圍：{', '.join(req_scope)}（不自動核准）")
             print(f"   建議指令：{scope_hint}")
@@ -2346,7 +2356,8 @@ def uses_pytest(root: Path) -> bool:
 def has_module(python: str, module: str) -> bool:
     code = f"import importlib.util, sys; sys.exit(importlib.util.find_spec({module!r}) is None)"
     try:
-        return subprocess.run([python, "-c", code], capture_output=True, timeout=60, **quota.NO_WINDOW).returncode == 0
+        return subprocess.run([python, "-c", code], env=worktree.project_environment(os.environ),
+                              capture_output=True, timeout=60, **quota.NO_WINDOW).returncode == 0
     except (OSError, subprocess.SubprocessError):
         return False
 
@@ -2392,7 +2403,8 @@ AGENT_COMMANDS = ("quota", "check", "build")   # 接手方可以執行的 Agora 
 def run_configured_command(spec, cwd: Path) -> subprocess.CompletedProcess:
     """執行 .agora/config.json 設定的指令：字串交給 shell；字串清單直接執行（不經 shell，
     Windows 上先找出 .exe/.cmd 的完整路徑）；清單的清單依序執行，遇到失敗就停"""
-    kw = dict(cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace", **quota.NO_WINDOW)
+    kw = dict(cwd=cwd, env=worktree.project_environment(os.environ), capture_output=True, text=True, encoding="utf-8",
+              errors="replace", **quota.NO_WINDOW)
     if isinstance(spec, str):
         return subprocess.run(spec, shell=True, **kw)
     if isinstance(spec, list) and spec and all(isinstance(x, list) for x in spec):
@@ -2438,9 +2450,22 @@ def active_task(ws: Workspace):
         meta = json.loads(Path(manifest).read_text(encoding="utf-8"))
         if meta["dispatch_id"] != os.getenv(worktree.DISPATCH_ENV) or Path(meta["worktree"]).resolve() != ws.root.resolve():
             raise worktree.WorktreeError("驗證工作區與 dispatch 不符")
-        worktree.verify_environment(meta)
         return meta
     except (OSError, ValueError, KeyError, worktree.WorktreeError) as exc:
+        sys.exit(f"隔離環境驗證失敗：{exc}")
+
+
+@contextmanager
+def checked_task_environment(ws: Workspace, *, refresh=False):
+    task = active_task(ws)
+    if task is None:
+        yield
+        return
+    try:
+        with worktree.environment_lock(task) as target:
+            worktree.ensure_environment(task, target, refresh=refresh)
+            yield
+    except (OSError, ValueError, worktree.WorktreeError, subprocess.SubprocessError) as exc:
         sys.exit(f"隔離環境驗證失敗：{exc}")
 
 
@@ -2453,6 +2478,14 @@ def run_task_check(meta):
                "--workspace", meta["worktree"], "check"]
     proc = subprocess.run(command, cwd=meta["worktree"], env=env, capture_output=True, text=True,
                           encoding="utf-8", errors="replace", **quota.NO_WINDOW)
+    # The child may have refreshed the venv. Keep its manifest updates when the
+    # controller next saves the check result or frozen command.
+    updated = worktree.load(meta)
+    for key in ("environment_status", "dependency_hashes", "build_outputs", "error"):
+        if key in updated:
+            meta[key] = updated[key]
+        else:
+            meta.pop(key, None)
     output = proc.stdout + proc.stderr
     evidence = completions.read_object(record)
     # Preserve the child's environment checks (including missing pytest). Freeze
@@ -2474,13 +2507,14 @@ def run_task_check(meta):
 
 def cmd_build(ws: Workspace, args):
     """專案建置：執行 .agora/config.json 的 build 指令"""
-    build = command_config(ws).get("build")
-    if not build:
-        sys.exit("未設定 build 指令。可在 .agora/config.json 加入 \"build\"（例如 \"west build\" 或 [\"make\"]）。")
-    try:
-        proc = run_configured_command(build, ws.root)
-    except ValueError as e:
-        sys.exit(str(e))
+    with checked_task_environment(ws):
+        build = command_config(ws).get("build")
+        if not build:
+            sys.exit("未設定 build 指令。可在 .agora/config.json 加入 \"build\"（例如 \"west build\" 或 [\"make\"]）。")
+        try:
+            proc = run_configured_command(build, ws.root)
+        except ValueError as e:
+            sys.exit(str(e))
     print(f"建置指令：{command_label(build)}（exit={proc.returncode}）")
     print((proc.stdout + proc.stderr).strip()[-3000:])
     sys.exit(1 if proc.returncode else 0)
@@ -2518,6 +2552,11 @@ def cmd_check(ws: Workspace, args):
         print(result["output_tail"])
         print(f"任務驗證（{meta['worktree']}）：exit={result['exit_code']}｜完整紀錄：{result['log']}")
         sys.exit(0 if result["exit_code"] == 0 else 1)
+    with checked_task_environment(ws, refresh=True):
+        check_workspace(ws)
+
+
+def check_workspace(ws: Workspace):
     check = command_config(ws).get("check")
     source = ("分派當輪的設定" if os.getenv(LOCKED_ENV) is not None else ".agora/config.json") if check else None
     if not check:

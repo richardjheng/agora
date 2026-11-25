@@ -102,7 +102,7 @@ python D:/github/agora/agora.py watch                          # 同時有分派
 
 ### 分支與 Worktree 隔離流程
 - **獨立 Branch 與 Worktree**：每次新分派會建立獨立 `<ai>/<slug>-<7 碼分派 ID>` branch（前綴 `claude/`、`codex/`、`agy/`，slug 預設取討論串標題並可用 `assign --name <slug>` 覆寫；改派續跑不改名；舊分派 `agora/<分派 ID>` 原樣相容）與獨立 git worktree（位於 `.agora/worktrees/<完整分派 ID>`；同 AI 多任務各一份）。接手 CLI 的工作目錄設為該 worktree，進度檔、control.json 與 `.agora/` 設定維持在主工作區。
-- **獨立環境與建置**：每個 worktree 各建 `.venv`，建置輸出留在該 worktree。
+- **獨立環境與建置**：每個 worktree 各建 `.venv` 並安裝依賴與可解析的 `dev`／`test`／`tests` extras，建置輸出留在該 worktree。依賴宣告變更時，下次 `agora check` 會先重裝並驗證環境。暫時性 pip 重試記於分派的 `environment.log`。環境失敗時依 `status` 提示續跑，先結束手動啟動且仍使用該環境的程序，`assign --resume` 會在鎖內重建及驗證。
 - **由 Agora 代做 Commit**：接手方完成後將 commit 訊息（任務目的、測試範圍）寫成檔案，宣告完成後由 Agora 核對分派、branch 與檔案範圍，執行實際 `agora check`，附上真實結果後代為 commit。接手方不要自行 git commit。分派與收尾不自動 push / merge。
 - **受控合併與清理（主持方，需使用者同意）**：僅在**使用者明確要求或同意**後，由主持方於主工作區執行 `python D:/github/agora/agora.py merge <討論串> [--dispatch-id <分派ID>] [--keep | --delete-branch]`（`--no-ff` 保留線圖分岔、寫入追蹤 trailer、衝突即 `merge --abort` 並回報），合併後於主工作區執行整合 `agora check`；驗證通過後預設只移除 worktree、保留分支（`--keep` 兩者都保留、`--delete-branch` 才於移除 worktree 後以 `git branch -d` 刪分支），僅自動刪可重建產物，未知檔案會阻擋清理、Windows 鎖定記待重試，控制紀錄含 SHA 保留。已合併未清資源亦可用 `python D:/github/agora/agora.py prune --merged [--delete-branch] --yes` 清理（預設保留分支、不刪討論串）。不自動 push。
 - **驗證排隊與不要中斷**：`agora check` 跨分派依控制根目錄 `.agora/config.json` 的 `check_concurrency`（預設 1）FIFO 排隊，可能排隊等待或執行耗時很長；排隊或執行中不要中斷，也不要因為耗時久就改判失敗。
