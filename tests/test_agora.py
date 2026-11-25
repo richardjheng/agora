@@ -2111,12 +2111,12 @@ class TestLock(unittest.TestCase):
 class TestVersion(unittest.TestCase):
     def test_version_defined_and_cli_flag(self):
         from agoralib import __version__
-        self.assertEqual(__version__, "0.2.26")
+        self.assertEqual(__version__, "0.2.27")
         out = io.StringIO()
         with patch("sys.stdout", out), self.assertRaises(SystemExit) as cm:
             cli.main(["--version"])
         self.assertEqual(cm.exception.code, 0)
-        self.assertIn("0.2.26", out.getvalue())
+        self.assertIn("0.2.27", out.getvalue())
 
 
 class TestQuotaWindows(unittest.TestCase):
