@@ -18,6 +18,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -2340,11 +2341,25 @@ def project_python(root: Path) -> Optional[Path]:
     return next((root / name / rel for name in (".venv", "venv") if (root / name / rel).is_file()), None)
 
 
-def uses_pytest(root: Path) -> bool:
+PYTEST_CONFIG_FILES = {
+    "pytest.ini": None, "conftest.py": None, "tests/conftest.py": None,
+    "pyproject.toml": "[tool.pytest", "setup.cfg": "[tool:pytest]", "tox.ini": "[pytest]",
+}
+
+
+def uses_pytest(root: Path, incoming=None) -> bool:
     """專案有 pytest 設定：pytest.ini、conftest.py，或 pyproject／setup.cfg／tox.ini 裡的 pytest 區段"""
-    if any((root / f).is_file() for f in ("pytest.ini", "conftest.py", "tests/conftest.py")):
-        return True
-    for name, marker in (("pyproject.toml", "[tool.pytest"), ("setup.cfg", "[tool:pytest]"), ("tox.ini", "[pytest]")):
+    incoming = incoming or {}
+    for name, marker in PYTEST_CONFIG_FILES.items():
+        if name in incoming:
+            contents = incoming[name]
+            if contents is not None and (marker is None or marker in contents):
+                return True
+            continue
+        if marker is None:
+            if (root / name).is_file():
+                return True
+            continue
         try:
             if marker in (root / name).read_text(encoding="utf-8", errors="replace"):
                 return True
@@ -2353,29 +2368,77 @@ def uses_pytest(root: Path) -> bool:
     return False
 
 
-def has_module(python: str, module: str) -> bool:
+def has_module(python: str, module: str, *, root=None, env=None) -> bool:
     code = f"import importlib.util, sys; sys.exit(importlib.util.find_spec({module!r}) is None)"
     try:
-        return subprocess.run([python, "-c", code], env=worktree.project_environment(os.environ),
+        return subprocess.run([python, "-c", code], cwd=root,
+                              env=worktree.project_environment(os.environ if env is None else env),
                               capture_output=True, timeout=60, **quota.NO_WINDOW).returncode == 0
     except (OSError, subprocess.SubprocessError):
         return False
 
 
-def default_check(root: Path) -> Tuple[Optional[list], str]:
+def default_check(root: Path, *, fallback_python=None, env=None, strict_pytest=False, incoming=None) -> Tuple[Optional[list], str]:
     """沒有設定 check 時的驗證指令與來源說明：工作區有 .venv／venv 就用它的 Python（否則用 Agora 的）；
     專案有 pytest 設定、而且那個 Python 裝了 pytest 就跑 pytest，否則有 tests/ 才跑 unittest"""
     venv = project_python(root)
-    python = str(venv) if venv else sys.executable
+    python = str(venv) if venv else (fallback_python or sys.executable)
     source = f"自動偵測 {venv.relative_to(root).parts[0]}" if venv else "自動偵測，工作區沒有 .venv／venv，用 Agora 的 Python"
-    pytest_config = uses_pytest(root)
-    if pytest_config and has_module(python, "pytest"):
+    pytest_config = uses_pytest(root, incoming)
+    if pytest_config and has_module(python, "pytest", root=root, env=env):
         return [python, "-m", "pytest", "-q"], source
     if pytest_config:
+        if strict_pytest:
+            raise ValueError(f"{python} 缺少 pytest")
         source += "；有 pytest 設定但這個 Python 沒有安裝 pytest，改用 unittest"
     if (root / "tests").is_dir():
         return [python, "-m", "unittest", "discover", "-s", "tests"], source
     return None, source
+
+
+INTEGRATION_CHECK_ENV = "AGORA_INTEGRATION_CHECK"
+
+
+def preflight_integration_check(ws: Workspace, python: str, env: dict, incoming: dict,
+                                dispatch_root: Path) -> None:
+    check = ws.config().get("check")
+    try:
+        if not check:
+            default_check(ws.root, fallback_python=python, env=env, strict_pytest=True, incoming=incoming)
+            return
+        commands = check if isinstance(check, list) and all(isinstance(x, list) for x in check) else [check]
+        for command in commands:
+            if isinstance(command, str):
+                if any(c in command for c in "&|;<>\n\r%$"):
+                    continue
+                try:
+                    command = [word.strip("\"'") for word in shlex.split(command, posix=False)]
+                except ValueError:
+                    continue
+            if not isinstance(command, list) or not command or not isinstance(command[0], str):
+                continue
+            program = command[0]
+            path = ws.root / program
+            executable = str(path) if path.is_file() else shutil.which(program, path=env.get("PATH", ""))
+            if executable is None:
+                # Shell strings may start with a shell builtin.
+                if isinstance(check, str) and not command_python(command) and Path(program).name.lower() not in ("pytest", "pytest.exe"):
+                    continue
+                raise ValueError(f"找不到驗證指令 {program}")
+            executable_path = Path(executable).absolute()
+            if (dispatch_root in executable_path.parents
+                    or config.resolve_control_root(executable_path) != executable_path):
+                raise ValueError(f"驗證指令指向分派 worktree：{executable}")
+            if command[1:3] == ["-m", "pytest"] and command_python(command):
+                if not has_module(executable, "pytest", root=ws.root, env=env):
+                    raise ValueError(f"{executable} 缺少 pytest")
+    except ValueError as exc:
+        venv = ".venv\\Scripts\\python.exe" if os.name == "nt" else ".venv/bin/python"
+        raise ValueError(
+            f"整合環境缺失：{exc}。請在主工作區建立環境（python -m venv .venv），"
+            f"依專案說明安裝驗證依賴（例如 {venv} -m pip install pytest），"
+            "並確認已設定的 check 指令使用該環境。"
+        ) from exc
 
 
 def legacy_default_check(spec, venv: Path) -> bool:
@@ -2400,17 +2463,20 @@ def command_python(spec) -> Optional[str]:
 AGENT_COMMANDS = ("quota", "check", "build")   # 接手方可以執行的 Agora 子指令（不帶參數）
 
 
-def run_configured_command(spec, cwd: Path) -> subprocess.CompletedProcess:
+def run_configured_command(spec, cwd: Path, *, pytest_without_cache=False) -> subprocess.CompletedProcess:
     """執行 .agora/config.json 設定的指令：字串交給 shell；字串清單直接執行（不經 shell，
     Windows 上先找出 .exe/.cmd 的完整路徑）；清單的清單依序執行，遇到失敗就停"""
     kw = dict(cwd=cwd, env=worktree.project_environment(os.environ), capture_output=True, text=True, encoding="utf-8",
               errors="replace", **quota.NO_WINDOW)
+    if pytest_without_cache:
+        addopts = kw["env"].get("PYTEST_ADDOPTS", "")
+        kw["env"]["PYTEST_ADDOPTS"] = f"-p no:cacheprovider {addopts}".rstrip()
     if isinstance(spec, str):
         return subprocess.run(spec, shell=True, **kw)
     if isinstance(spec, list) and spec and all(isinstance(x, list) for x in spec):
         outputs, proc = [], None
         for sub in spec:
-            proc = run_configured_command(sub, cwd)
+            proc = run_configured_command(sub, cwd, pytest_without_cache=pytest_without_cache)
             outputs.append((proc.stdout + proc.stderr).strip())
             if proc.returncode:
                 break
@@ -2522,18 +2588,17 @@ def cmd_build(ws: Workspace, args):
 
 def check_slot_context(ws: Workspace) -> Tuple[Path, Optional[Path], str]:
     """回傳 (控制根目錄, 分派討論串路徑或 None, 顯示標籤)。
-    分派 worktree 內執行時（環境有 MANIFEST_ENV）從 manifest 取得 control_root 與 thread，否則用 ws.root。"""
+    討論串從分派 manifest 取得，槽位一律放在控制根目錄。"""
     manifest = os.getenv(worktree.MANIFEST_ENV)
     if manifest:
         try:
             meta = json.loads(Path(manifest).read_text(encoding="utf-8"))
-            control_root = Path(meta["control_root"]).resolve()
             thread = Path(meta["thread"]).resolve() if meta.get("thread") else None
             label = meta.get("dispatch_id") or ws.root.name
-            return control_root, thread, label
+            return ws.control_root.resolve(), thread, label
         except (OSError, ValueError, KeyError):
             pass
-    return ws.root.resolve(), None, ws.root.name
+    return ws.control_root.resolve(), None, ws.root.name
 
 
 def cmd_check(ws: Workspace, args):
@@ -2559,10 +2624,15 @@ def cmd_check(ws: Workspace, args):
 def check_workspace(ws: Workspace):
     check = command_config(ws).get("check")
     source = ("分派當輪的設定" if os.getenv(LOCKED_ENV) is not None else ".agora/config.json") if check else None
+    task = bool(os.getenv(worktree.MANIFEST_ENV))
+    isolated = task or ws.root.resolve() != ws.control_root.resolve()
+    integration = bool(os.getenv(INTEGRATION_CHECK_ENV))
     if not check:
-        if os.getenv(worktree.MANIFEST_ENV) and uses_pytest(ws.root) and not has_module(str(project_python(ws.root)), "pytest"):
-            sys.exit("分派環境缺少 pytest，拒絕降級為 unittest。")
-        check, source = default_check(ws.root)
+        try:
+            check, source = default_check(ws.root, strict_pytest=isolated or integration)
+        except ValueError as exc:
+            label = "整合環境缺失" if integration else "分派環境缺失"
+            sys.exit(f"{label}：{exc}，拒絕降級為 unittest。")
     if check:   # 第一行：實際執行的指令與 Python，方便判斷環境問題
         python = command_python(check)
         print(f"驗證指令：{command_label(check)}（Python：{python or '指令未直接指定'}；來源：{source}）")
@@ -2590,7 +2660,8 @@ def check_workspace(ws: Workspace):
     stop_check = (lambda: stop_requested(task_thread)) if task_thread else None
     try:
         with checkqueue.acquire_slot(control_root, label=slot_label, stop_check=stop_check):
-            proc = run_configured_command(check, ws.root)
+            proc = (run_configured_command(check, ws.root, pytest_without_cache=True)
+                    if isolated else run_configured_command(check, ws.root))
     except checkqueue.CheckStopped as e:
         sys.exit(str(e))
     except PermissionError as e:

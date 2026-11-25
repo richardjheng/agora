@@ -117,7 +117,7 @@ class EnvironmentTests(unittest.TestCase):
                 patch.object(worktree, "verify_environment", side_effect=lambda meta: events.append("verify")), \
                 patch.object(cli, "command_config", return_value={"check": ["fake-test"]}), \
                 patch.object(cli, "run_configured_command",
-                             side_effect=lambda *args: events.append("test") or subprocess.CompletedProcess([], 0, "", "")):
+                             side_effect=lambda *args, **kwargs: events.append("test") or subprocess.CompletedProcess([], 0, "", "")):
             self.write("requirements-test.txt", "# added\n")
             check()
             self.assertEqual(events, ["pip", "verify", "test"])

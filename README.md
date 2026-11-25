@@ -388,7 +388,7 @@ Agora 在建立訊息、背景 job 或派工 worktree 前立即回報 sandbox �
 - 沒有分派工作，或分派的工作已完成（隔離分派須已合併並已清理）；暫停、失敗、等待中、尚未合併清理的都保留
 - 目前沒有人在使用
 
-另提供 `agora prune --merged [--thread <id>] [--delete-branch] [--yes]`，專門清理**已合併但未清理**的分派 worktree（預設保留分支，加 `--delete-branch` 才以 `git branch -d` 刪分支；預設只列出，加 `--yes` 執行），只清理分派資源、**不刪除討論串與控制紀錄**；僅自動刪除可重建產物（`.venv`、`__pycache__`、`*.pyc` 與 manifest 記錄的 `build_outputs`），有未知檔案或未提交變更時不清理並列出檔案。
+另提供 `agora prune --merged [--thread <id>] [--delete-branch] [--yes]`，專門清理**已合併但未清理**的分派 worktree（預設保留分支，加 `--delete-branch` 才以 `git branch -d` 刪分支；預設只列出，加 `--yes` 執行）。可清理的未追蹤產物包括 `.venv`、`*.egg-info/`、`.pytest_cache/`、`.mypy_cache/`、`.ruff_cache/`、`__pycache__/`、`*.pyc` 與 manifest 記錄的 `build_outputs`。未知檔案和未提交的已追蹤變更會阻擋清理，討論串與控制紀錄會保留。
 
 刪除討論串時，會一併刪除 Agora 為它在各 CLI 開的對話紀錄（`--keep-sessions` 可保留）；使用者用 `--session` 帶進來的對話不會刪：
 
@@ -417,6 +417,7 @@ Agora 在建立訊息、背景 job 或派工 worktree 前立即回報 sandbox �
   - 接手方的書面界線：只改工作單範圍、不自行 commit/push/merge、不碰 `.env`、不做影響外部系統的動作。
   - 接手方把 commit 訊息（任務目的、測試範圍）寫成檔案；宣告完成後由 Agora 核對分派、branch、檔案範圍，執行實際 `agora check`，附上真實結果後代為 commit。
   - 分派與收尾不自動 push / merge；僅在使用者明確要求時，由主持方於主工作區執行 `agora merge <討論串> [--dispatch-id <ID>] [--keep | --delete-branch]`：檢查程序已停止、`commit_status=committed` 且分支 SHA 吻合、主工作區位於 `source_branch`、無未提交的已追蹤變更與進行中 Git 操作；以 `git merge --no-ff` 合併（衝突即 `merge --abort` 並回報，不清理）並在主工作區執行一次 `agora check` 整合驗證（失敗不回滾合併且不清理）；驗證通過後預設只移除 worktree、保留分支（`--keep` 兩者都保留、`--delete-branch` 才於移除 worktree 後以 `git branch -d` 刪分支），僅自動刪除可重建產物，遇未知檔阻擋、遇 Windows 鎖定（EPERM）記為待重試可重試，控制紀錄含 SHA 完整保留。
+  - 合併前會依主工作區的驗證指令檢查環境。若缺少該指令需要的 pytest，先依提示準備環境再合併。純標準庫 unittest 專案可直接使用 Agora 的 Python。若合併已完成但尚無整合驗證通過紀錄，再執行 `agora merge` 會重新驗證。
 - **固定基準審查**：`agora changes` 與審查比對基準改為固定 `base SHA...branch`，避免基準漂移。
 - **確認程序結束才可清理**：未 merge 的成果、branch 與 worktree 均妥善保留，停止或中斷時不會提前清理。
 - hook 與會自動執行指令的設定（`.claude/settings*.json`、`.agents/hooks.json`、`.codex/config.toml`、`.codex/hooks.json`、`.vscode/tasks.json`、git hooks）改了等於繞過指令白名單：Claude 接手時直接禁止編輯 `.claude/`、`.agents/`、`.codex/`、`.git/` 與 `.vscode/tasks.json`；每輪結束時這些檔案被新增、修改或刪除都會還原，並記在逐字稿。

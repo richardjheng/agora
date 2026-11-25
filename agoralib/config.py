@@ -349,12 +349,17 @@ def resolve_root(workspace: Optional[str] = None, start: Optional[Path] = None) 
 
 
 def resolve_control_root(root: Path) -> Path:
-    """在隔離 worktree 內執行時映射回控制根目錄（AGORA_CONTROL_ROOT），否則維持 root。"""
+    """從分派目錄結構或隔離環境取得控制根目錄。"""
     import os
+    resolved = Path(root).resolve()
+    absolute = Path(root).absolute()
+    for candidate in (absolute, *absolute.parents):
+        worktrees = candidate.parent
+        if worktrees.name == "worktrees" and worktrees.parent.name == ".agora":
+            return worktrees.parent.parent.resolve()
     worktree_dir = os.getenv("AGORA_WORKTREE")
     control_dir = os.getenv("AGORA_CONTROL_ROOT")
     if worktree_dir and control_dir:
-        resolved = Path(root).resolve()
         wt = Path(worktree_dir).resolve()
         if _same_path(resolved, wt) or any(_same_path(p, wt) for p in resolved.parents):
             return Path(control_dir).resolve()
