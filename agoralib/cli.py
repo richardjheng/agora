@@ -17,17 +17,24 @@ live/discussion.md、live/work.md（回覆進行中的內容，完成後刪除�
 import argparse
 import json
 import os
+import posixpath
 import re
 import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
+
+try:
+    import tomllib
+except ImportError:  # Python 3.9 and 3.10
+    tomllib = None
 
 from agoralib import __version__, checkqueue, completions, config, jobs, merge, models, prune, quota, routing, sandbox, shares, snapshot, worktree
 from agoralib import baseline as failure_baseline
@@ -2397,41 +2404,380 @@ def default_check(root: Path, *, fallback_python=None, env=None, strict_pytest=F
 
 
 INTEGRATION_CHECK_ENV = "AGORA_INTEGRATION_CHECK"
+DEPENDENCY_REQUIREMENT_FILES = ("requirements.txt", "requirements-dev.txt", "requirements-test.txt")
+DEPENDENCY_PYPROJECT_EXTRAS = ("dev", "test", "tests")
+_PEP508_NAME_RE = re.compile(r"^([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)")
+_URL_SCHEME_RE = re.compile(r"^(?:(?:git|hg|svn|bzr)\+)?[a-zA-Z][a-zA-Z0-9+.-]*://|^(?:git|hg|svn|bzr)\+", re.IGNORECASE)
+_LOCAL_ARCHIVE_SUFFIXES = (".whl", ".tar.gz", ".tgz", ".zip", ".tar.bz2", ".tar.xz")
+_PIP_OPTION_RE = re.compile(r"^(--?[A-Za-z0-9][A-Za-z0-9_-]*)(?:=(.*)|\s+(.*))?$")
 
 
-def preflight_integration_check(ws: Workspace, python: str, env: dict, incoming: dict,
-                                dispatch_root: Path) -> None:
+def _normalize_pkg_name(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _logical_requirement_lines(text: str) -> List[str]:
+    """Join backslash line continuations and strip comments/blank lines."""
+    lines: List[str] = []
+    buf = ""
+    for raw in text.splitlines():
+        if raw.endswith("\\"):
+            buf += raw[:-1]
+            continue
+        full = buf + raw
+        buf = ""
+        cleaned = re.sub(r"(?:^|\s+)#.*$", "", full).strip()
+        if cleaned:
+            lines.append(cleaned)
+    if buf.strip():
+        cleaned = re.sub(r"(?:^|\s+)#.*$", "", buf).strip()
+        if cleaned:
+            lines.append(cleaned)
+    return lines
+
+
+def _resolve_tree_relpath(current_file: str, target: str) -> Optional[str]:
+    """Resolve a relative path inside the repository tree, rejecting absolute or escaping paths."""
+    raw = target.strip().strip("\"'").replace("\\", "/")
+    if not raw or raw.startswith("/") or re.match(r"^[A-Za-z]:", raw):
+        return None
+    base_dir = posixpath.dirname(current_file)
+    joined = posixpath.join(base_dir, raw) if base_dir else raw
+    norm = posixpath.normpath(joined)
+    if norm in ("", ".", "..") or norm.startswith("../") or norm.startswith("/"):
+        return None
+    return norm
+
+
+def _classify_pep508_requirement(spec: str, project_name_norm: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    """Return (clean_spec, None) if spec is a named PEP 508 requirement, else (None, skip_reason)."""
+    text = spec.strip()
+    if not text:
+        return None, "空白行"
+    # Strip trailing per-requirement pip options (e.g. --hash=sha256:..., --global-option=...)
+    text = re.sub(r"\s+--[A-Za-z0-9_-]+(?:=\S+|\s+\S+)?", "", text).strip()
+    if not text:
+        return None, "pip 選項行"
+    if text.startswith(("-e ", "-e\t", "--editable=", "--editable ", "--editable\t")) or text == "-e":
+        return None, "editable 安裝"
+    if text.startswith("-"):
+        return None, "pip 選項行"
+    if _URL_SCHEME_RE.match(text):
+        return None, "直接 URL／VCS"
+
+    before_marker = text.split(";", 1)[0].strip()
+    if re.search(r"@\s*\S+", before_marker):
+        return None, "直接 URL／VCS"
+    if (
+        before_marker in (".", "..")
+        or before_marker.startswith(("./", "../", ".\\", "..\\", "/", "\\", "~"))
+        or re.match(r"^[A-Za-z]:[\\/]", before_marker)
+        or "/" in before_marker
+        or "\\" in before_marker
+        or before_marker.lower().endswith(_LOCAL_ARCHIVE_SUFFIXES)
+    ):
+        return None, "本機路徑"
+
+    match = _PEP508_NAME_RE.match(before_marker)
+    if not match:
+        return None, "非具名 PEP 508 需求"
+    pkg_name = match.group(1)
+    rest = before_marker[match.end():].strip()
+    # Optional extras: [extra1, extra2]
+    if rest.startswith("["):
+        close = rest.find("]")
+        if close == -1:
+            return None, "非具名 PEP 508 需求"
+        rest = rest[close + 1:].strip()
+    # Remaining part before ';' must be empty or a valid version specifier (possibly parenthesized)
+    if rest:
+        unwrapped = rest[1:-1].strip() if rest.startswith("(") and rest.endswith(")") else rest
+        if not re.match(r"^(?:===|==|~=|!=|<=|>=|<|>)", unwrapped):
+            return None, "非具名 PEP 508 需求"
+    if project_name_norm and _normalize_pkg_name(pkg_name) == project_name_norm:
+        return None, "專案本身"
+    return text, None
+
+
+def collect_project_dependencies(read_file: Callable[[str], Optional[str]]) -> Dict[str, object]:
+    """Read and filter declared Python dependencies from a merged repository tree."""
+    sources: List[str] = []
+    requirements: List[str] = []
+    constraints: List[str] = []
+    skipped: List[Dict[str, str]] = []
+    notices: List[str] = []
+    project_name_norm: Optional[str] = None
+    pyproject_extras: List[str] = []
+
+    pyproject_text = read_file("pyproject.toml")
+    if pyproject_text is not None:
+        sources.append("pyproject.toml")
+        if tomllib is None:
+            notices.append("未預檢依賴：目前的 Python 缺少 tomllib，略過 pyproject.toml")
+        else:
+            try:
+                data = tomllib.loads(pyproject_text)
+            except ValueError as exc:
+                notices.append(f"未預檢依賴：無法解析 pyproject.toml（{exc}）")
+                data = None
+            if isinstance(data, dict):
+                project = data.get("project")
+                if isinstance(project, dict):
+                    raw_name = project.get("name")
+                    if isinstance(raw_name, str) and raw_name.strip():
+                        project_name_norm = _normalize_pkg_name(raw_name.strip())
+                    raw_deps = project.get("dependencies")
+                    if isinstance(raw_deps, list):
+                        for item in raw_deps:
+                            if not isinstance(item, str):
+                                continue
+                            clean, reason = _classify_pep508_requirement(item, project_name_norm)
+                            if clean:
+                                requirements.append(clean)
+                            else:
+                                skipped.append({"source": "pyproject.toml", "item": item, "reason": reason or "略過"})
+                    opt_deps = project.get("optional-dependencies")
+                    if isinstance(opt_deps, dict):
+                        for extra in DEPENDENCY_PYPROJECT_EXTRAS:
+                            items = opt_deps.get(extra)
+                            if not isinstance(items, list):
+                                continue
+                            pyproject_extras.append(extra)
+                            for item in items:
+                                if not isinstance(item, str):
+                                    continue
+                                clean, reason = _classify_pep508_requirement(item, project_name_norm)
+                                if clean:
+                                    requirements.append(clean)
+                                else:
+                                    skipped.append({"source": f"pyproject.toml[{extra}]", "item": item, "reason": reason or "略過"})
+
+    visited_req: set = set()
+    visited_con: set = set()
+
+    def parse_req_file(rel_path: str, *, is_constraint: bool) -> None:
+        visited = visited_con if is_constraint else visited_req
+        if rel_path in visited:
+            skipped.append({"source": rel_path, "item": rel_path, "reason": "循環引用 -c" if is_constraint else "循環引用 -r"})
+            return
+        content = read_file(rel_path)
+        if content is None:
+            skipped.append({"source": rel_path, "item": rel_path, "reason": "合併後找不到參考檔"})
+            return
+        visited.add(rel_path)
+        for line in _logical_requirement_lines(content):
+            opt_match = _PIP_OPTION_RE.match(line)
+            if opt_match:
+                flag = opt_match.group(1)
+                value = (opt_match.group(2) if opt_match.group(2) is not None else (opt_match.group(3) or "")).strip()
+                if flag in ("-e", "--editable"):
+                    skipped.append({"source": rel_path, "item": line, "reason": "editable 安裝"})
+                    continue
+                if flag in ("-r", "--requirement"):
+                    if not value or _URL_SCHEME_RE.match(value):
+                        skipped.append({"source": rel_path, "item": line, "reason": "遠端 -r 檔"})
+                        continue
+                    nested = _resolve_tree_relpath(rel_path, value)
+                    if nested is None:
+                        skipped.append({"source": rel_path, "item": line, "reason": "工作區外的本機 -r 檔"})
+                        continue
+                    parse_req_file(nested, is_constraint=is_constraint)
+                    continue
+                if flag in ("-c", "--constraint"):
+                    if not value or _URL_SCHEME_RE.match(value):
+                        skipped.append({"source": rel_path, "item": line, "reason": "遠端 -c 約束檔"})
+                        continue
+                    nested = _resolve_tree_relpath(rel_path, value)
+                    if nested is None:
+                        skipped.append({"source": rel_path, "item": line, "reason": "工作區外的本機 -c 約束檔"})
+                        continue
+                    parse_req_file(nested, is_constraint=True)
+                    continue
+                skipped.append({"source": rel_path, "item": line, "reason": "pip 選項行"})
+                continue
+
+            clean, reason = _classify_pep508_requirement(line, project_name_norm)
+            if clean:
+                (constraints if is_constraint else requirements).append(clean)
+            else:
+                skipped.append({"source": rel_path, "item": line, "reason": reason or "略過"})
+
+    for req_name in DEPENDENCY_REQUIREMENT_FILES:
+        if read_file(req_name) is not None:
+            sources.append(req_name)
+            parse_req_file(req_name, is_constraint=False)
+
+    return {
+        "sources": sources,
+        "pyproject_extras": pyproject_extras,
+        "requirements": list(dict.fromkeys(requirements)),
+        "constraints": list(dict.fromkeys(constraints)),
+        "skipped": skipped,
+        "notices": notices,
+    }
+
+
+def _dependency_install_hint(sources: List[str], pyproject_extras: List[str]) -> str:
+    venv = ".venv\\Scripts\\python.exe" if os.name == "nt" else ".venv/bin/python"
+    req_files = [name for name in DEPENDENCY_REQUIREMENT_FILES if name in sources]
+    if req_files:
+        flags = " ".join(f"-r {name}" for name in req_files)
+        return f"{venv} -m pip install {flags}"
+    if "pyproject.toml" in sources:
+        if pyproject_extras:
+            return f"{venv} -m pip install -e .[{','.join(pyproject_extras)}]"
+        return f"{venv} -m pip install -e ."
+    return f"{venv} -m pip install -r requirements.txt"
+
+
+def _parse_missing_from_pip_output(output: str) -> Optional[List[str]]:
+    """Return missing package names if pip output indicates unsatisfied requirements, else None."""
+    found: List[str] = []
+    for pattern in (
+        r"No matching distribution found for\s+([^\s(]+)",
+        r"Could not find a version that satisfies the requirement\s+([^\s(]+)",
+    ):
+        for match in re.findall(pattern, output):
+            item = match.strip().rstrip(".,;:")
+            if item and item not in found:
+                found.append(item)
+    if found:
+        return found
+    if re.search(r"ResolutionImpossible|conflicting dependencies", output, re.IGNORECASE):
+        return ["版本衝突的依賴套件"]
+    return None
+
+
+def _check_python_dependencies(
+    python: str,
+    root: Path,
+    env: dict,
+    requirements: List[str],
+    constraints: List[str],
+) -> Tuple[Optional[List[str]], Optional[str]]:
+    """Run offline pip dry-run check. Returns (missing_packages, skip_notice)."""
+    if not requirements:
+        return None, None
+    pip_env = worktree.project_environment(os.environ if env is None else env)
+    pip_env["PYTHONUTF8"] = "1"
+    pip_env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
+    with tempfile.TemporaryDirectory(prefix="agora-preflight-deps-") as tmp:
+        req_file = Path(tmp) / "requirements.txt"
+        req_file.write_text("\n".join(requirements) + "\n", encoding="utf-8")
+        cmd = [
+            python, "-m", "pip", "--isolated", "install",
+            "--dry-run", "--no-index", "--no-deps", "--quiet",
+            "--report", "-", "-r", str(req_file),
+        ]
+        if constraints:
+            con_file = Path(tmp) / "constraints.txt"
+            con_file.write_text("\n".join(constraints) + "\n", encoding="utf-8")
+            cmd.extend(["-c", str(con_file)])
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=root,
+                env=pip_env,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=120,
+                **quota.NO_WINDOW,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            return None, f"未預檢依賴：無法執行 pip（{exc}）"
+
+    stdout = proc.stdout or ""
+    stderr = proc.stderr or ""
+    combined = (stderr + "\n" + stdout).strip()
+    if proc.returncode == 0:
+        try:
+            report = json.loads(stdout)
+        except ValueError:
+            return None, "未預檢依賴：pip 報告解析失敗"
+        if not isinstance(report, dict) or not isinstance(report.get("install"), list):
+            return None, "未預檢依賴：pip 報告格式異常"
+        install_items = report["install"]
+        if not install_items:
+            return None, None
+        missing: List[str] = []
+        for item in install_items:
+            name = None
+            if isinstance(item, dict):
+                meta = item.get("metadata")
+                if isinstance(meta, dict):
+                    name = meta.get("name")
+            label = str(name or item)
+            if label not in missing:
+                missing.append(label)
+        return missing, None
+
+    if re.search(r"No module named ['\"]?pip['\"]?", combined, re.IGNORECASE):
+        return None, f"未預檢依賴：{python} 沒有安裝 pip"
+    if re.search(r"no such option:\s*--(?:report|dry-run|isolated)|unrecognized arguments:\s*--(?:report|dry-run|isolated)", combined, re.IGNORECASE):
+        return None, f"未預檢依賴：{python} 的 pip 版本過舊（需要 pip >= 22.2）"
+    missing = _parse_missing_from_pip_output(combined)
+    if missing:
+        return missing, None
+    first_line = next((line.strip() for line in combined.splitlines() if line.strip()), f"exit={proc.returncode}")
+    return None, f"未預檢依賴：pip 執行錯誤（{first_line[:200]}）"
+
+
+def preflight_integration_check(
+    ws: Workspace,
+    python: str,
+    env: dict,
+    incoming: dict,
+    dispatch_root: Path,
+    *,
+    merged_tree_reader: Optional[Callable[[str], Optional[str]]] = None,
+    merged_tree_error: Optional[str] = None,
+) -> List[str]:
     check = ws.config().get("check")
+    notices: List[str] = []
+    target_pythons: List[str] = []
+    non_python_programs: List[str] = []
     try:
         if not check:
             default_check(ws.root, fallback_python=python, env=env, strict_pytest=True, incoming=incoming)
-            return
-        commands = check if isinstance(check, list) and all(isinstance(x, list) for x in check) else [check]
-        for command in commands:
-            if isinstance(command, str):
-                if any(c in command for c in "&|;<>\n\r%$"):
+            venv = project_python(ws.root)
+            target_pythons.append(str(venv) if venv else python)
+        else:
+            commands = check if isinstance(check, list) and all(isinstance(x, list) for x in check) else [check]
+            for command in commands:
+                if isinstance(command, str):
+                    if any(c in command for c in "&|;<>\n\r%$"):
+                        non_python_programs.append(command.strip()[:40])
+                        continue
+                    try:
+                        command = [word.strip("\"'") for word in shlex.split(command, posix=False)]
+                    except ValueError:
+                        non_python_programs.append(command.strip()[:40])
+                        continue
+                if not isinstance(command, list) or not command or not isinstance(command[0], str):
                     continue
-                try:
-                    command = [word.strip("\"'") for word in shlex.split(command, posix=False)]
-                except ValueError:
-                    continue
-            if not isinstance(command, list) or not command or not isinstance(command[0], str):
-                continue
-            program = command[0]
-            path = ws.root / program
-            executable = str(path) if path.is_file() else shutil.which(program, path=env.get("PATH", ""))
-            if executable is None:
-                # Shell strings may start with a shell builtin.
-                if isinstance(check, str) and not command_python(command) and Path(program).name.lower() not in ("pytest", "pytest.exe"):
-                    continue
-                raise ValueError(f"找不到驗證指令 {program}")
-            executable_path = Path(executable).absolute()
-            if (dispatch_root in executable_path.parents
-                    or config.resolve_control_root(executable_path) != executable_path):
-                raise ValueError(f"驗證指令指向分派 worktree：{executable}")
-            if command[1:3] == ["-m", "pytest"] and command_python(command):
-                if not has_module(executable, "pytest", root=ws.root, env=env):
-                    raise ValueError(f"{executable} 缺少 pytest")
+                program = command[0]
+                path = ws.root / program
+                executable = str(path) if path.is_file() else shutil.which(program, path=env.get("PATH", ""))
+                if executable is None:
+                    # Shell strings may start with a shell builtin.
+                    if isinstance(check, str) and not command_python(command) and Path(program).name.lower() not in ("pytest", "pytest.exe"):
+                        non_python_programs.append(program)
+                        continue
+                    raise ValueError(f"找不到驗證指令 {program}")
+                executable_path = Path(executable).absolute()
+                if (dispatch_root in executable_path.parents
+                        or config.resolve_control_root(executable_path) != executable_path):
+                    raise ValueError(f"驗證指令指向分派 worktree：{executable}")
+                if command_python(command):
+                    if executable not in target_pythons:
+                        target_pythons.append(executable)
+                    if command[1:3] == ["-m", "pytest"]:
+                        if not has_module(executable, "pytest", root=ws.root, env=env):
+                            raise ValueError(f"{executable} 缺少 pytest")
+                else:
+                    non_python_programs.append(Path(program).name)
     except ValueError as exc:
         venv = ".venv\\Scripts\\python.exe" if os.name == "nt" else ".venv/bin/python"
         raise ValueError(
@@ -2439,6 +2785,40 @@ def preflight_integration_check(ws: Workspace, python: str, env: dict, incoming:
             f"依專案說明安裝驗證依賴（例如 {venv} -m pip install pytest），"
             "並確認已設定的 check 指令使用該環境。"
         ) from exc
+
+    if merged_tree_error:
+        notices.append(f"未預檢依賴：{merged_tree_error}")
+        return notices
+    if merged_tree_reader is None:
+        return notices
+
+    deps = collect_project_dependencies(merged_tree_reader)
+    notices.extend(deps["notices"])
+    requirements = deps["requirements"]
+    constraints = deps["constraints"]
+    sources = deps["sources"]
+    pyproject_extras = deps["pyproject_extras"]
+
+    if not requirements:
+        return notices
+
+    if not target_pythons:
+        detail = f"（{', '.join(dict.fromkeys(non_python_programs))}）" if non_python_programs else ""
+        notices.append(f"未預檢依賴：自訂 check 未直接指定 Python 直譯器{detail}")
+        return notices
+
+    for target_python in target_pythons:
+        missing, notice = _check_python_dependencies(target_python, ws.root, env, requirements, constraints)
+        if notice:
+            notices.append(notice)
+        if missing:
+            install_hint = _dependency_install_hint(sources, pyproject_extras)
+            raise ValueError(
+                f"整合環境缺失：缺少 {', '.join(missing)}。請在主工作區建立環境（python -m venv .venv），"
+                f"依專案說明安裝驗證依賴（例如 {install_hint}），"
+                "並確認已設定的 check 指令使用該環境。"
+            )
+    return notices
 
 
 def legacy_default_check(spec, venv: Path) -> bool:

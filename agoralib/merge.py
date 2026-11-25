@@ -605,6 +605,36 @@ def _unmerged_files(root: Path) -> List[str]:
     return sorted(p for p in proc.stdout.split("\0") if p)
 
 
+def _merged_tree_preview(root: Path, commit_sha: str) -> Tuple[Optional[str], Optional[str], bool]:
+    """Compute merged tree via `git merge-tree --write-tree HEAD <commit_sha>`.
+
+    Returns `(tree_sha, unsupported_reason, has_conflict)`.
+    """
+    try:
+        proc = _git_run(root, "merge-tree", "--write-tree", "HEAD", commit_sha)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, f"無法執行 git merge-tree（{exc}）", False
+    stdout = proc.stdout or ""
+    stderr = proc.stderr or ""
+    lines = [line.strip() for line in stdout.splitlines() if line.strip()]
+    first = lines[0] if lines else ""
+    is_oid = bool(re.fullmatch(r"[0-9a-fA-F]{40,64}", first))
+    if proc.returncode == 0 and is_oid:
+        return first, None, False
+    combined = (stdout + "\n" + stderr).strip()
+    if proc.returncode == 1 and (is_oid or "CONFLICT" in combined):
+        return None, None, True
+    detail = [line.strip() for line in (stderr or stdout).splitlines() if line.strip()]
+    reason = detail[0][:200] if detail else f"exit={proc.returncode}"
+    return None, f"git merge-tree --write-tree 無法使用（{reason}）", False
+
+
+def _read_tree_blob(root: Path, tree_sha: str, rel_path: str) -> Optional[str]:
+    """Read a blob file from a git tree object; return None if missing or not a blob."""
+    proc = _git_run(root, "cat-file", "blob", f"{tree_sha}:{rel_path}")
+    return proc.stdout if proc.returncode == 0 else None
+
+
 def merge_dispatch(
     ws,
     thread: Path,
@@ -689,6 +719,7 @@ def merge_dispatch(
         worker = meta.get("worker") or (relay or {}).get("worker") or meta.get("initial_worker")
 
         # 7. Perform `git merge --no-ff` only if not already merged
+        preflight_warnings: List[str] = []
         if not already_merged:
             main_ws = cli.Workspace(root)
             incoming = {}
@@ -703,9 +734,19 @@ def merge_dispatch(
                     marker = cli.PYTEST_CONFIG_FILES[path]
                     if marker is None or ((marker in before.stdout) != (marker in after.stdout)):
                         incoming[path] = after.stdout if after.returncode == 0 else None
+            tree_sha, tree_error, _tree_conflict = _merged_tree_preview(root, commit_sha)
+            tree_reader = (lambda rel_path, _t=tree_sha: _read_tree_blob(root, _t, rel_path)) if tree_sha else None
             python, env = _main_check_environment(root)
             try:
-                cli.preflight_integration_check(main_ws, python, env, incoming, Path(meta["worktree"]))
+                preflight_warnings = cli.preflight_integration_check(
+                    main_ws,
+                    python,
+                    env,
+                    incoming,
+                    Path(meta["worktree"]),
+                    merged_tree_reader=tree_reader,
+                    merged_tree_error=tree_error,
+                ) or []
             except ValueError as exc:
                 raise MergeError(str(exc)) from exc
             msg = build_merge_message(topic, worker, thread.name, meta)
@@ -743,6 +784,7 @@ def merge_dispatch(
                 "worker": worker,
                 "check_result": None,
                 "check_passed": None,
+                "preflight_warnings": preflight_warnings,
             }
             worktree.save(meta)
         else:
@@ -803,6 +845,7 @@ def merge_dispatch(
                 "already_merged": already_merged,
                 "check_result": check_result,
                 "check_passed": False,
+                "preflight_warnings": preflight_warnings,
                 "cleanup": {"status": "skipped_check_failed", "reason": "整合驗證失敗，不回滾合併且不清理"},
             }
     else:
@@ -833,6 +876,8 @@ def merge_dispatch(
         + ("已合併，未建立空節點" if already_merged else f"merge SHA：{(merge_sha or '')[:12]}")
         + f"；清理狀態：{describe_cleanup(cleanup_rec) or cleanup_rec.get('status')}）"
     )
+    if preflight_warnings:
+        summary_note += "\n" + "\n".join(preflight_warnings)
     cli.add_system_note(thread, summary_note)
     cli.append_progress(thread, "agora merge", summary_note)
 
@@ -846,6 +891,7 @@ def merge_dispatch(
         "already_merged": already_merged,
         "check_result": check_result,
         "check_passed": check_passed,
+        "preflight_warnings": preflight_warnings,
         "cleanup": cleanup_rec,
     }
 
@@ -1068,6 +1114,8 @@ def cmd_merge(ws, args) -> None:
         return
 
     if not result.get("ok"):
+        for warning in result.get("preflight_warnings") or []:
+            print(f"⚠️ {warning}")
         print(
             f"⚠️ 合併已完成（SHA：{result['integration_sha']}），只有整合檢查失敗"
             f"（exit={(result.get('check_result') or {}).get('exit_code')}）。"
@@ -1078,6 +1126,8 @@ def cmd_merge(ws, args) -> None:
             print(tail)
         sys.exit(1)
 
+    for warning in result.get("preflight_warnings") or []:
+        print(f"⚠️ {warning}")
     if result["already_merged"]:
         print(f"分支 {result['branch']} 已是 {result['source_branch']} 的祖先，略過建立合併節點。")
     else:
