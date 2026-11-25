@@ -109,7 +109,7 @@ class TestInstallSourceEdges(unittest.TestCase):
             self.install_from(ws, home, Path(a) / "core")
             claude = (ws.root / ".claude" / "settings.local.json").read_text(encoding="utf-8")
             self.install_from(ws, home, Path(b) / "core")
-            # Claude 的 hook 指回 A，其他 hook 是 B：兩個來源都要認得，不能把 B 的項目判成舊版
+            # Claude 的 hook 指回 A，啟動器與其他 hook 是 B：兩個來源都要認得，不能把任一方判成舊版
             (ws.root / ".claude" / "settings.local.json").write_text(claude, encoding="utf-8")
             with patch.object(Path, "home", return_value=Path(home)):
                 status = cli.install_status(ws)

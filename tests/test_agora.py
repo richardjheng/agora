@@ -1478,7 +1478,11 @@ class TestInstall(unittest.TestCase):
             skill = (Path(tmp) / ".claude" / "skills" / "agora" / "SKILL.md").read_text(encoding="utf-8")
             self.assertIn(f"T=$({quoted} new", skill)
             hooks = (Path(tmp) / ".claude" / "settings.local.json").read_text(encoding="utf-8")
-            self.assertIn('quota_hook.py\\" claude-prompt', hooks)          # JSON 內的引號
+            self.assertIn('quota_hook.py\\" claude-prompt', hooks)          # 個人本地設定維持絕對路徑＋引號
+            for rel in (".codex/hooks.json", ".agents/hooks.json"):
+                self.assertNotIn("Richard Clayd", (Path(tmp) / rel).read_text(encoding="utf-8"), rel)
+            launcher = (Path(tmp) / ".agora" / "hook.py").read_text(encoding="utf-8")
+            self.assertIn(custom_root.as_posix(), launcher)
             allow = json.loads((Path(home) / ".gemini" / "antigravity-cli" / "settings.json")
                                .read_text(encoding="utf-8"))["permissions"]["allow"]
             self.assertIn(f"command({quoted} quota)", allow)
