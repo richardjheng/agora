@@ -27,7 +27,8 @@ os.environ.pop(parties.LOCKED_ENV, None)
 # The suite also runs inside an Agora task. Its temporary projects must not
 # inherit the outer task's manifest or controller when testing CLI commands.
 for name in ("AGORA_WORKSPACE", cli.worktree.CONTROL_ENV, cli.worktree.WORK_ENV,
-             cli.worktree.DISPATCH_ENV, cli.worktree.MANIFEST_ENV):
+             cli.worktree.DISPATCH_ENV, cli.worktree.MANIFEST_ENV,
+             cli.failure_baseline.RECORD_ENV, jobs.JOB_ENV):
     os.environ.pop(name, None)
 
 

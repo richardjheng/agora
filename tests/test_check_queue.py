@@ -58,7 +58,7 @@ def _cmd_check_worker(work_root: str, env_overrides: dict, out_file: str):
     """子程序：執行 cli.cmd_check，將 stdout/stderr 與 exit code 寫入 out_file。"""
     buf = io.StringIO()
     code = 0
-    with patch.dict(os.environ, env_overrides), patch("sys.stdout", buf), patch("sys.stderr", buf):
+    with patch.dict(os.environ, env_overrides, clear=True), patch("sys.stdout", buf), patch("sys.stderr", buf):
         try:
             ws = cli.Workspace(Path(work_root))
             cli.cmd_check(ws, argparse.Namespace(task=None))
@@ -129,7 +129,6 @@ class TestCheckQueueUnit(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
             config.save(root, {"check": [sys.executable, "-c", "pass"]})
-            ws = cli.Workspace(root)
             slots = checkqueue.slots_dir(root)
             buf = io.StringIO()
             with patch.dict(os.environ, {}, clear=False), \
@@ -137,7 +136,11 @@ class TestCheckQueueUnit(unittest.TestCase):
                     patch.object(checkqueue, "_queue_lock",
                                  side_effect=PermissionError(13, "Permission denied", str(slots / "queue.lock"))):
                 os.environ.pop(worktree.MANIFEST_ENV, None)
+                os.environ.pop(worktree.CONTROL_ENV, None)
+                os.environ.pop(worktree.WORK_ENV, None)
+                os.environ.pop(cli.failure_baseline.RECORD_ENV, None)
                 os.environ.pop(cli.LOCKED_ENV, None)
+                ws = cli.Workspace(root)
                 with self.assertRaises(SystemExit) as ctx:
                     cli.cmd_check(ws, argparse.Namespace(task=None))
             msg = str(ctx.exception.code)
@@ -288,7 +291,8 @@ class TestCheckQueueWorktreeIntegration(unittest.TestCase):
         env.start()
         self.addCleanup(env.stop)
         for name in ("AGORA_WORKSPACE", worktree.CONTROL_ENV, worktree.WORK_ENV,
-                     worktree.DISPATCH_ENV, worktree.MANIFEST_ENV, cli.LOCKED_ENV):
+                     worktree.DISPATCH_ENV, worktree.MANIFEST_ENV, cli.LOCKED_ENV,
+                     cli.failure_baseline.RECORD_ENV, cli.jobs.JOB_ENV):
             os.environ.pop(name, None)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)

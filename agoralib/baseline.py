@@ -17,9 +17,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from agoralib import checkqueue, completions, quota, worktree
+from agoralib.worktree import RECORD_ENV
 
 LABELS = {"new": "新失敗", "preexisting": "既有失敗", "flaky": "不穩定", "unknown": "無法比對"}
-RECORD_ENV = "AGORA_CHECK_RECORD"
 
 
 def now():

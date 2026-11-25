@@ -219,6 +219,38 @@ class ResumeTests(unittest.TestCase):
         # Both initial stopped and resumed done completion files exist on disk.
         self.assertGreaterEqual(len(list((self.root / ".agora" / "completions").glob("*.json"))), 2)
 
+    def test_resume_rebuilds_failed_environment_before_calling_worker(self):
+        ws, relay, meta = self.assign_initial()
+        target = Path(meta["worktree"])
+        marker = target / ".venv" / "partial-install.txt"
+        marker.write_text("old environment", encoding="utf-8")
+        meta.update(environment_status="failed", error="interrupted install")
+        worktree.save(meta)
+        cli.update_relay(self.thread, status="failed", environment_status="failed")
+
+        output = io.StringIO()
+        failed_relay = cli.load_state(self.thread)["relay"]
+        with patch.object(cli, "wait_relay", return_value=(failed_relay, False, False)), \
+                patch("sys.stdout", output):
+            cli.cmd_status(ws, argparse.Namespace(thread=self.thread.name, wait=None, json=True))
+        hint = json.loads(output.getvalue())["resume_hint"]
+        self.assertIn(f"assign {self.thread.name} --resume {relay['dispatch_id']}", hint)
+
+        self.resume_call(ws, dispatch_id=relay["dispatch_id"])
+        offline_builder = worktree.venv.EnvBuilder(with_pip=False)
+
+        def worker(*args, **kwargs):
+            self.assertFalse(marker.exists())
+            self.assertTrue(worktree.python_path(target).is_file())
+            self.assertEqual(self.read_meta(meta)["environment_status"], "ready")
+            return "先暫停\n【已暫停】", "resumed", "ok"
+
+        with patch.object(worktree.venv, "EnvBuilder", return_value=offline_builder) as builder:
+            call_worker = self.run_worker(ws, relay["dispatch_id"], worker)
+        builder.assert_called_once_with(with_pip=True)
+        call_worker.assert_called_once()
+        self.assertEqual(self.read_meta(meta)["dependency_hashes"], {})
+
     def test_scope_extension_records_audit_invalidates_old_check_and_commits_new_paths(self):
         ws, paused, meta = self.pause_initial(allow=["app.py"])
         # Simulate prior check_result & checked_tree on manifest before scope extension.

@@ -216,6 +216,10 @@ class BaselineTests(unittest.TestCase):
         self.fail(meta)
         self.assertTrue(meta["baseline_comparison"]["cache_hit"])
         self.modify(meta, name="requirements-dev.txt", text="# changed dependency contract\n")
+        # This fixture has no pip. Model an already refreshed environment so
+        # this test isolates the baseline cache key from dependency installation.
+        meta["dependency_hashes"] = worktree._dependency_hashes(Path(meta["worktree"]))
+        worktree.save(meta)
         self.fail(meta)
         self.assertFalse(meta["baseline_comparison"]["cache_hit"])
         self.assertNotEqual(original, meta["baseline_comparison"]["cache_key"])
