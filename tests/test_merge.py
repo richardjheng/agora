@@ -34,7 +34,7 @@ class MergeTestBase(unittest.TestCase):
                 "codex": {"enabled": True, "share": 10},
                 "antigravity": {"enabled": True, "share": 5},
             },
-            "check": [sys.executable, "-c", "pass"],
+            "check": [sys._base_executable, "-c", "pass"],
         })
 
     def make_committed_dispatch(
@@ -384,7 +384,9 @@ class TestAgoraMerge(MergeTestBase):
         worktree.git(self.root, "merge", "--no-ff", "-m", "manual merge", meta["branch"])
         head_before = worktree.git(self.root, "rev-parse", "HEAD")
 
-        result = merge.merge_dispatch(ws, self.thread, run_check=lambda r: self.fail("should not re-run check"))
+        with patch.object(merge, "run_main_check", return_value={"exit_code": 0}) as check:
+            result = merge.merge_dispatch(ws, self.thread)
+        check.assert_called_once_with(self.root)
         self.assertTrue(result["ok"])
         self.assertTrue(result["already_merged"])
         self.assertEqual(worktree.git(self.root, "rev-parse", "HEAD"), head_before)
@@ -392,6 +394,58 @@ class TestAgoraMerge(MergeTestBase):
         self.assertTrue(result["cleanup"]["branch_kept"])
         self.assertFalse(Path(meta["worktree"]).exists())
         self.assertTrue(merge.ref_exists(self.root, f"refs/heads/{meta['branch']}"))
+
+    def test_interrupted_merge_without_passed_check_runs_it_again(self):
+        ws = cli.Workspace(self.root)
+        self.make_committed_dispatch()
+        with patch.object(merge, "run_main_check", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                merge.merge_dispatch(ws, self.thread, keep=True)
+        head = worktree.git(self.root, "rev-parse", "HEAD")
+        with patch.object(merge, "run_main_check", return_value={"exit_code": 0}) as check:
+            result = merge.merge_dispatch(ws, self.thread, keep=True)
+        check.assert_called_once_with(self.root)
+        self.assertTrue(result["already_merged"])
+        self.assertTrue(result["check_passed"])
+        self.assertEqual(result["merge_sha"], head)
+
+    def test_missing_pytest_refuses_merge_for_configured_and_incoming_checks(self):
+        ws = cli.Workspace(self.root)
+        self.make_committed_dispatch(allowed=["pytest.ini"], edit_file="pytest.ini", edit_text="[pytest]\n")
+        head = worktree.git(self.root, "rev-parse", "HEAD")
+        for check in (None, [sys._base_executable, "-m", "pytest", "-q"]):
+            with self.subTest(check=check):
+                config.save(self.root, {"check": check})
+                with patch.object(cli, "has_module", return_value=False) as probe, \
+                        patch.object(merge, "run_main_check") as integration:
+                    with self.assertRaisesRegex(merge.MergeError, r"整合環境缺失.*pytest.*python -m venv"):
+                        merge.merge_dispatch(ws, self.thread)
+                self.assertEqual(probe.call_args.kwargs["root"], self.root)
+                integration.assert_not_called()
+                self.assertEqual(worktree.git(self.root, "rev-parse", "HEAD"), head)
+
+    def test_merge_runs_unittest_without_workspace_venv(self):
+        ws = cli.Workspace(self.root)
+        (self.root / "tests").mkdir()
+        test = "import unittest\nclass AppTest(unittest.TestCase):\n def test_app(self):\n  self.assertTrue(True)\n"
+        (self.root / "tests/test_app.py").write_text(test, encoding="utf-8")
+        self.make_committed_dispatch()
+        self.assertIsNone(cli.project_python(self.root))
+        result = merge.merge_dispatch(ws, self.thread, keep=True)
+        self.assertTrue(result["check_passed"], result["check_result"])
+        self.assertIn("unittest", result["check_result"]["output_tail"])
+        self.assertIn("Ran 1 test", result["check_result"]["output_tail"])
+
+    def test_merge_refuses_a_configured_dispatch_python(self):
+        ws = cli.Workspace(self.root)
+        meta = self.make_committed_dispatch()
+        self.venv(meta)
+        python = worktree.python_path(Path(meta["worktree"]))
+        config.save(self.root, {"check": [str(python), "-m", "pytest"]})
+        head = worktree.git(self.root, "rev-parse", "HEAD")
+        with self.assertRaisesRegex(merge.MergeError, "整合環境缺失.*分派 worktree"):
+            merge.merge_dispatch(ws, self.thread)
+        self.assertEqual(worktree.git(self.root, "rev-parse", "HEAD"), head)
 
     def test_conflict_aborts_reports_files_and_does_not_clean(self):
         ws = cli.Workspace(self.root)
@@ -430,6 +484,14 @@ class TestAgoraMerge(MergeTestBase):
         self.assertTrue(Path(meta["worktree"]).is_dir())
         self.assertTrue(merge.ref_exists(self.root, f"refs/heads/{meta['branch']}"))
         self.assertIn("不回滾", (self.thread / "transcript.md").read_text(encoding="utf-8"))
+        out = io.StringIO()
+        with patch.object(merge, "merge_dispatch", return_value=result), patch("sys.stdout", out):
+            with self.assertRaises(SystemExit):
+                merge.cmd_merge(ws, argparse.Namespace(thread=self.thread.name, json=False))
+        first = out.getvalue().splitlines()[0]
+        self.assertIn("合併已完成", first)
+        self.assertIn("只有整合檢查失敗", first)
+        self.assertIn(result["merge_sha"], first)
 
     def test_merge_keep_flag_preserves_worktree_and_branch(self):
         ws = cli.Workspace(self.root)
@@ -452,14 +514,13 @@ class TestCleanupAndPruneMerged(MergeTestBase):
         (target / "notes.txt").write_text("keep me", encoding="utf-8")
         (target / "debug.log").write_text("ignored or untracked", encoding="utf-8")
         (target / "demo" / "__pycache__").mkdir()
-        (target / "demo" / "__pycache__" / "keep.txt").write_text("not pyc", encoding="utf-8")
+        (target / "demo" / "__pycache__" / "ok.pyc").write_bytes(b"pyc")
 
         result = merge.merge_dispatch(ws, self.thread, run_check=lambda r: {"exit_code": 0})
         self.assertTrue(result["ok"])
         self.assertEqual(result["cleanup"]["status"], "blocked")
         self.assertIn("notes.txt", result["cleanup"]["blocking_files"])
         self.assertIn("debug.log", result["cleanup"]["blocking_files"])
-        self.assertIn("demo/__pycache__/keep.txt", result["cleanup"]["blocking_files"])
         # Nothing deleted when blocked!
         self.assertTrue(target.is_dir())
         self.assertTrue((target / "dist" / "bundle.js").is_file())
@@ -468,8 +529,6 @@ class TestCleanupAndPruneMerged(MergeTestBase):
         # Remove unknown files, leave recorded build_outputs + .pyc -> retry succeeds
         (target / "notes.txt").unlink()
         (target / "debug.log").unlink()
-        (target / "demo" / "__pycache__" / "keep.txt").unlink()
-        (target / "demo" / "__pycache__" / "ok.pyc").write_bytes(b"pyc")
 
         retry = merge.merge_dispatch(ws, self.thread, run_check=lambda r: self.fail("already checked"))
         self.assertTrue(retry["already_merged"])
@@ -487,6 +546,32 @@ class TestCleanupAndPruneMerged(MergeTestBase):
         self.assertEqual(outcome["tracked_changes"], ["app.py"])
         self.assertTrue(Path(meta["worktree"]).is_dir())
         self.assertTrue(merge.ref_exists(self.root, f"refs/heads/{meta['branch']}"))
+
+    def test_prune_blocks_tracked_cache_changes_and_cleans_nested_untracked_caches(self):
+        ws = cli.Workspace(self.root)
+        fixture = self.root / "demo/.pytest_cache/fixture.txt"
+        fixture.parent.mkdir()
+        fixture.write_text("tracked\n", encoding="utf-8")
+        worktree.git(self.root, "add", "-f", "demo/.pytest_cache/fixture.txt")
+        worktree.git(self.root, "commit", "-m", "track cache fixture")
+        meta = self.make_committed_dispatch()
+        target = Path(meta["worktree"])
+        tracked = target / "demo/.pytest_cache/fixture.txt"
+        original = tracked.read_bytes()
+        tracked.write_bytes(b"changed")
+        merge.merge_dispatch(ws, self.thread, keep=True, run_check=lambda r: {"exit_code": 0})
+        dry = merge.prune_merged_dispatches(ws, [self.thread])
+        self.assertIn("demo/.pytest_cache/fixture.txt", dry["kept"][0]["tracked_changes"])
+        tracked.write_bytes(original)
+        for path in ("demo/.pytest_cache/untracked", "fresh/pkg.egg-info/PKG-INFO", "fresh/.mypy_cache/data",
+                     "fresh/.ruff_cache/data", "fresh/__pycache__/cache"):
+            (target / path).parent.mkdir(parents=True, exist_ok=True)
+            self.modify(meta, path, "generated")
+        dry = merge.prune_merged_dispatches(ws, [self.thread])
+        self.assertIn("demo/.pytest_cache/untracked", dry["candidates"][0]["rebuildable_artifacts"])
+        result = merge.prune_merged_dispatches(ws, [self.thread], yes=True)
+        self.assertEqual(len(result["cleaned"]), 1, result)
+        self.assertFalse(target.exists())
 
     def test_eperm_marks_pending_retry_and_retry_completes_without_rollback(self):
         ws = cli.Workspace(self.root)
@@ -507,6 +592,7 @@ class TestCleanupAndPruneMerged(MergeTestBase):
         self.assertTrue(res["ok"])
         self.assertEqual(res["cleanup"]["status"], "pending_retry")
         self.assertTrue(res["cleanup"]["retryable"])
+        self.assertIn("沙箱建立的檔案，需要以較高權限刪除", res["cleanup"]["error"])
         # Merge is NOT rolled back; worktree & branch still present
         merge_sha = res["merge_sha"]
         self.assertEqual(worktree.git(self.root, "rev-parse", "HEAD"), merge_sha)

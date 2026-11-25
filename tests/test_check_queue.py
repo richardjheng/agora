@@ -340,6 +340,24 @@ class TestCheckQueueWorktreeIntegration(unittest.TestCase):
         # worktree 內不應各自建立獨立 check-slots
         self.assertFalse(checkqueue.slots_dir(Path(meta["worktree"])).exists())
 
+    def test_manual_check_in_worktree_uses_control_slots_and_preserves_pytest_options(self):
+        meta = self._prepare_task("manual")
+        target = Path(meta["worktree"])
+        (target / "pytest.py").write_text(
+            "import os, shlex\n"
+            "assert shlex.split(os.environ['PYTEST_ADDOPTS']) == "
+            "['-p', 'no:cacheprovider', '-k', 'some tests']\n",
+            encoding="utf-8",
+        )
+        config.save(self.root, {"check": [str(worktree.python_path(target)), "-m", "pytest"]})
+        with patch.dict(os.environ, {"PYTEST_ADDOPTS": '-k "some tests"'}), patch.object(Path, "cwd", return_value=target):
+            with self.assertRaises(SystemExit) as done:
+                cli.cmd_check(cli.Workspace(cli.resolve_workspace(None)), argparse.Namespace(task=None))
+            self.assertEqual(os.environ["PYTEST_ADDOPTS"], '-k "some tests"')
+        self.assertEqual(done.exception.code, 0)
+        self.assertTrue((self.root / ".agora" / "check-slots" / "queue.lock").is_file())
+        self.assertFalse((target / ".agora" / "check-slots").exists())
+
     def test_stop_requested_aborts_waiting_cmd_check_with_distinct_message(self):
         config.save(self.root, {"check_concurrency": 1})
         meta = self._prepare_task("stop-wait")

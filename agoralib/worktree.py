@@ -623,10 +623,18 @@ def rebase_command(spec, meta):
     return spec
 
 
+def rebuildable_directory(name: str) -> bool:
+    return name in ("__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache") or name.endswith(".egg-info")
+
+
 def checked_paths(meta):
     target = validate(meta)
     paths = set(filter(None, git(target, "diff", "--name-only", "--no-renames", "-z", meta["base_sha"]).split("\0")))
-    paths.update(filter(None, git(target, "ls-files", "--others", "--exclude-standard", "--exclude=.venv/", "-z").split("\0")))
+    staged = git(target, "diff", "--cached", "--name-only", "--no-renames", "-z", meta["base_sha"])
+    paths.update(filter(None, staged.split("\0")))
+    untracked = git(target, "ls-files", "--others", "--exclude-standard", "--exclude=.venv/", "-z")
+    paths.update(name for name in untracked.split("\0")
+                 if name and not any(rebuildable_directory(part) for part in name.split("/")[:-1]))
     for name in paths:
         parts = name.split("/")
         forbidden = next((p for p in parts if p in (".git", ".agora", ".venv", "venv")), None)

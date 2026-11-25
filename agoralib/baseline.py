@@ -197,7 +197,8 @@ def rerun(meta, target, selected, ids, directory, label, can_continue=lambda: Tr
     for index, test in enumerate(ids):
         if not can_continue():
             raise checkqueue.CheckStopped("已要求停止，不再執行下一個診斷項目")
-        args = (["-v"] if selected["framework"] == "unittest" else ["-q", "-rA", "--color=no"])
+        args = (["-v"] if selected["framework"] == "unittest"
+                else ["-p", "no:cacheprovider", "-q", "-rA", "--color=no"])
         command = [str(worktree.python_path(Path(meta["worktree"]))), "-c", RUNNER,
                    str(target), meta["worktree"], selected["start"], selected["top"], selected["framework"],
                    *selected["flags"], *args, test]

@@ -212,7 +212,10 @@ class WorktreeTests(unittest.TestCase):
         meta = self.task(allowed=["**"])
         for directory in (".git", ".agora", ".venv", "venv"):
             name = f"nested/{directory}/.env.example"
-            with self.subTest(directory=directory), patch.object(worktree, "git", side_effect=[name + "\0", ""]):
+            def status_path(_target, command, *args):
+                return name + "\0" if command == "diff" and "--cached" not in args else ""
+
+            with self.subTest(directory=directory), patch.object(worktree, "git", side_effect=status_path):
                 with patch.object(worktree, "validate", return_value=Path(meta["worktree"])):
                     with self.assertRaises(worktree.WorktreeError) as caught:
                         worktree.checked_paths({**meta, "allowed_paths": [name]})
@@ -237,6 +240,24 @@ class WorktreeTests(unittest.TestCase):
         with patch.object(cli, "run_task_check") as check:
             worktree.finalize(meta, check)
             check.assert_not_called()
+
+    def test_generated_directories_do_not_block_finalize_but_tracked_changes_do(self):
+        meta = self.task(allowed=["app.py"])
+        target = Path(meta["worktree"])
+        names = ("pkg.egg-info", ".pytest_cache", ".ruff_cache", ".mypy_cache", "__pycache__")
+        for directory in names:
+            cache = target / "nested" / directory / "generated"
+            cache.parent.mkdir(parents=True)
+            cache.write_text("generated", encoding="utf-8")
+        staged = "nested/.pytest_cache/generated"
+        worktree.git(target, "add", "-f", staged)
+        with self.assertRaisesRegex(worktree.WorktreeError, "超出允許修改範圍"):
+            worktree.checked_paths(meta)
+        worktree.git(target, "rm", "--cached", staged)
+        self.modify(meta)
+        self.message(meta)
+        result = worktree.finalize(meta, lambda _: {"exit_code": 0})
+        self.assertEqual(worktree.git(target, "diff", "--name-only", meta["base_sha"], result["commit_sha"]), "app.py")
 
     def test_out_of_scope_and_secret_changes_refuse_before_check(self):
         for i, (name, reason) in enumerate((("other.py", "超出允許修改範圍"),

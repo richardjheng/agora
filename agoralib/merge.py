@@ -2,7 +2,7 @@
 
 Dispatches and finalize never auto-merge. Merging happens only when explicitly
 requested by the user via `agora merge`. Cleanup removes only verified
-rebuildable artifacts (`.venv`, `__pycache__`, `*.pyc`, and manifest-recorded
+rebuildable artifacts (virtualenv, Python caches, egg-info, and manifest-recorded
 `build_outputs`), then removes the worktree while keeping the branch by default
 (deleting it with `git branch -d` only when `--delete-branch` is specified).
 """
@@ -20,7 +20,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
-from agoralib import completions, jobs, parties, quota, shares, worktree
+from agoralib import completions, config, jobs, parties, quota, shares, worktree
 
 IN_PROGRESS_FILES = (
     ("MERGE_HEAD", "merge"),
@@ -104,83 +104,50 @@ def _tracked_dirty_paths(root: Path) -> List[str]:
     return sorted(dict.fromkeys(paths))
 
 
-def _check_pycache_dir(target: Path, rel_dir: str) -> Tuple[bool, List[str]]:
-    """Return (is_pure_pyc, blocking_files) for a __pycache__ directory."""
-    full_dir = target / rel_dir
-    blocking: List[str] = []
-    for root_dir, dirs, files in os.walk(full_dir, followlinks=False):
-        root_path = Path(root_dir)
-        for d in list(dirs):
-            dp = root_path / d
-            if dp.is_symlink():
-                blocking.append(dp.relative_to(target).as_posix())
-                dirs.remove(d)
-        for name in files:
-            fp = root_path / name
-            rel = fp.relative_to(target).as_posix()
-            if fp.is_symlink() or not name.endswith(".pyc"):
-                blocking.append(rel)
-    return (len(blocking) == 0), sorted(blocking)
-
-
-def _classify_path(target: Path, entry: str, build_outputs: set, rebuildable: List[str], blocking: List[str]):
-    norm = entry.rstrip("/")
-    is_dir_entry = entry.endswith("/")
-    if not norm:
-        return
-    full = target / norm
-    if full.is_symlink():
-        blocking.append(norm)
-        return
-    if norm == ".venv" or norm.startswith(".venv/"):
-        rebuildable.append(entry)
-        return
-    if norm in build_outputs or any(norm.startswith(b + "/") for b in build_outputs):
-        rebuildable.append(entry)
-        return
-    if not is_dir_entry:
-        if norm.endswith(".pyc"):
-            rebuildable.append(entry)
-        else:
-            blocking.append(norm)
-        return
-    if Path(norm).name == "__pycache__":
-        pure, bad = _check_pycache_dir(target, norm)
-        if pure:
-            rebuildable.append(entry)
-        else:
-            blocking.extend(bad)
-        return
-    # If an ignored parent dir contains a configured nested build_output (e.g. build/out),
-    # inspect its direct children instead of blindly blocking the whole parent.
-    if any(b.startswith(norm + "/") for b in build_outputs):
-        try:
-            children = sorted(full.iterdir(), key=lambda p: p.name)
-        except OSError:
-            blocking.append(entry)
-            return
-        if not children:
-            blocking.append(entry)
-            return
-        for child in children:
-            child_rel = child.relative_to(target).as_posix()
-            child_entry = child_rel + ("/" if child.is_dir() and not child.is_symlink() else "")
-            _classify_path(target, child_entry, build_outputs, rebuildable, blocking)
-        return
-    blocking.append(entry)
-
-
 def classify_worktree_files(target: Path, meta: dict) -> Dict[str, List[str]]:
     """Classify tracked changes, rebuildable artifacts, and blocking untracked/ignored files."""
     tracked = _tracked_dirty_paths(target)
-    untracked = [p for p in worktree.git(target, "ls-files", "--others", "--exclude-standard", "--directory", "-z").split("\0") if p]
-    ignored = [p for p in worktree.git(target, "ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z").split("\0") if p]
-    others = sorted(dict.fromkeys(untracked + ignored))
+    args = ("ls-files", "--others", "--exclude-standard", "--directory", "--no-empty-directory", "-z")
+    untracked = worktree.git(target, *args).split("\0")
+    ignored = worktree.git(target, *args, "--ignored").split("\0")
+    target = target.resolve()
+    others = sorted(set(untracked + ignored) - {""})
     build_outputs = set(worktree.normalize_build_outputs(meta.get("build_outputs")))
+    indexed = set(filter(None, worktree.git(target, "ls-files", "--cached", "-z").split("\0")))
+    tracked_dirs = {p.as_posix() for name in indexed for p in Path(name).parents}
     rebuildable: List[str] = []
     blocking: List[str] = []
+
+    def classify(entry: str) -> None:
+        name = entry.rstrip("/")
+        if name in indexed:
+            return
+        path = target / name
+        if path.is_symlink() or target not in path.resolve().parents:
+            blocking.append(name)
+            return
+        directory = entry.endswith("/")
+        parts = name.split("/")
+        cache_parts = parts if directory else parts[:-1]
+        generated = (any(worktree.rebuildable_directory(part) for part in cache_parts)
+                     or parts[0] == ".venv"
+                     or any(name == output or name.startswith(output + "/") for output in build_outputs)
+                     or (not directory and name.endswith(".pyc")))
+        if generated and name not in tracked_dirs:
+            rebuildable.append(entry)
+        elif directory:
+            # Git can collapse a new or ignored parent containing only caches.
+            children = list(path.iterdir())
+            if not children and not generated:
+                blocking.append(entry)
+            for child in children:
+                suffix = "/" if child.is_dir() and not child.is_symlink() else ""
+                classify(child.relative_to(target).as_posix() + suffix)
+        else:
+            blocking.append(entry)
+
     for entry in others:
-        _classify_path(target, entry, build_outputs, rebuildable, blocking)
+        classify(entry)
     return {
         "tracked": tracked,
         "rebuildable": sorted(dict.fromkeys(rebuildable)),
@@ -268,10 +235,10 @@ def _remove_artifact(target: Path, entry: str) -> None:
     full = (target / norm)
     resolved_target = target.resolve()
     if full.is_symlink():
-        raise PermissionError(f"拒絕刪除符號連結：{norm}")
+        raise worktree.WorktreeError(f"拒絕刪除符號連結：{norm}")
     resolved = full.resolve()
     if resolved == resolved_target or resolved_target not in resolved.parents:
-        raise PermissionError(f"拒絕刪除 worktree 外路徑：{norm}")
+        raise worktree.WorktreeError(f"拒絕刪除 worktree 外路徑：{norm}")
     if full.is_dir():
         shutil.rmtree(full)
     elif full.exists():
@@ -280,6 +247,14 @@ def _remove_artifact(target: Path, entry: str) -> None:
 
 def _prune_stale_worktree_metadata(root: Path) -> None:
     _git_run(root, "worktree", "prune")
+
+
+def _cleanup_error(exc: Exception) -> str:
+    detail = str(exc)
+    if isinstance(exc, PermissionError) or re.search(
+            r"permission denied|access (?:is )?denied|operation not permitted|拒絕存取", detail, re.IGNORECASE):
+        return f"權限不足。若為沙箱建立的檔案，需要以較高權限刪除。{detail}"
+    return detail
 
 
 def describe_cleanup(cleanup_rec: Optional[dict]) -> str:
@@ -434,7 +409,7 @@ def cleanup_dispatch(
         try:
             files = classify_worktree_files(target, meta)
         except (worktree.WorktreeError, OSError) as exc:
-            return _blocked(f"無法檢查 worktree 檔案狀態：{exc}")
+            return _blocked(f"無法檢查 worktree 檔案狀態：{_cleanup_error(exc)}")
         if files["tracked"] or files["blocking"]:
             parts = []
             if files["tracked"]:
@@ -446,20 +421,23 @@ def cleanup_dispatch(
             try:
                 _remove_artifact(target, entry)
                 removed_artifacts.append(entry)
-            except (PermissionError, OSError) as exc:
-                return _pending_retry(f"移除可重建產物 {entry} 失敗（待重試）：{exc}", False, not branch_exists)
+            except (OSError, worktree.WorktreeError) as exc:
+                return _pending_retry(f"移除可重建產物 {entry} 失敗（待重試）：{_cleanup_error(exc)}",
+                                      False, not branch_exists)
         # Re-check before removing worktree (no --force).
         try:
             remaining = classify_worktree_files(target, meta)
         except (worktree.WorktreeError, OSError) as exc:
-            return _pending_retry(f"移除產物後重檢 worktree 失敗（待重試）：{exc}", False, not branch_exists)
+            return _pending_retry(f"移除產物後重檢 worktree 失敗（待重試）：{_cleanup_error(exc)}",
+                                  False, not branch_exists)
         if remaining["tracked"] or remaining["blocking"] or remaining["rebuildable"]:
             leftover = remaining["tracked"] + remaining["blocking"] + remaining["rebuildable"]
             return _pending_retry(f"移除可重建產物後仍有殘留檔案（待重試）：{', '.join(leftover)}", False, not branch_exists)
         try:
             worktree.git(root, "worktree", "remove", str(target))
         except (PermissionError, OSError, worktree.WorktreeError) as exc:
-            return _pending_retry(f"移除 worktree 失敗（待重試）：{exc}", not target.exists(), not branch_exists)
+            return _pending_retry(f"移除 worktree 失敗（待重試）：{_cleanup_error(exc)}",
+                                  not target.exists(), not branch_exists)
     else:
         _prune_stale_worktree_metadata(root)
 
@@ -538,9 +516,26 @@ def build_merge_message(topic: str, worker: Optional[str], thread_name: str, met
     return header + "\n\n" + "\n".join(body_lines) + "\n\n" + "\n".join(trailers) + "\n"
 
 
-def run_main_check(root: Path) -> dict:
-    """Run `agora check` once in the main workspace as post-merge integration verification."""
+def _main_check_environment(root: Path) -> Tuple[str, dict]:
+    from agoralib import cli
+
     env = dict(os.environ)
+
+    def in_dispatch(path: str) -> bool:
+        if not path:
+            return False
+        absolute = Path(path).absolute()
+        return config.resolve_control_root(absolute) != absolute
+
+    python = sys.executable
+    if in_dispatch(python):
+        python = sys._base_executable
+    for key in ("PATH", "PYTHONPATH"):
+        if key in env:
+            env[key] = os.pathsep.join(path for path in env[key].split(os.pathsep) if not in_dispatch(path))
+    if in_dispatch(env.get("VIRTUAL_ENV", "")):
+        env.pop("VIRTUAL_ENV")
+        env.pop("PYTHONNOUSERSITE", None)
     for key in (
         worktree.WORK_ENV,
         worktree.CONTROL_ENV,
@@ -552,7 +547,14 @@ def run_main_check(root: Path) -> dict:
     ):
         env.pop(key, None)
     env["AGORA_WORKSPACE"] = str(root)
-    command = [sys.executable, str(parties.AGORA_ROOT / "agora.py"), "--workspace", str(root), "check"]
+    env[cli.INTEGRATION_CHECK_ENV] = "1"
+    return python, env
+
+
+def run_main_check(root: Path) -> dict:
+    """Run `agora check` once in the main workspace as post-merge integration verification."""
+    python, env = _main_check_environment(root)
+    command = [python, str(parties.AGORA_ROOT / "agora.py"), "--workspace", str(root), "check"]
     proc = subprocess.run(
         command,
         cwd=root,
@@ -688,6 +690,24 @@ def merge_dispatch(
 
         # 7. Perform `git merge --no-ff` only if not already merged
         if not already_merged:
+            main_ws = cli.Workspace(root)
+            incoming = {}
+            if not main_ws.config().get("check"):
+                changed = worktree.git(root, "diff", "--name-only", "--no-renames", "-z",
+                                       meta["base_sha"], commit_sha, "--", *cli.PYTEST_CONFIG_FILES)
+                for path in filter(None, changed.split("\0")):
+                    before = _git_run(root, "show", f"{meta['base_sha']}:{path}")
+                    after = _git_run(root, "show", f"{commit_sha}:{path}")
+                    # A dispatch that changes an unrelated pyproject section
+                    # must not mask a pytest section already added on main.
+                    marker = cli.PYTEST_CONFIG_FILES[path]
+                    if marker is None or ((marker in before.stdout) != (marker in after.stdout)):
+                        incoming[path] = after.stdout if after.returncode == 0 else None
+            python, env = _main_check_environment(root)
+            try:
+                cli.preflight_integration_check(main_ws, python, env, incoming, Path(meta["worktree"]))
+            except ValueError as exc:
+                raise MergeError(str(exc)) from exc
             msg = build_merge_message(topic, worker, thread.name, meta)
             with tempfile.TemporaryDirectory(prefix="agora-merge-") as tmp:
                 msg_file = Path(tmp) / "merge-message.txt"
@@ -742,11 +762,15 @@ def merge_dispatch(
                 worktree.save(meta)
 
     # 8. Post-merge integration check in main workspace (outside locks so checkqueue/recall work normally)
-    need_check = (not already_merged) or (prior_merge.get("check_passed") is False)
+    need_check = (not already_merged) or (prior_merge.get("check_passed") is not True)
     check_result = prior_merge.get("check_result")
-    check_passed = True
+    check_passed = prior_merge.get("check_passed") is True
     if need_check:
-        check_result = check_runner(root)
+        integration_sha = merge_sha or worktree.git(root, "rev-parse", "HEAD")
+        try:
+            check_result = check_runner(root)
+        except (OSError, subprocess.SubprocessError) as exc:
+            check_result = {"exit_code": 1, "output_tail": f"無法執行整合檢查：{exc}"}
         check_passed = check_result.get("exit_code") == 0
         meta["merge_record"]["check_result"] = check_result
         meta["merge_record"]["check_passed"] = check_passed
@@ -756,7 +780,8 @@ def merge_dispatch(
             f"（分派 {key}｜branch：{branch}｜merge：{merge_sha or '已合併'}｜exit={check_result.get('exit_code')}）"
         ]
         if not check_passed:
-            note_lines.append("整合驗證失敗：不回滾已完成的合併，且不清理 worktree 與分支，請修正後再處理。")
+            note_lines.insert(0, f"合併已完成（SHA：{integration_sha}），只有整合檢查失敗。")
+            note_lines.append("不回滾合併，保留 worktree 與分支，請修正後再處理。")
         tail = (check_result.get("output_tail") or "").strip()
         if tail:
             note_lines.append("\n".join(tail.splitlines()[-10:]))
@@ -774,6 +799,7 @@ def merge_dispatch(
                 "source_branch": source_branch,
                 "commit_sha": commit_sha,
                 "merge_sha": merge_sha,
+                "integration_sha": integration_sha,
                 "already_merged": already_merged,
                 "check_result": check_result,
                 "check_passed": False,
@@ -955,7 +981,7 @@ def scan_merged_dispatches(ws, threads: List[Path], *, delete_branch: bool = Fal
                     _verify_worktree_ownership(root, target, meta, br_exists)
                     files = classify_worktree_files(target, meta)
                 except (worktree.WorktreeError, OSError) as exc:
-                    kept.append({**info, "reason": str(exc)})
+                    kept.append({**info, "reason": _cleanup_error(exc)})
                     continue
                 if files["tracked"] or files["blocking"]:
                     parts = []
@@ -1043,9 +1069,10 @@ def cmd_merge(ws, args) -> None:
 
     if not result.get("ok"):
         print(
-            f"⚠️ 已合併（merge SHA：{result.get('merge_sha') or '已存在'}），但主工作區整合驗證失敗"
-            f"（exit={(result.get('check_result') or {}).get('exit_code')}）：不回滾合併，且不清理 worktree 與分支。"
+            f"⚠️ 合併已完成（SHA：{result['integration_sha']}），只有整合檢查失敗"
+            f"（exit={(result.get('check_result') or {}).get('exit_code')}）。"
         )
+        print("已保留 worktree 與分支。")
         tail = ((result.get("check_result") or {}).get("output_tail") or "").strip()
         if tail:
             print(tail)
