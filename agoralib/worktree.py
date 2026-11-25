@@ -34,6 +34,7 @@ WORK_ENV = "AGORA_WORKTREE"
 DISPATCH_ENV = "AGORA_DISPATCH_ID"
 MANIFEST_ENV = "AGORA_DISPATCH_MANIFEST"
 RECORD_ENV = "AGORA_CHECK_RECORD"
+INTEGRATION_CHECK_ENV = "AGORA_INTEGRATION_CHECK"
 FIELDS = ("dispatch_id", "source_branch", "base_sha", "branch", "branch_naming_version", "initial_worker",
           "worktree", "control_root", "manifest", "commit_message", "check_result", "commit_sha",
           "commit_status", "environment_status", "baseline_comparison", "preexisting_approval",
@@ -380,7 +381,8 @@ def environment(meta):
 
 def project_environment(env):
     """Keep the project runtime environment and withhold controller state from project code."""
-    controller_keys = (RECORD_ENV, parties.LOCKED_ENV, MANIFEST_ENV, CONTROL_ENV, DISPATCH_ENV, jobs.JOB_ENV)
+    controller_keys = (RECORD_ENV, parties.LOCKED_ENV, MANIFEST_ENV, CONTROL_ENV, DISPATCH_ENV,
+                       jobs.JOB_ENV, INTEGRATION_CHECK_ENV, quota.PROBE_ENV)
     return {key: value for key, value in env.items() if key not in controller_keys}
 
 

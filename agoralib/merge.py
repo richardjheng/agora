@@ -517,8 +517,6 @@ def build_merge_message(topic: str, worker: Optional[str], thread_name: str, met
 
 
 def _main_check_environment(root: Path) -> Tuple[str, dict]:
-    from agoralib import cli
-
     env = dict(os.environ)
 
     def in_dispatch(path: str) -> bool:
@@ -547,7 +545,7 @@ def _main_check_environment(root: Path) -> Tuple[str, dict]:
     ):
         env.pop(key, None)
     env["AGORA_WORKSPACE"] = str(root)
-    env[cli.INTEGRATION_CHECK_ENV] = "1"
+    env[worktree.INTEGRATION_CHECK_ENV] = "1"
     return python, env
 
 

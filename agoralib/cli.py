@@ -2403,7 +2403,6 @@ def default_check(root: Path, *, fallback_python=None, env=None, strict_pytest=F
     return None, source
 
 
-INTEGRATION_CHECK_ENV = "AGORA_INTEGRATION_CHECK"
 DEPENDENCY_REQUIREMENT_FILES = ("requirements.txt", "requirements-dev.txt", "requirements-test.txt")
 DEPENDENCY_PYPROJECT_EXTRAS = ("dev", "test", "tests")
 _PEP508_NAME_RE = re.compile(r"^([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)")
@@ -3006,7 +3005,7 @@ def check_workspace(ws: Workspace):
     source = ("分派當輪的設定" if os.getenv(LOCKED_ENV) is not None else ".agora/config.json") if check else None
     task = bool(os.getenv(worktree.MANIFEST_ENV))
     isolated = task or ws.root.resolve() != ws.control_root.resolve()
-    integration = bool(os.getenv(INTEGRATION_CHECK_ENV))
+    integration = bool(os.getenv(worktree.INTEGRATION_CHECK_ENV))
     if not check:
         try:
             check, source = default_check(ws.root, strict_pytest=isolated or integration)
