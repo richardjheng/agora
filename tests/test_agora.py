@@ -28,7 +28,7 @@ os.environ.pop(parties.LOCKED_ENV, None)
 # inherit the outer task's manifest or controller when testing CLI commands.
 for name in ("AGORA_WORKSPACE", cli.worktree.CONTROL_ENV, cli.worktree.WORK_ENV,
              cli.worktree.DISPATCH_ENV, cli.worktree.MANIFEST_ENV,
-             cli.failure_baseline.RECORD_ENV, jobs.JOB_ENV):
+             cli.failure_baseline.RECORD_ENV, jobs.JOB_ENV, cli.worktree.INTEGRATION_CHECK_ENV):
     os.environ.pop(name, None)
 
 
@@ -2319,6 +2319,17 @@ class TestBuildAndSandbox(unittest.TestCase):
             self.assertIn("2 個檔案，1 個錯誤", out)
             self.assertIn("bad.py", out)
             self.assertFalse((ws.root / "__pycache__").exists())
+
+    def test_check_hides_controller_flags_from_project_subprocess(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = cli.Workspace(Path(tmp))
+            flags = ("AGORA_INTEGRATION_CHECK", "AGORA_PROBE")
+            script = f"import os; print('controller flags absent:', all(k not in os.environ for k in {flags!r}))"
+            config.save(ws.root, {"check": [sys.executable, "-c", script]})
+            with patch.dict(os.environ, dict.fromkeys(flags, "1")):
+                code, out = self.run_cmd(cli.cmd_check, ws)
+            self.assertEqual(code, 0, out)
+            self.assertIn("controller flags absent: True", out)
 
     def test_check_uses_project_venv_and_pytest(self):
         """沒設定 check：工作區有 .venv 就用它的 Python；有 pytest 設定且裝了 pytest 就跑 pytest，第一行印出指令與 Python"""
