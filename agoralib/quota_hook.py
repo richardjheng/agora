@@ -31,7 +31,10 @@ def load_state() -> dict:
 
 
 def save_state(state: dict):
-    quota._write_json(STATE_FILE, state)
+    try:
+        quota._write_json(STATE_FILE, state)
+    except OSError:
+        pass
 
 
 def advice(me: str, usages: dict, weights: dict | None = None, work: dict | None = None) -> tuple[str | None, str | None]:
@@ -97,7 +100,10 @@ def main():
                if os.getenv("AGORA_SUBAGENTS") == "0" else {"decision": "allow"})
         sys.stdout.buffer.write(json.dumps(out, ensure_ascii=False).encode("utf-8"))
         return
-    (quota.AGORA_HOME / f"last_hook_{mode}").touch()  # 診斷用：確認 hook 有在執行
+    try:
+        (quota.AGORA_HOME / f"last_hook_{mode}").touch()  # 診斷用：確認 hook 有在執行
+    except OSError:
+        pass
     if os.getenv(quota.PROBE_ENV):
         print("{}")
         return
@@ -111,7 +117,10 @@ def main():
     usages = {p: u for p, u in quota.all_usage().items() if p in parties}
     max_age = quota.wanted_max_age(*usages.values())
     if any(quota.is_stale(usages[p], max_age) for p in ("claude", "antigravity") if p in usages):
-        quota.refresh_in_background()
+        try:
+            quota.refresh_in_background()
+        except OSError:
+            pass
 
     root = project_root()
     level, text = advice(me, usages, config.shares(root) if root else None, shares.recent_work(root) if root else None)

@@ -230,10 +230,9 @@ def _codex_limits_from_file(path: Path) -> dict | None:
     return None
 
 
-def update_codex_snapshot_from_session(thread_id: str | None = None) -> bool:
-    """從指定（或最近一次）的 Codex 工作階段讀出額度並快取"""
+def _codex_snapshot_from_session(thread_id: str | None = None) -> dict | None:
     if not CODEX_SESSIONS.exists():
-        return False
+        return None
     pattern = f"*/*/*/rollout-*{thread_id}.jsonl" if thread_id else "*/*/*/rollout-*.jsonl"
     files = sorted(CODEX_SESSIONS.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)[:5]
     for f in files:
@@ -246,10 +245,17 @@ def update_codex_snapshot_from_session(thread_id: str | None = None) -> bool:
                     windows[key] = {"used_percentage": float(w["used_percent"]), "resets_at": w.get("resets_at"),
                                     "window_minutes": w.get("window_minutes")}
             if windows:
-                _write_json(CODEX_SNAPSHOT, {"updated_at": int(f.stat().st_mtime), "plan": limits.get("plan_type"),
-                                             **windows})
-                return True
-    return False
+                return {"updated_at": int(f.stat().st_mtime), "plan": limits.get("plan_type"), **windows}
+    return None
+
+
+def update_codex_snapshot_from_session(thread_id: str | None = None) -> bool:
+    """從指定（或最近一次）的 Codex 工作階段讀出額度並快取"""
+    snapshot = _codex_snapshot_from_session(thread_id)
+    if snapshot is None:
+        return False
+    _write_json(CODEX_SNAPSHOT, snapshot)
+    return True
 
 
 def codex_window_label(key: str, minutes: int | None) -> str:
@@ -269,8 +275,13 @@ def codex_window_label(key: str, minutes: int | None) -> str:
 def codex_usage() -> dict | None:
     """回傳最緊的視窗：{remaining_pct, resets_at, window, window_label, windows, plan, updated_at}"""
     snap = _read_json(CODEX_SNAPSHOT)
-    if not snap and update_codex_snapshot_from_session():
-        snap = _read_json(CODEX_SNAPSHOT)
+    if not snap:
+        snap = _codex_snapshot_from_session()
+        if snap:
+            try:
+                _write_json(CODEX_SNAPSHOT, snap)
+            except OSError:
+                pass
     if not snap:
         return None
     now = time.time()
