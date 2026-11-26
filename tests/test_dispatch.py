@@ -44,6 +44,7 @@ def assign(ws, args, crash=None, fail_spawn=False, usages=None, output=None):
     with patch.dict(os.environ, {cli.NESTED_ENV: ""}), patch("sys.stdout", output if output is not None else io.StringIO()), \
             patch.object(cli.sandbox, "network_restricted", return_value=False), \
             patch.object(cli.sandbox, "is_codex_sandbox", return_value=False), \
+            patch.object(cli, "missing_agy_commands", return_value=()), \
             patch.object(cli, "party_usage", side_effect=lambda p, m=None: usages.get(p) if usages is not None
                          else {"remaining_pct": 80, "updated_at": time.time()}), \
             patch.object(cli.quota, "blocked", return_value=None), \
@@ -69,7 +70,8 @@ class TestDispatch(unittest.TestCase):
     def setUp(self):
         # Some tests also exercise provider calls after the assignment helper returns.
         for patcher in (patch.object(cli.sandbox, "network_restricted", return_value=False),
-                        patch.object(cli.sandbox, "is_codex_sandbox", return_value=False)):
+                        patch.object(cli.sandbox, "is_codex_sandbox", return_value=False),
+                        patch.object(cli, "missing_agy_commands", return_value=())):
             patcher.start()
             self.addCleanup(patcher.stop)
         self.tmp = tempfile.TemporaryDirectory()
@@ -392,7 +394,8 @@ class TestDispatch(unittest.TestCase):
             text = routing.instruction("claude", enabled, config.shares(self.root))
             self.assertIn(routing.ZERO_SHARE_ROLE, text)
             self.assertNotIn("直接自己處理", text)
-        with patch.object(quota_hook, "project_root", return_value=self.root):
+        with patch.dict(os.environ, {cli.NESTED_ENV: ""}), \
+                patch.object(quota_hook, "project_root", return_value=self.root):
             self.assertIn(routing.ZERO_SHARE_ROLE, quota_hook.routing_line("claude"))
         out = io.StringIO()
         with patch("sys.stdout", out):

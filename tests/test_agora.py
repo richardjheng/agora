@@ -900,14 +900,16 @@ class TestTiers(unittest.TestCase):
         args = {"thread": "t1", "sender": "claude", "to": None, "message": "做事", "file": None, "session": None,
                 "from_summary": False, "yes": False, "tier": None, "model": None, "effort": None, "subagents": None,
                 "trigger": None, "reason": "測試：使用者指定接手方" if kw.get("to") else None, **kw}
+        out = io.StringIO()
         with patch.object(cli.jobs, "spawn", return_value=123), patch.object(cli.jobs, "pid_started", return_value=None), \
-                patch.object(cli.snapshot, "create", return_value={}), patch("sys.stdout", io.StringIO()), \
+                patch.object(cli.snapshot, "create", return_value={}), patch("sys.stdout", out), \
                 patch.object(cli.worktree, "prepare", side_effect=lambda root, key, allowed, thread: {
                     "dispatch_id": key, "source_dirty": False, "base_sha": "base", "branch": f"agora/{key}",
                     "allowed_paths": ["**"]}), patch.object(cli.worktree, "save"), \
                 patch.object(cli, "party_usage", return_value=pct(80)):
             os.environ.pop(cli.NESTED_ENV, None)
             cli.cmd_assign(ws, type("Args", (), args)())
+        return out.getvalue()
 
     def test_assign_freezes_model_and_logs_decision(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -916,7 +918,8 @@ class TestTiers(unittest.TestCase):
             thread.mkdir(parents=True)
             cli.save_state(thread, state_with(["claude", "codex", "antigravity"]))
             (thread / "transcript.md").write_text("", encoding="utf-8")
-            self.assign(ws, to="antigravity", tier="heavy", subagents="on")
+            with patch.object(cli, "missing_agy_commands", return_value=()):
+                self.assign(ws, to="antigravity", tier="heavy", subagents="on")
             relay = cli.load_state(thread)["relay"]
             self.assertEqual((relay["model"], relay["tier"], relay["selection"], relay["subagents"], relay["frozen"]),
                              ("gemini-4-argon-high", "heavy", "explicit", True, True))
@@ -938,6 +941,115 @@ class TestTiers(unittest.TestCase):
                 with self.assertRaises(SystemExit):
                     self.assign(ws, to="codex", **kw)
 
+    def test_assign_refuses_necessary_permissions_before_worktree_creation(self):
+        scenarios = [(("quota", "check"), None), (("build",), "build-project")]
+        for missing, build in scenarios:
+            with self.subTest(missing=missing), tempfile.TemporaryDirectory() as tmp:
+                ws = self.setup(tmp)
+                data = ws.config()
+                data["build"] = build
+                config.save(ws.root, data)
+                thread = ws.threads / "t1"
+                thread.mkdir(parents=True)
+                cli.save_state(thread, state_with(["claude", "antigravity"]))
+                with patch.object(cli, "agora_cmd", return_value="agora"), \
+                        patch.object(cli, "missing_agy_commands", return_value=missing) as permissions, \
+                        patch.object(cli, "_prepare_worktree") as prepare, \
+                        self.assertRaises(SystemExit) as exc:
+                    self.assign(ws, to="antigravity")
+                for sub in missing:
+                    self.assertIn(f"`agora {sub}`", str(exc.exception.code))
+                self.assertIn("agora install", str(exc.exception.code))
+                permissions.assert_called_once_with("agora")
+                prepare.assert_not_called()
+                self.assertFalse((thread / "progress.md").exists())
+
+    def test_assign_warns_only_for_test_and_skips_checks_for_other_workers(self):
+        for worker, missing in (("antigravity", ("test",)), ("antigravity", ("build",)),
+                                ("codex", cli.AGENT_COMMANDS), ("claude", cli.AGENT_COMMANDS)):
+            with self.subTest(worker=worker, missing=missing), tempfile.TemporaryDirectory() as tmp:
+                ws = self.setup(tmp)
+                thread = ws.threads / "t1"
+                thread.mkdir(parents=True)
+                cli.save_state(thread, state_with(["claude", "codex", "antigravity"]))
+                (thread / "transcript.md").write_text("", encoding="utf-8")
+                with patch.object(cli, "agora_cmd", return_value="agora"), \
+                        patch.object(cli, "missing_agy_commands", return_value=missing) as permissions:
+                    out = self.assign(ws, to=worker, sender="codex" if worker == "claude" else "claude")
+                self.assertEqual(cli.load_state(thread)["relay"]["worker"], worker)
+                self.assertEqual("⚠️ Antigravity 缺少 `agora test` 權限" in out, missing == ("test",))
+                if worker != "antigravity":
+                    permissions.assert_not_called()
+
+    def test_resume_checks_frozen_build_before_changing_dispatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = self.setup(tmp)
+            thread = ws.threads / "t1"
+            thread.mkdir(parents=True)
+            state = state_with(["claude", "codex", "antigravity"])
+            relay = {"worker": "codex", "status": "stopped"}
+            state["relay"] = relay
+            cli.save_state(thread, state)
+            control = thread / "control.json"
+            control.write_text('{"stop_requested": true}', encoding="utf-8")
+            meta = {"commands": {"build": "frozen-build"}}
+            with patch.object(cli, "load_recovery_target", return_value=("d1", meta, relay, relay)), \
+                    patch.object(cli, "verify_recovery_inactive"), patch.object(cli.worktree, "validate"), \
+                    patch.object(cli, "party_usage", return_value=pct(80)), \
+                    patch.object(cli, "agora_cmd", return_value="agora"), \
+                    patch.object(cli, "missing_agy_commands", return_value=("build",)), \
+                    patch.object(cli.worktree, "save") as save, patch.object(cli.jobs, "spawn") as spawn, \
+                    self.assertRaisesRegex(SystemExit, "agora build.*agora install"):
+                cli._cmd_resume_locked(ws, argparse.Namespace(thread="t1", sender="claude", resume="d1", to="antigravity"))
+            self.assertEqual(cli.load_state(thread)["relay"], relay)
+            self.assertTrue(json.loads(control.read_text(encoding="utf-8"))["stop_requested"])
+            save.assert_not_called()
+            spawn.assert_not_called()
+
+    def test_worker_checks_permissions_on_each_round(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = self.setup(tmp)
+            thread = ws.threads / "t1"
+            thread.mkdir(parents=True)
+            state = state_with(["claude", "antigravity"])
+            task = {"commands": {}, "commit_message": str(thread / "commit-message.md"),
+                    "manifest": str(thread / "manifest.json"), "dispatch_id": "d1", "branch": "agy/d1",
+                    "base_sha": "base", "allowed_paths": ["**"], "control_root": str(ws.root)}
+            state["relay"] = {"worker": "antigravity", "from": "claude", "handoff": "做事", "rounds": 0,
+                              "status": "starting", "worktree": str(ws.root)}
+            cli.save_state(thread, state)
+            (thread / "transcript.md").write_text("", encoding="utf-8")
+            with patch.object(cli, "agora_cmd", return_value="agora"), \
+                    patch.object(cli, "missing_agy_commands", side_effect=[("test",), ("check",)]) as permissions, \
+                    patch.object(cli.worktree, "load", return_value=task), \
+                    patch.object(cli.worktree, "recover_commit"), \
+                    patch.object(cli.worktree, "validate", return_value=ws.root), \
+                    patch.object(cli.worktree, "setup_environment", side_effect=lambda task: task.update(environment_status="ready")), \
+                    patch.object(cli.worktree, "environment", return_value={}), \
+                    patch.object(cli, "party_usage", return_value=pct(80)), \
+                    patch.object(cli, "git_status", return_value=""), patch.object(quota, "refresh"), \
+                    patch("sys.stdout", io.StringIO()), \
+                    patch.object(cli, "call_party", return_value=("做完一步", "sid", "1s")) as caller:
+                cli.cmd_work(ws, argparse.Namespace(thread="t1"))
+            self.assertEqual(permissions.call_count, 2)
+            caller.assert_called_once()
+            prompt = caller.call_args.args[1]
+            self.assertNotIn("agora test", prompt)
+            self.assertNotIn("test-targets.txt", prompt)
+            self.assertIn("Agora 收尾時會執行完整的 `agora check`，非必要不手動跑。", prompt)
+            relay = cli.load_state(thread)["relay"]
+            self.assertEqual((relay["status"], relay["rounds"]), ("blocked", 1))
+            self.assertIn("agora check", relay["error"])
+            self.assertIn("agora install", relay["error"])
+            progress = (thread / "progress.md").read_text(encoding="utf-8")
+            self.assertIn("局部測試權限提醒", progress)
+            self.assertIn(relay["error"], progress)
+            out = io.StringIO()
+            with patch("sys.stdout", out):
+                cli.cmd_status(ws, argparse.Namespace(thread="t1", wait=None, json=True))
+            status = json.loads(out.getvalue())
+            self.assertEqual((status["status"], status["error"]), ("blocked", relay["error"]))
+
     def run_frozen_worker(self, reply):
         with tempfile.TemporaryDirectory() as tmp:
             ws = self.setup(tmp)
@@ -957,6 +1069,7 @@ class TestTiers(unittest.TestCase):
                 return reply, "s1", "1s"
 
             with patch.dict(cli.CALLERS, {"antigravity": agy}), patch.object(cli, "party_usage", return_value=pct(80)), \
+                    patch.object(cli, "missing_agy_commands", return_value=()), \
                     patch.object(cli, "git_status", return_value=""), patch.object(quota, "refresh"), \
                     patch.object(cli, "MAX_WORK_ROUNDS", 1), patch("sys.stdout", io.StringIO()):
                 cli.cmd_work(ws, type("Args", (), {"thread": "t1"})())
@@ -2711,6 +2824,7 @@ class TestBuildAndSandbox(unittest.TestCase):
             (thread / "transcript.md").write_text("", encoding="utf-8")
             (thread / "progress.md").write_text("# 工作進度\n", encoding="utf-8")
             with patch.object(parties, "_run", fake_run), patch.object(cli, "party_usage", return_value=None), \
+                    patch.object(cli, "missing_agy_commands", return_value=()), \
                     patch.object(cli, "git_status", return_value=""), patch("sys.stdout", io.StringIO()), \
                     patch("sys.stderr", io.StringIO()):
                 cli.cmd_work(ws, type("Args", (), {"thread": "t1"})())
