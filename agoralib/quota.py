@@ -302,15 +302,46 @@ def codex_usage() -> dict | None:
 
 # ───────────────────────── Antigravity ─────────────────────────
 
+MAX_DISCOVERY_FILES = 6   # 未對應執行中程序的探索檔最多取最新幾份
+MAX_CANDIDATES = 8        # 最多嘗試幾個候選端點（避免大量舊檔逐一逾時）
+_LAST_AGY_ERROR: str | None = None
+
+
+def _int_or_none(val) -> int | None:
+    try:
+        return int(val) if val is not None and str(val).strip() != "" else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _file_mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
 def _list_processes() -> list[dict]:
+    global _LAST_AGY_ERROR
+    _LAST_AGY_ERROR = None
     names = " OR ".join(f"Name='{n}'" for n in PROCESS_NAMES)
-    cmd = f'Get-CimInstance Win32_Process -Filter "{names}" | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress'
+    cmd = (
+        "[Console]::OutputEncoding=[Text.Encoding]::UTF8; "
+        f'Get-CimInstance Win32_Process -Filter "{names}" | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress'
+    )
     try:
         out = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", cmd],
                              capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20,
-                             **NO_WINDOW).stdout.strip()
-        data = json.loads(out) if out else []
-    except Exception:
+                             **NO_WINDOW).stdout.lstrip("\ufeff").strip()
+    except Exception as exc:
+        _LAST_AGY_ERROR = f"列出 Antigravity 程序失敗：{type(exc).__name__}: {exc}"
+        return []
+    if not out:
+        return []
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError as exc:
+        _LAST_AGY_ERROR = f"解析 Antigravity 程序清單 JSON 失敗：{exc}（前段：{out[:120]!r}）"
         return []
     return data if isinstance(data, list) else [data]
 
@@ -321,28 +352,88 @@ def _arg(cmdline: str, name: str) -> str | None:
 
 
 def _candidates() -> list[dict]:
-    """(protocol, port, csrf) 候選；開著本專案的 hub 優先，探索檔最後"""
-    found, seen = [], set()
+    """(protocol, port, csrf) 候選：
+    開著目前工作區的執行中程序優先，其次其他執行中程序；
+    有 pid 與 --hub-port 皆相符的 hub_*.json 時優先帶上其 csrfToken，
+    其餘探索檔依修改時間取較新的幾份，並保留舊格式 ls_*.json 相容。"""
+    found, by_key = [], {}
 
-    def add(proto, port, csrf, priority):
-        if port and (proto, str(port)) not in seen:
-            seen.add((proto, str(port)))
-            found.append({"protocol": proto, "port": int(port), "csrf": csrf, "priority": priority})
+    def add(proto: str, port, csrf: str | None, priority: tuple):
+        pnum = _int_or_none(port)
+        if not pnum:
+            return
+        key = (proto, pnum)
+        existing = by_key.get(key)
+        if existing is not None:
+            if not existing["csrf"] and csrf:
+                existing["csrf"] = csrf
+            if priority < existing["priority"]:
+                existing["priority"] = priority
+            return
+        entry = {"protocol": proto, "port": pnum, "csrf": csrf or None, "priority": priority}
+        by_key[key] = entry
+        found.append(entry)
 
     # Antigravity 有多個 hub 時，優先選開著目前工作區的那個；查詢時才讀（cli 解析 --workspace 後才設定 AGORA_WORKSPACE）
     ws = str(Path(os.getenv("AGORA_WORKSPACE") or os.getcwd())).lower().replace("/", "\\")
+    live_hubs: dict[tuple[int, int], int] = {}
     for p in _list_processes():
         cl = p.get("CommandLine") or ""
-        prio = 0 if ws in cl.lower().replace("/", "\\") else 1
-        add("http", _arg(cl, "hub-port"), None, prio)
+        ws_tier = 0 if ws in cl.lower().replace("/", "\\") else 1
+        pid = _int_or_none(p.get("ProcessId"))
+        hub_port = _int_or_none(_arg(cl, "hub-port"))
+        if pid is not None and hub_port is not None:
+            prev = live_hubs.get((pid, hub_port))
+            if prev is None or ws_tier < prev:
+                live_hubs[(pid, hub_port)] = ws_tier
+        if hub_port is not None:
+            add("http", hub_port, None, (ws_tier, 2, 0, 0.0))
         csrf = _arg(cl, "csrf_token")
-        add("http", _arg(cl, "http_server_port"), csrf, prio)
-        add("https", _arg(cl, "https_server_port"), csrf, prio)
-    for f in GEMINI_DIR.glob("*/daemon/ls_*.json"):
-        d = _read_json(f) or {}
-        add("http", d.get("httpPort"), d.get("csrfToken"), 2)
-        add("https", d.get("httpsPort"), d.get("csrfToken"), 2)
-    return sorted(found, key=lambda c: c["priority"])
+        add("http", _arg(cl, "http_server_port"), csrf, (ws_tier, 1, 0, 0.0))
+        add("https", _arg(cl, "https_server_port"), csrf, (ws_tier, 1, 1, 0.0))
+
+    hub_files = sorted(GEMINI_DIR.glob("*/daemon/hub_*.json"), key=_file_mtime, reverse=True)
+    recent_hubs = 0
+    for f in hub_files:
+        if not live_hubs and recent_hubs >= MAX_DISCOVERY_FILES:
+            break
+        d = _read_json(f)
+        if not isinstance(d, dict):
+            continue
+        mtime = _file_mtime(f)
+        pid = _int_or_none(d.get("pid"))
+        http_port = _int_or_none(d.get("httpPort"))
+        https_port = _int_or_none(d.get("httpsPort"))
+        csrf = d.get("csrfToken") or None
+        ws_tier = live_hubs.get((pid, http_port)) if (pid is not None and http_port is not None) else None
+        if ws_tier is not None:
+            add("http", http_port, csrf, (ws_tier, 0, 0, -mtime))
+            add("https", https_port, csrf, (ws_tier, 0, 1, -mtime))
+        elif recent_hubs < MAX_DISCOVERY_FILES and (http_port or https_port):
+            recent_hubs += 1
+            add("http", http_port, csrf, (2, 0, 0, -mtime))
+            add("https", https_port, csrf, (2, 0, 1, -mtime))
+
+    ls_files = sorted(GEMINI_DIR.glob("*/daemon/ls_*.json"), key=_file_mtime, reverse=True)
+    recent_ls = 0
+    for f in ls_files:
+        if recent_ls >= MAX_DISCOVERY_FILES:
+            break
+        d = _read_json(f)
+        if not isinstance(d, dict):
+            continue
+        http_port = _int_or_none(d.get("httpPort"))
+        https_port = _int_or_none(d.get("httpsPort"))
+        if not (http_port or https_port):
+            continue
+        recent_ls += 1
+        mtime = _file_mtime(f)
+        csrf = d.get("csrfToken") or None
+        add("http", http_port, csrf, (3, 0, 0, -mtime))
+        add("https", https_port, csrf, (3, 0, 1, -mtime))
+
+    found.sort(key=lambda c: c["priority"])
+    return found[:MAX_CANDIDATES]
 
 
 def _request(c: dict, path: str, body: bytes | None = None, headers: dict | None = None, timeout: float = 4) -> str:
@@ -421,18 +512,25 @@ def _configured_agy_model() -> str | None:
 
 def query_antigravity() -> dict | None:
     """即時查詢；找不到執行中的 Antigravity 時回傳 None"""
+    global _LAST_AGY_ERROR
     if sandbox.network_restricted():
         return None
-    for c in _candidates():
+    _LAST_AGY_ERROR = None
+    candidates = _candidates()
+    proc_err = _LAST_AGY_ERROR
+    last_err = None
+    for c in candidates:
         try:
             csrf = c["csrf"]
             if not csrf:
                 m = re.search(r'"csrfToken"\s*:\s*"([^"]+)"', _request(c, "/"))
                 csrf = m.group(1) if m else None
             if not csrf:
+                last_err = f"127.0.0.1:{c['port']} 首頁未提供 csrfToken"
                 continue
             status = json.loads(_request(c, f"{LS_SERVICE}/GetUserStatus", b"{}", {"x-codeium-csrf-token": csrf}))
-        except Exception:
+        except Exception as exc:
+            last_err = f"127.0.0.1:{c['port']} 查詢失敗：{type(exc).__name__}: {exc}"
             continue
         cmcd = (status.get("userStatus") or {}).get("cascadeModelConfigData") or {}
         configs = cmcd.get("clientModelConfigs") or []
@@ -464,7 +562,10 @@ def query_antigravity() -> dict | None:
             if pool not in pools or entry["remaining_pct"] < pools[pool]["remaining_pct"]:
                 pools[pool] = entry
         if pools:
+            _LAST_AGY_ERROR = None
             return {"schema": 2, "updated_at": int(time.time()), "default_model": default_model, "pools": pools}
+    errs = [e for e in (proc_err, last_err) if e]
+    _LAST_AGY_ERROR = "；".join(errs) if errs else "找不到可用的 Antigravity hub / language server"
     return None
 
 
@@ -524,6 +625,19 @@ def antigravity_usage(model: str | None = None) -> dict | None:
 
 # ───────────────────────── 更新與摘要 ─────────────────────────
 
+def _record_agy_error(error: str) -> None:
+    """更新失敗時將診斷資訊寫入快取（保留既有 pools 與 updated_at）"""
+    cache = _read_json(AGY_CACHE)
+    if not isinstance(cache, dict):
+        cache = {}
+    cache["last_error"] = error
+    cache["last_error_at"] = int(time.time())
+    try:
+        _write_json(AGY_CACHE, cache)
+    except OSError:
+        pass
+
+
 def refresh(force: bool = False, min_interval: int = 60) -> None:
     """重新查詢兩方並寫入快取；多個呼叫者同時觸發時只跑一次"""
     if sandbox.network_restricted():
@@ -539,6 +653,8 @@ def refresh(force: bool = False, min_interval: int = 60) -> None:
     agy = query_antigravity()
     if agy:
         _write_json(AGY_CACHE, agy)
+    elif _LAST_AGY_ERROR:
+        _record_agy_error(_LAST_AGY_ERROR)
     update_codex_snapshot_from_session()
     probe_claude()
 
@@ -580,6 +696,14 @@ def fmt_time(ts) -> str:
     return dt.strftime("%H:%M") if dt.date() == datetime.now().date() else dt.strftime("%m/%d %H:%M")
 
 
+def _age_duration(updated_at) -> str:
+    if not updated_at:
+        return "時間未知"
+    seconds = max(0, time.time() - updated_at)
+    minutes = int(seconds / 60)
+    return f"{minutes} 分鐘前" if minutes < 120 else f"{minutes // 60} 小時前"
+
+
 def age_text(updated_at) -> str:
     """「N 分鐘前」；超過 STALE_AFTER 改用小時並標示可能過期"""
     seconds = time.time() - (updated_at or 0)
@@ -594,6 +718,11 @@ def describe(name: str, usage: dict | None) -> str:
         return f"{name}：無法使用（{b.get('reason')}，{fmt_time(b.get('at'))} 偵測）"
     if not usage:
         return f"{name}：無資料"
+    now = time.time()
+    updated_at = usage.get("updated_at")
+    stale = (now - (updated_at or 0)) > STALE_AFTER or bool(usage.get("resets_at") and usage["resets_at"] <= now)
+    if stale:
+        return f"{name}：額度未知（上次 {usage['remaining_pct']:.0f}%，{_age_duration(updated_at)}）"
     win_tag = f"{usage['window_label']}，" if usage.get("window_label") and usage.get("window") else ""
     extra = ""
     if usage.get("pools") and usage.get("windows"):
@@ -709,19 +838,24 @@ def main(argv=None):
             sys.exit(f"--unblock 要指定 {'、'.join(USAGE)} 其中之一。")
         print(f"已清除 {LABELS[party]} 的無法使用標記。" if clear_blocked(party) else f"{LABELS[party]} 沒有無法使用標記。")
         return
+    refreshed = False
     if "--refresh" in argv:
         refresh(force=True)
+        refreshed = True
         if "--quiet" in argv:
             return
     usages = all_usage()
     if "--refresh" not in argv and any(is_stale(usages[p], 600) for p in ("claude", "antigravity")):
         refresh(force=True)
+        refreshed = True
         usages = all_usage()
     if "--json" in argv:
         print(json.dumps({**usages, "threshold_pct": THRESHOLD_PCT}, ensure_ascii=False, indent=2))
         return
     for party, u in usages.items():
         print(describe(LABELS[party], u))
+        if party == "antigravity" and refreshed and _LAST_AGY_ERROR:
+            print(f"  （更新失敗：{_LAST_AGY_ERROR}）")
         if u and u.get("windows") and len(u["windows"]) > 1:
             details = "、".join(f"{w.get('full_label') or w['label']} 剩 {w['remaining_pct']:.0f}%（{fmt_time(w.get('resets_at'))} 重置）"
                                for w in u["windows"].values())

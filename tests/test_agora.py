@@ -2624,7 +2624,7 @@ class TestBuildAndSandbox(unittest.TestCase):
             with patch.dict(cli.CALLERS, {"codex": lambda *a, **k: ("好", "s", "1s")}):
                 cli.call_party("codex", "p", None, {}, False, Path("."), 1, Path("."))
             self.assertIsNone(quota.blocked("codex"))
-            self.assertEqual(quota.describe("Codex", quota.usage("codex")), "Codex 剩 18%（7 天，未知 重置，7 小時前，可能過期）")
+            self.assertEqual(quota.describe("Codex", quota.usage("codex")), "Codex：額度未知（上次 18%，7 小時前）")
 
     def test_blocked_relay_shown_in_status_and_activity(self):
         with tempfile.TemporaryDirectory() as tmp:
