@@ -16,7 +16,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from agoralib import checkqueue, completions, quota, worktree
+from agoralib import checkqueue, completions, config, quota, worktree
 from agoralib.worktree import RECORD_ENV
 
 LABELS = {"new": "新失敗", "preexisting": "既有失敗", "flaky": "不穩定", "unknown": "無法比對"}
@@ -28,6 +28,21 @@ def now():
 
 def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+def valid_test_id(test_id, framework):
+    """Enforce strict ID whitelist before parsing/rerunning individual test IDs."""
+    if not isinstance(test_id, str) or not test_id or test_id.startswith("-") or any(c.isspace() for c in test_id):
+        return False
+    if framework == "unittest":
+        parts = test_id.split(".")
+        return len(parts) >= 3 and all(p.isidentifier() for p in parts)
+    if framework == "pytest":
+        if "::" not in test_id or test_id.startswith(("/", "\\", "-")):
+            return False
+        path_part = test_id.split("::", 1)[0]
+        return ":" not in path_part and ".." not in re.split(r"[/\\]", path_part)
+    return False
 
 
 def parse(output, framework, exit_code):
@@ -44,7 +59,7 @@ def parse(output, framework, exit_code):
                 or any(name != test.rsplit(".", 1)[-1] for _, name, test in rows)):
             return result
         result["count"] = int(runs[0])
-        if any(not re.fullmatch(r"[\w]+(?:\.[\w]+){2,}", test) for test in result["ids"]):
+        if any(not valid_test_id(test, "unittest") for test in result["ids"]):
             return result  # fixtures, subtests, custom descriptions
         counts = dict((k, int(v)) for k, v in re.findall(r"[,(]\s*(failures|errors)=(\d+)", ends[0]))
         expected = sum(counts.values())
@@ -60,10 +75,7 @@ def parse(output, framework, exit_code):
         counts = dict((k, int(v)) for v, k in re.findall(r"(\d+) (\w+)", summaries[0]))
         result["count"] = sum(counts.get(k, 0) for k in ("passed", "failed", "error", "errors", "skipped", "xfailed", "xpassed"))
         expected = counts.get("failed", 0) + counts.get("error", 0) + counts.get("errors", 0)
-        safe_ids = all("::" in test and not test.startswith(("/", "\\", "-"))
-                       and ":" not in test.split("::", 1)[0]
-                       and ".." not in re.split(r"[/\\]", test.split("::", 1)[0])
-                       for test in result["ids"])
+        safe_ids = all(valid_test_id(test, "pytest") for test in result["ids"])
         result["complete"] = (safe_ids and len(rows) == len(result["ids"]) == expected
                               and ((exit_code == 0 and counts.get("passed", 0) > 0 and not expected)
                                    or (exit_code == 1 and expected > 0)))
@@ -117,6 +129,23 @@ def plan(spec):
         if Path(value).is_absolute() or ".." in Path(value).parts:
             raise ValueError("測試探索路徑必須在工作區內")
     return {"framework": framework, "start": start, "top": top, "flags": flags}
+
+
+def plan_custom(spec, root=None):
+    """Validate and translate a declared check_framework into a rerun plan."""
+    validated = config.validate_check_framework(spec, root=root)
+    return {
+        "framework": validated["output"],
+        "custom": True,
+        "script": validated["script"],
+        "rerun": validated["rerun"],
+        "ids_index": validated["ids_index"],
+        "env": validated["env"],
+        "target_format": validated["target_format"],
+        "start": ".",
+        "top": ".",
+        "flags": [],
+    }
 
 
 def dependency_fingerprint(target):
@@ -188,24 +217,83 @@ sys.exit(code)
 '''
 
 
+CUSTOM_RUNNER = '''import pathlib, runpy, sys
+root, task, script = sys.argv[1:4]
+args = sys.argv[4:]
+root, task = pathlib.Path(root).resolve(), pathlib.Path(task).resolve()
+script_path = (root / script).resolve()
+if root not in script_path.parents or not script_path.is_file():
+    print('AGORA: custom test script outside workspace or missing', file=sys.stderr)
+    sys.exit(2)
+def _in_task_source(p):
+    try:
+        rp = pathlib.Path(p).resolve()
+    except OSError:
+        return False
+    return (rp == task or task in rp.parents) and rp != task / '.venv' and task / '.venv' not in rp.parents
+sys.path[:] = [p for p in sys.path if not (p and _in_task_source(p))]
+sys.path[:0] = [str(root / 'src'), str(root)]
+sys.argv = [script] + args
+code = 0
+try:
+    runpy.run_path(str(script_path), run_name='__main__')
+except SystemExit as exc:
+    if exc.code is None:
+        code = 0
+    elif isinstance(exc.code, int):
+        code = exc.code
+    else:
+        print(exc.code, file=sys.stderr)
+        code = 1
+if root != task:
+    for mod in list(sys.modules.values()):
+        origin = getattr(mod, '__file__', None)
+        if isinstance(origin, str) and origin and _in_task_source(origin):
+            print('AGORA: imported dispatch source during baseline', file=sys.stderr)
+            code = 3
+sys.exit(code)
+'''
+
+
 def rerun(meta, target, selected, ids, directory, label, can_continue=lambda: True):
     env = worktree.environment(meta)
     env.pop(RECORD_ENV, None)
+    if selected.get("env"):
+        env.update(selected["env"])
     env.update(PYTHONDONTWRITEBYTECODE="1", AGORA_WORKSPACE=str(target))
     env = worktree.git_environment(env, (target,))
+    target_resolved = Path(target).resolve()
+    if selected.get("custom"):
+        script_path = (target_resolved / selected["script"]).resolve()
+        if target_resolved not in script_path.parents or not script_path.is_file():
+            raise ValueError(f"工作區缺少自訂測試腳本：{selected['script']}")
     results = {}
     for index, test in enumerate(ids):
         if not can_continue():
             raise checkqueue.CheckStopped("已要求停止，不再執行下一個診斷項目")
-        args = (["-v"] if selected["framework"] == "unittest"
-                else ["-p", "no:cacheprovider", "-q", "-rA", "--color=no"])
-        command = [str(worktree.python_path(Path(meta["worktree"]))), "-c", RUNNER,
-                   str(target), meta["worktree"], selected["start"], selected["top"], selected["framework"],
-                   *selected["flags"], *args, test]
+        path = directory / f"{label}-{index}.log"
+        if not valid_test_id(test, selected["framework"]):
+            output = f"AGORA: invalid test id rejected: {test}\n"
+            path.write_text(output, encoding="utf-8")
+            results[test] = {
+                "state": "unknown", "exit_code": None, "log": str(path), "time": now(),
+                "log_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                "reason": f"不合格的測試 ID：{test}",
+            }
+            continue
+        if selected.get("custom"):
+            template_args = [test if item == "{ids}" else item for item in selected["rerun"][1:]]
+            command = [str(worktree.python_path(Path(meta["worktree"]))), "-c", CUSTOM_RUNNER,
+                       str(target), meta["worktree"], selected["script"], *template_args]
+        else:
+            args = (["-v"] if selected["framework"] == "unittest"
+                    else ["-p", "no:cacheprovider", "-q", "-rA", "--color=no"])
+            command = [str(worktree.python_path(Path(meta["worktree"]))), "-c", RUNNER,
+                       str(target), meta["worktree"], selected["start"], selected["top"], selected["framework"],
+                       *selected["flags"], *args, test]
         proc = subprocess.run(command, cwd=target, env=env, capture_output=True, text=True,
                               encoding="utf-8", errors="replace", **quota.NO_WINDOW)
         output = proc.stdout + proc.stderr
-        path = directory / f"{label}-{index}.log"
         path.write_text(output, encoding="utf-8")
         parsed = parse(output, selected["framework"], proc.returncode)
         state = "unknown"
@@ -216,8 +304,18 @@ def rerun(meta, target, selected, ids, directory, label, can_continue=lambda: Tr
                     state = "passed"
             elif parsed["ids"] == [test]:
                 state = "failed"
-        results[test] = {"state": state, "exit_code": proc.returncode, "log": str(path), "time": now(),
-                         "log_sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+        entry = {"state": state, "exit_code": proc.returncode, "log": str(path), "time": now(),
+                 "log_sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+        if state == "unknown":
+            if "AGORA: imported dispatch source during baseline" in output:
+                entry["reason"] = "基準重跑誤載入分派原始碼"
+            elif not parsed["complete"]:
+                entry["reason"] = "重跑輸出不完整或異常退出"
+            elif parsed["count"] != 1:
+                entry["reason"] = f"重跑執行測試數為 {parsed['count']}（預期 1）"
+            else:
+                entry["reason"] = "重跑結果無法判定"
+        results[test] = entry
     return results
 
 
@@ -227,8 +325,12 @@ def compare(meta, result, can_continue=lambda: True):
                   "commands": json.loads(json.dumps(meta.get("commands"))), "initial": dict(result), "classifications": {},
                   "base": {}, "dispatch": {}, "cache_hit": False}
     try:
-        spec = (meta.get("commands") or {}).get("check")
-        selected = plan(spec)
+        commands = meta.get("commands") or {}
+        target = Path(meta["worktree"])
+        if commands.get("check_framework") is not None:
+            selected = plan_custom(commands.get("check_framework"), root=target)
+        else:
+            selected = plan(commands.get("check"))
         if (not result.get("complete") or result.get("syntax_errors") != 0
                 or result.get("exit_code") != 1 or result.get("test_exit_code") != 1):
             raise ValueError("首次驗證未完整執行或有語法錯誤")
@@ -237,7 +339,6 @@ def compare(meta, result, can_continue=lambda: True):
         ids = parsed["ids"]
         if not parsed["complete"] or not ids:
             raise ValueError("收集／匯入失敗、輸出不完整或無法解析失敗項目")
-        target = Path(meta["worktree"])
         fingerprint = dependency_fingerprint(target)
         key = digest({"version": 1, "base_sha": meta["base_sha"], "commands": meta["commands"],
                       "ids": ids, "dependencies": fingerprint, "environment": environment_fingerprint(target)})
@@ -285,14 +386,39 @@ def eligible(comparison):
     return bool(values) and set(values.values()) == {"preexisting"} and not comparison.get("error")
 
 
+def _unknown_reason(comparison, unknown_ids):
+    if comparison.get("error"):
+        return str(comparison["error"])
+    reasons = []
+    for bucket in ("base", "dispatch"):
+        records = comparison.get(bucket) or {}
+        for test_id in unknown_ids:
+            item = records.get(test_id)
+            if isinstance(item, dict) and item.get("reason") and item["reason"] not in reasons:
+                reasons.append(item["reason"])
+    return "；".join(reasons) if reasons else "部分測試重跑結果無法判定"
+
+
 def describe(record):
     comparison = record.get("baseline_comparison")
     if not comparison:
         return ""
-    groups = [f"{label}：" + (", ".join(k for k, v in comparison["classifications"].items() if v == kind) or "無")
+    classifications = comparison.get("classifications") or {}
+    unknown_ids = [k for k, v in classifications.items() if v == "unknown"]
+    has_unknown = bool(comparison.get("error")) or bool(unknown_ids)
+    if has_unknown:
+        groups = []
+        for kind, label in LABELS.items():
+            items = [k for k, v in classifications.items() if v == kind]
+            if items:
+                groups.append(f"{label}：" + ", ".join(items))
+        reason = _unknown_reason(comparison, unknown_ids)
+        groups.append(f"無法比對失敗項目（不代表沒有新失敗）：{reason}")
+        if "未知測試框架" in reason or "未知或複合驗證指令" in reason:
+            groups.append("自訂驗證指令請在 .agora/config.json 宣告 check_framework")
+        return "\n".join(groups)
+    groups = [f"{label}：" + (", ".join(k for k, v in classifications.items() if v == kind) or "無")
               for kind, label in LABELS.items()]
-    if comparison.get("error"):
-        groups.append(comparison["error"])
     if eligible(comparison) and not record.get("commit_sha"):
         thread = Path(record.get("thread") or "<thread>").name
         groups.append(f'主持方可核准（不自動核准）：agora finalize "{thread}" --dispatch-id {record["dispatch_id"]} --accept-preexisting --reason "<理由>"')

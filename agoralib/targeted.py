@@ -132,6 +132,7 @@ def validate_targets(
     *,
     test_root: str = TEST_ROOT,
     max_targets: int = MAX_TARGETS,
+    target_format: Optional[str] = None,
 ) -> List[str]:
     """整批驗證目標；任何一項不合格即拋出 TargetValidationError 並逐項列出原因。"""
     root = Path(worktree_root).resolve()
@@ -160,6 +161,9 @@ def validate_targets(
 
         if "::" in raw:
             file_part, node_part = raw.split("::", 1)
+            if target_format == "module":
+                errors.append((raw, "target_format=module 不接受 路徑::名稱 形式"))
+                continue
             if framework != "pytest":
                 errors.append((raw, "只有 pytest 支援 路徑::名稱 形式"))
                 continue
@@ -187,6 +191,11 @@ def validate_targets(
         if parts[0] != test_root_norm:
             errors.append((raw, f"目標必須位於 {test_root_norm}/ 目錄底下"))
             continue
+        if target_format == "module":
+            module_parts = parts[1:-1] + [parts[-1][:-3]]
+            if not module_parts or not all(p.isidentifier() for p in module_parts):
+                errors.append((raw, "target_format=module 需要可轉成有效 Python 模組名的路徑"))
+                continue
 
         candidate = root / norm_posix
         if not candidate.exists() or not candidate.is_file():
@@ -217,11 +226,39 @@ def resolve_runner(
     check_spec,
     *,
     env: Optional[dict] = None,
+    check_framework: Optional[dict] = None,
 ) -> Dict[str, object]:
-    """從凍結的 check 指令（或 default_check）推導 Python 與測試框架。"""
+    """從凍結的 check_framework 或 check 指令（或 default_check）推導 Python 與測試框架。"""
     from agoralib import cli
 
     root = Path(worktree_root).resolve()
+    if check_framework is not None:
+        try:
+            cf = config.validate_check_framework(check_framework, root=root)
+        except ValueError as exc:
+            raise TargetedError(f"無效的 check_framework 設定：{exc}") from exc
+        if not cf["target_format"]:
+            raise TargetedError(
+                "自訂測試入口未宣告 target_format，無法選測；請在 .agora/config.json 的 check_framework 設定"
+            )
+        venv_py = worktree.python_path(root)
+        python = str(venv_py) if venv_py.is_file() else (cli.command_python(check_spec) or sys.executable)
+        if not Path(python).is_file() and not shutil.which(python):
+            raise TargetedError(f"找不到測試用 Python 執行檔：{python}")
+        return {
+            "python": python,
+            "framework": cf["output"],
+            "custom": True,
+            "rerun": cf["rerun"],
+            "script": cf["script"],
+            "ids_index": cf["ids_index"],
+            "env": cf["env"],
+            "target_format": cf["target_format"],
+            "start": ".",
+            "top": ".",
+            "flags": [],
+        }
+
     spec = check_spec
     if not spec:
         try:
@@ -232,12 +269,16 @@ def resolve_runner(
             raise TargetedError("無法推導測試框架：未設定 check 且找不到 tests/ 目錄。")
 
     if isinstance(spec, list) and spec and all(isinstance(x, list) for x in spec):
-        raise TargetedError("無法從複合 check 指令清單推導單一測試框架。")
+        raise TargetedError(
+            "無法從複合 check 指令清單推導單一測試框架；若使用自訂測試入口，請在 .agora/config.json 宣告 check_framework。"
+        )
 
     try:
         planned = baseline.plan(spec)
     except ValueError as exc:
-        raise TargetedError(f"無法推導測試框架：{exc}") from exc
+        raise TargetedError(
+            f"無法推導測試框架：{exc}；若使用自訂測試入口，請在 .agora/config.json 宣告 check_framework。"
+        ) from exc
 
     framework = planned["framework"]
     python = cli.command_python(spec)
@@ -261,6 +302,22 @@ def resolve_runner(
     }
 
 
+def format_target(target: str, target_format: str, test_root: str = TEST_ROOT) -> str:
+    """依 check_framework.target_format 轉換單一目標（path 或 module）。"""
+    if target_format == "path":
+        return target
+    if target_format == "module":
+        if "::" in target:
+            raise TargetedError(f"target_format=module 不接受 路徑::名稱 形式：{target}")
+        norm = target.replace("\\", "/")
+        prefix = test_root.strip("/\\") + "/"
+        if not norm.startswith(prefix) or not norm.endswith(".py"):
+            raise TargetedError(f"無法將目標轉換為模組名：{target}")
+        rel = norm[len(prefix):-3]
+        return ".".join(rel.split("/"))
+    raise TargetedError(f"不支援的 target_format：{target_format}")
+
+
 def _has_package_chain(worktree_root: Path, directory: Path) -> bool:
     """從 directory 往上至 worktree_root（不含）是否每層皆有 `__init__.py`。"""
     root = worktree_root.resolve()
@@ -281,9 +338,30 @@ def build_commands(
     framework: str,
     targets: Sequence[str],
     worktree_root: Path,
+    *,
+    check_framework: Optional[dict] = None,
+    test_root: str = TEST_ROOT,
 ) -> List[List[str]]:
-    """依測試框架與目標清單組成 argv 清單（一律以 shell=False 執行）。"""
+    """依測試框架或 check_framework 與目標清單組成 argv 清單（一律以 shell=False 執行）。"""
     root = Path(worktree_root).resolve()
+    if check_framework is not None:
+        try:
+            cf = config.validate_check_framework(check_framework, root=root)
+        except ValueError as exc:
+            raise TargetedError(f"無效的 check_framework 設定：{exc}") from exc
+        target_format = cf["target_format"]
+        if not target_format:
+            raise TargetedError(
+                "自訂測試入口未宣告 target_format，無法選測；請在 .agora/config.json 的 check_framework 設定"
+            )
+        formatted = [format_target(t, target_format, test_root=test_root) for t in targets]
+        argv: List[str] = [python, cf["script"]]
+        for item in cf["rerun"][1:]:
+            if item == "{ids}":
+                argv.extend(formatted)
+            else:
+                argv.append(item)
+        return [argv]
     if framework == "pytest":
         return [[python, "-m", "pytest", "-p", "no:cacheprovider", *targets]]
     if framework == "unittest":
@@ -367,11 +445,14 @@ def execute_commands(
     framework: str,
     *,
     env: Optional[dict] = None,
+    extra_env: Optional[Dict[str, str]] = None,
     timeout: float = DEFAULT_TIMEOUT,
 ) -> Dict[str, object]:
     """依序執行所有 argv 指令，共用單次硬逾時並檢查零測試收集。"""
     root = Path(worktree_root).resolve()
     run_env = worktree.project_environment(os.environ if env is None else env)
+    if extra_env:
+        run_env.update(extra_env)
     start_ts = time.monotonic()
     deadline = start_ts + timeout
     chunks: List[str] = []
@@ -440,6 +521,15 @@ def run_targeted_tests(
     dispatch_dir = Path(task["manifest"]).parent
     targets_file = targets_file_path(task)
 
+    early_cf = cli.command_config(ws).get("check_framework")
+    if early_cf is not None:
+        try:
+            cf_checked = config.validate_check_framework(early_cf, root=worktree_root)
+        except ValueError as exc:
+            sys.exit(f"無效的 check_framework 設定：{exc}")
+        if not cf_checked["target_format"]:
+            sys.exit("自訂測試入口未宣告 target_format，無法選測；請在 .agora/config.json 的 check_framework 設定")
+
     raw_targets = parse_targets_file(targets_file)
     if raw_targets:
         source_label = "目標檔"
@@ -456,10 +546,18 @@ def run_targeted_tests(
     try:
         with dispatch_test_lock(dispatch_dir):
             with cli.checked_task_environment(ws, refresh=True):
-                check_spec = cli.command_config(ws).get("check")
-                runner = resolve_runner(worktree_root, check_spec)
-                validated = validate_targets(raw_targets, worktree_root, runner["framework"])
-                commands = build_commands(runner["python"], runner["framework"], validated, worktree_root)
+                cmd_cfg = cli.command_config(ws)
+                check_spec = cmd_cfg.get("check")
+                check_framework = cmd_cfg.get("check_framework")
+                runner = resolve_runner(worktree_root, check_spec, check_framework=check_framework)
+                validated = validate_targets(
+                    raw_targets, worktree_root, runner["framework"],
+                    target_format=runner.get("target_format"),
+                )
+                commands = build_commands(
+                    runner["python"], runner["framework"], validated, worktree_root,
+                    check_framework=check_framework,
+                )
 
                 first_line = f"測試目標（{source_label}，共 {len(validated)} 個）：{', '.join(validated)}"
                 print(first_line, flush=True)
@@ -478,6 +576,7 @@ def run_targeted_tests(
                             commands,
                             worktree_root,
                             runner["framework"],
+                            extra_env=runner.get("env"),
                             timeout=timeout,
                         )
                 except checkqueue.CheckStopped as exc:
