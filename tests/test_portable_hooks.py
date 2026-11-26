@@ -72,12 +72,12 @@ class TestPortableHooks(unittest.TestCase):
             cli.cmd_install(ws, None)
         return out.getvalue()
 
-    def _clean_env(self, **extra: str) -> dict:
+    def _clean_env(self, home: Path, **extra: str) -> dict:
         env = {k: v for k, v in os.environ.items() if k not in (
             parties.NESTED_ENV, quota.PROBE_ENV, "AGORA_SUBAGENTS",
             "CLAUDE_PROJECT_DIR", "AGORA_WORKSPACE", "AGORA_WORKTREE", "AGORA_CONTROL_ROOT",
         )}
-        env.update(extra)
+        env.update(HOME=str(home), USERPROFILE=str(home), CODEX_HOME=str(home / ".codex"), **extra)
         return env
 
     def test_two_machines_produce_byte_identical_hooks_json(self):
@@ -289,6 +289,9 @@ class TestPortableHooks(unittest.TestCase):
                 tempfile.TemporaryDirectory() as outside_tmp:
             ws, home = cli.Workspace(Path(tmp)), Path(home_tmp)
             self._install(ws, home)
+            agora_home = home / ".agora"
+            agora_home.mkdir(exist_ok=True)
+            (agora_home / "refresh.lock").touch()
             config.update_parties(ws.root, disable=["claude"])
 
             codex_cmd = json.loads((ws.root / ".codex" / "hooks.json").read_text(encoding="utf-8"))[
@@ -313,7 +316,7 @@ class TestPortableHooks(unittest.TestCase):
                 ("worktree_with_control_root", worktree_dir, {"AGORA_CONTROL_ROOT": str(ws.root), "AGORA_WORKTREE": str(worktree_dir)}),
             ):
                 with self.subTest(scenario=label):
-                    p_codex = _run_codex_hook(codex_cmd, cwd, {"prompt": "幫我修 bug"}, self._clean_env(**extra_env))
+                    p_codex = _run_codex_hook(codex_cmd, cwd, {"prompt": "幫我修 bug"}, self._clean_env(home, **extra_env))
                     self.assertEqual(p_codex.returncode, 0, (label, p_codex.stderr))
                     ctx = json.loads(p_codex.stdout)["hookSpecificOutput"]["additionalContext"]
                     self.assertIn("【額度】", ctx)
@@ -322,19 +325,19 @@ class TestPortableHooks(unittest.TestCase):
 
                     p_tool = _run_agy_hook(
                         agy_tool_cmd, cwd, {"toolCall": {"name": "invoke_subagent"}},
-                        self._clean_env(AGORA_SUBAGENTS="0", **extra_env),
+                        self._clean_env(home, AGORA_SUBAGENTS="0", **extra_env),
                     )
                     self.assertEqual(p_tool.returncode, 0, (label, p_tool.stderr))
                     self.assertEqual(json.loads(p_tool.stdout)["decision"], "deny")
 
-                    p_pre = _run_agy_hook(agy_pre_cmd, cwd, {"invocationNum": 1}, self._clean_env(**extra_env))
+                    p_pre = _run_agy_hook(agy_pre_cmd, cwd, {"invocationNum": 1}, self._clean_env(home, **extra_env))
                     self.assertEqual(p_pre.returncode, 0, (label, p_pre.stderr))
                     self.assertIn("【額度】", json.loads(p_pre.stdout)["injectSteps"][0]["ephemeralMessage"])
 
             # 2) 外部 worktree 目錄搭配 AGORA_CONTROL_ROOT：也能找到主工作區的啟動器並正常執行
             p_ext = _run_agy_hook(
                 agy_tool_cmd, outside, {"toolCall": {"name": "invoke_subagent"}},
-                self._clean_env(AGORA_SUBAGENTS="0", AGORA_CONTROL_ROOT=str(ws.root)),
+                self._clean_env(home, AGORA_SUBAGENTS="0", AGORA_CONTROL_ROOT=str(ws.root)),
             )
             self.assertEqual(p_ext.returncode, 0, p_ext.stderr)
             self.assertEqual(json.loads(p_ext.stdout)["decision"], "deny")
@@ -343,7 +346,7 @@ class TestPortableHooks(unittest.TestCase):
             (ws.root / ".agora" / "hook.py").unlink()
             p_claude = _run_codex_hook(
                 claude_cmd, outside, {"prompt": "hi"},
-                self._clean_env(CLAUDE_PROJECT_DIR=str(ws.root)),
+                self._clean_env(home, CLAUDE_PROJECT_DIR=str(ws.root)),
             )
             self.assertEqual(p_claude.returncode, 0, p_claude.stderr)
             self.assertIn("【額度】", json.loads(p_claude.stdout)["hookSpecificOutput"]["additionalContext"])
@@ -351,17 +354,40 @@ class TestPortableHooks(unittest.TestCase):
             # 4) 啟動器不存在（已刪除，或在完全沒有 .agora/hook.py 的外部目錄）：Codex 與 Antigravity 必須 exit 0，絕不 exit 2
             for label, cwd in (("deleted_in_root", ws.root), ("deleted_in_worktree", worktree_dir), ("outside_no_launcher", outside)):
                 with self.subTest(missing_launcher=label):
-                    p_codex = _run_codex_hook(codex_cmd, cwd, {"prompt": "hi"}, self._clean_env())
+                    p_codex = _run_codex_hook(codex_cmd, cwd, {"prompt": "hi"}, self._clean_env(home))
                     self.assertEqual(p_codex.returncode, 0, (label, p_codex.stderr))
                     self.assertEqual(p_codex.stdout.strip(), "")
 
-                    p_pre = _run_agy_hook(agy_pre_cmd, cwd, {"invocationNum": 1}, self._clean_env())
+                    p_pre = _run_agy_hook(agy_pre_cmd, cwd, {"invocationNum": 1}, self._clean_env(home))
                     self.assertEqual(p_pre.returncode, 0, (label, p_pre.stderr))
                     self.assertEqual(p_pre.stdout.strip(), "")
 
-                    p_tool = _run_agy_hook(agy_tool_cmd, cwd, {"toolCall": {"name": "invoke_subagent"}}, self._clean_env(AGORA_SUBAGENTS="0"))
+                    p_tool = _run_agy_hook(agy_tool_cmd, cwd, {"toolCall": {"name": "invoke_subagent"}}, self._clean_env(home, AGORA_SUBAGENTS="0"))
                     self.assertEqual(p_tool.returncode, 0, (label, p_tool.stderr))
                     self.assertEqual(p_tool.stdout.strip(), "")
+
+    def test_hook_emits_low_quota_even_when_agora_home_cannot_be_written(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / ".agora").touch()
+            session_dir = home / ".codex" / "sessions" / "2026" / "01" / "01"
+            session_dir.mkdir(parents=True)
+            (session_dir / "rollout-test.jsonl").write_text(
+                json.dumps({"rate_limits": {"primary": {"used_percent": 99}}}) + "\n",
+                encoding="utf-8",
+            )
+            hook = cli.AGORA_ROOT_DIR / "agoralib" / "quota_hook.py"
+            proc = _run_codex_hook(
+                f'python "{hook.as_posix()}" codex-prompt', home, {},
+                self._clean_env(home, AGORA_QUOTA_THRESHOLD="5"),
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertFalse(proc.stderr)
+            output = json.loads(proc.stdout)["hookSpecificOutput"]
+            self.assertEqual(output["hookEventName"], "UserPromptSubmit")
+            context = output["additionalContext"]
+            self.assertIn("Codex 剩 1%", context)
+            self.assertIn("額度剩 1%", context)
 
 
 if __name__ == "__main__":
