@@ -30,21 +30,21 @@ class TestAgyDiagnostics(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def call(self, result, stderr="", steps=(), opts=None, work=False):
+    def call(self, result, stderr="", steps=(), opts=None, work=False, prompt="private prompt"):
         events = parties._RunEvents([{"event": "result", "result": result}])
         events.exit_code = 17 if result.get("status") == "ERROR" else 0
 
         def run(cmd, workspace, stdin_text, timeout, on_event=None, extra_env=None):
             self.command = cmd
-            for name, params in steps:
+            for state, name, params in steps:
                 on_event({"event": "step_update", "step_update": {
-                    "step_type": "tool", "state": "ACTIVE", "tool_name": name,
+                    "step_type": "tool", "state": state, "tool_name": name,
                     "tool_info": {"parameters": params}}})
             return events, stderr
 
         with patch.object(parties, "_run", side_effect=run) as runner:
             self.runner = runner
-            return parties.call_antigravity("private prompt", None, opts or {}, work, self.workspace, 3, self.root)
+            return parties.call_antigravity(prompt, None, opts or {}, work, self.workspace, 3, self.root)
 
     def fail(self, result=None, stderr="", **kwargs):
         with self.assertRaises(parties.CallError) as caught:
@@ -169,7 +169,7 @@ class TestAgyDiagnostics(unittest.TestCase):
 
     def test_denials_preserve_original_events_and_mark_inferred_target(self):
         denied = [{"action": "read_file", "display_name": "Read File", "detail": "permission denied"}]
-        steps = [("read_file", {"path": "first.md"}), ("read_file", {"path": "last.md"})]
+        steps = [("ACTIVE", "read_file", {"path": "first.md"}), ("ACTIVE", "read_file", {"path": "last.md"})]
         error, record = self.fail({"status": "ERROR", "error": "permission denied", "denied_actions": denied},
                                   steps=steps, work=True, opts={"control_dir": "control folder"})
         self.assertEqual(error.kind, "denied")
@@ -182,10 +182,46 @@ class TestAgyDiagnostics(unittest.TestCase):
         self.assertEqual(error.diagnostics["args"], {"--add-dir": ["control folder"], "--mode": ["accept-edits"]})
         self.assertIn('"detail": "permission denied"', record)
 
+    def test_explicit_denial_target_takes_precedence_over_same_tool_step(self):
+        steps = [("ACTIVE", "ReadFile", {"path": "old.md"})]
+        for fields in ({"target": "blocked.md"}, {"path": "blocked.md"},
+                       {"parameters": {"AbsolutePath": "blocked.md"}}):
+            with self.subTest(fields=fields):
+                denied = {"action": "read_file", **fields, "token": "denial-secret"}
+                error, record = self.fail({"status": "ERROR", "denied_actions": [denied]}, steps=steps)
+                self.assertEqual(error.denials, [
+                    {"action": "read_file", "target": "blocked.md", "target_inferred": False}])
+                self.assertEqual(error.diagnostics["denied_actions"], [{**denied, "token": "[REDACTED]"}])
+                self.assertNotIn("denial-secret", record)
+
+    def test_first_tool_denial_uses_parameters_from_non_active_step(self):
+        for state in ("PENDING", "ERROR"):
+            with self.subTest(state=state):
+                steps = [(state, "ReadFile", {"AbsolutePath": "blocked.md"}), ("ERROR", "ReadFile", None)]
+                error, _ = self.fail({"status": "ERROR", "denied_actions": [{"action": "read_file"}]},
+                                     steps=steps)
+                self.assertEqual(error.denials, [
+                    {"action": "read_file", "target": "推定目標：blocked.md", "target_inferred": True}])
+
     def test_denial_without_matching_step_does_not_invent_target(self):
-        denied = parties.agy_denials([{"action": "read_file"}], [("other", {"path": "wrong.md"})])
-        self.assertIsNone(denied[0]["target"])
-        self.assertFalse(denied[0]["target_inferred"])
+        error, _ = self.fail({"status": "ERROR", "denied_actions": [{"action": "read_file"}]},
+                             steps=[("ACTIVE", "other", {"path": "wrong.md"})])
+        self.assertIsNone(error.denials[0]["target"])
+        self.assertFalse(error.denials[0]["target_inferred"])
+
+    def test_work_adds_control_directory_and_check_slots_once(self):
+        control = str(self.root / "thread")
+        slots = str(self.root / "check-slots")
+        error, _ = self.fail(work=True, opts={"control_dir": control,
+                                              "add_dirs": [control, slots, "../check-slots"]})
+        self.assertEqual(error.diagnostics["args"]["--add-dir"], [control, slots])
+
+    def test_discussion_adds_overflow_directory_and_configured_directories_once(self):
+        slots = str(self.root / "check-slots")
+        error, _ = self.fail(prompt="x" * 20001, opts={"add_dirs": [slots, slots]})
+        self.assertEqual(error.diagnostics["args"], {"--add-dir": [slots, str(self.root)], "--mode": []})
+        self.assertIn(str(self.root / "long_message_"), self.command[2])
+        self.assertEqual(list(self.root.glob("long_message_*.md")), [])
 
     def test_error_and_raw_events_are_redacted_before_persistence(self):
         result = {"status": "ERROR", "error": 'authentication failed password="password-secret"',

@@ -205,30 +205,38 @@ def call_error(message: str, result, *texts: str, **kwargs) -> CallError:
 
 CLAUDE_TOOL_ACTIONS = {"Bash": "command", "WebFetch": "read_url", "WebSearch": "web_search", "Read": "read_file",
                        "Edit": "write_file", "Write": "write_file", "MultiEdit": "write_file", "NotebookEdit": "write_file"}
+TOOL_KEYS = ("file_path", "path", "AbsolutePath", "TargetFile", "notebook_path", "command", "CommandLine",
+             "pattern", "Query", "query", "url", "Url", "SearchPath")
 
 
 def _norm(name: str) -> str:
     return re.sub(r"[^a-z0-9]", "", (name or "").lower())
 
 
-def tool_target(params: dict) -> Optional[str]:
-    value = next((str(params[k]) for k in TOOL_KEYS if isinstance(params, dict) and params.get(k)), "")
+def tool_target(params: dict, keys: tuple = TOOL_KEYS) -> Optional[str]:
+    value = next((str(params[k]) for k in keys if isinstance(params, dict) and params.get(k)), "")
     value = " ".join(value.split())
     return (value[:200] + ("…" if len(value) > 200 else "")) or None
 
 
 def agy_denials(denied: list, steps: list) -> list:
-    """同名工具的最後一次呼叫只能作為推定目標，不能證明該次呼叫被拒。"""
+    """優先採用拒絕事件明示的目標，否則從最近一次同名工具步驟推定。"""
+    keys = ("target", *TOOL_KEYS)
     out = []
     for d in denied or []:
         if not isinstance(d, dict):
             continue
-        names = {_norm(d.get("action")), _norm(d.get("display_name"))} - {""}
-        step = next((params for name, params in reversed(steps) if _norm(name) in names), None)
-        target = tool_target(redact(step or d))
-        out.append({"action": d.get("action") or d.get("display_name") or "unknown",
-                    "target": f"推定目標：{redact(target)}" if target and step is not None else redact(target),
-                    "target_inferred": bool(target and step is not None)})
+        fields = redact(d)
+        target = tool_target(fields, keys) or tool_target(fields.get("parameters"), keys)
+        inferred = False
+        if not target:
+            names = {_norm(d.get("action")), _norm(d.get("display_name"))} - {""}
+            step = next((params for name, params in reversed(steps) if _norm(name) in names), None)
+            target = tool_target(redact(step), keys)
+            inferred = bool(target)
+        out.append({"action": fields.get("action") or fields.get("display_name") or "unknown",
+                    "target": f"推定目標：{target}" if inferred else target,
+                    "target_inferred": inferred})
     return out
 
 
@@ -287,10 +295,6 @@ class Live:
                     p.unlink(missing_ok=True)
                 except OSError:
                     pass
-
-
-TOOL_KEYS = ("file_path", "path", "AbsolutePath", "TargetFile", "notebook_path", "command", "CommandLine",
-             "pattern", "Query", "query", "url", "Url", "SearchPath")
 
 
 def describe_tool(name: str, params: dict, workspace: Path) -> str:
@@ -735,8 +739,18 @@ def call_antigravity(prompt: str, session_id: Optional[str], opts: dict, work: b
             overflow.write_text(prompt, encoding="utf-8")
             prompt = f"這則訊息較長，完整內容在 {overflow}，請先讀取該檔再照內容回覆。"
         cmd = [find_agy(), "-p", prompt, "--output-format", "stream-json", "--print-timeout", f"{timeout}s"]
+        add_dirs = []
         if work and opts.get("control_dir"):
-            cmd += ["--add-dir", opts["control_dir"]]
+            add_dirs.append(opts["control_dir"])
+        add_dirs.extend(opts.get("add_dirs") or [])
+        if overflow:
+            add_dirs.append(overflow.parent)
+        seen_dirs = set()
+        for directory in add_dirs:
+            key = os.path.normcase(os.path.abspath(workspace / directory))
+            if key not in seen_dirs:
+                cmd += ["--add-dir", str(directory)]
+                seen_dirs.add(key)
         if work:
             # 只有接手工作時開放改檔：accept-edits 允許寫工作區內的檔案，工作區外仍會被拒絕。
             # 不在全域權限加 write_file，否則同一個工作區的討論也能改檔。
@@ -752,8 +766,10 @@ def call_antigravity(prompt: str, session_id: Optional[str], opts: dict, work: b
         def on_event(e):
             stats.event(e)
             step = e.get("step_update") or {}
-            if e.get("event") == "step_update" and step.get("step_type") == "tool" and step.get("state") == "ACTIVE":
-                steps.append((step.get("tool_name") or "", (step.get("tool_info") or {}).get("parameters") or {}))
+            if e.get("event") == "step_update" and step.get("step_type") == "tool":
+                params = (step.get("tool_info") or {}).get("parameters")
+                if isinstance(params, dict) and params:
+                    steps.append((step.get("tool_name") or "", params))
             if live:
                 antigravity_event(live, e)
 

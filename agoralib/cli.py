@@ -1776,8 +1776,9 @@ def unverified_warning(relay: dict) -> Optional[str]:
         return None
     parts = []
     if relay.get("denied"):
-        parts.append("接手期間有工具被拒，之後卻宣告【工作完成】：被拒的來源可能沒有真的讀到，"
-                     "請查證結果的依據（例如被拒的網址、指令輸出），不要直接採用。")
+        detail = ("有被拒目標不明，仍需查證結果的依據" if any(not d.get("target") for d in relay["denied"])
+                  else "被拒的來源可能沒有真的讀到，請查證結果的依據（例如被拒的網址、指令輸出）")
+        parts.append(f"接手期間有工具被拒，之後卻宣告【工作完成】。{detail}，不要直接採用。")
     rounds = relay.get("interrupted_rounds") or 0
     if rounds:
         parts.append(f"接手期間有 {rounds} 輪 CLI 回報串流中斷（連線中斷，原因待查），回覆可能不完整："
