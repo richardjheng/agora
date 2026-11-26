@@ -84,11 +84,11 @@ WORK_PREAMBLE = """\
 {file_rule}
 
 工作方式：每完成一個小步驟（約 10~20 分鐘的工作量）就做以下三件事：
-1. 在 {progress} 末尾追加一段：時間、完成了什麼、改了哪些檔案、下一步是什麼。
+1. 在 {progress} 末尾追加一段：時間、完成了什麼、改了哪些檔案、下一步是什麼。{checkpoint_note}
 2. 讀 {control}；若 "stop_requested" 為 true，把交接說明寫進進度檔後結束這一輪，最後一行寫「【已暫停】」。
 3. 執行 `{agora} quota`；若你（{me}）的額度低於 {threshold:.0f}%，把交接說明寫進進度檔後結束，最後一行寫「【額度不足】」。
-全部完成時，執行 {finish_cmds}，在進度檔寫總結，回覆最後一行寫「【工作完成】」。
-執行 `{agora} check` 時可能因其他分派正在驗證而排隊，或測試本身耗時很長；排隊或執行中不要中斷，也不要因為耗時久就改判失敗。
+全部完成時，{finish_instruction}，在進度檔寫總結，回覆最後一行寫「【工作完成】」。
+{check_note}若執行 `{agora} check`，可能因其他分派正在驗證而排隊，或測試本身耗時很長。排隊或執行中不要中斷，也不要因為耗時久就改判失敗。
 這次的等級：{tier_line}。若判斷這個等級（模型）不足以完成，不要勉強：在進度檔寫明理由，回覆最後一行寫「【需要升級】」後結束。
 
 以下是 {owner} 的工作單：
@@ -132,7 +132,9 @@ FILE_RULES = {"codex": "Codex 沒有內建的讀檔工具：列目錄、讀檔�
 CONTINUE_PROMPT = """\
 【Agora 工作分派・繼續】
 請先讀 {progress} 與 {control}，從上次停下的地方繼續。界線與工作方式和第一輪相同：
-每完成一小步就更新進度檔、檢查 control.json、執行 `{agora} quota`；執行 `{agora} check` 可能排隊或耗時很長，排隊或執行中不要中斷、不要因為久就改判失敗；若因允許修改範圍不足而暫停，在進度檔用獨立一行 `需要範圍：a.py, tests/b.py` 列出需要的相對路徑；結束時最後一行寫「【工作完成】」「【已暫停】」「【額度不足】」或「【需要升級】」。
+每完成一小步就更新進度檔、檢查 control.json、執行 `{agora} quota`。{checkpoint_note}
+{check_note}若執行 `{agora} check`，排隊或執行中不要中斷，也不要因為耗時久就改判失敗。
+若因允許修改範圍不足而暫停，在進度檔用獨立一行 `需要範圍：a.py, tests/b.py` 列出需要的相對路徑。結束時最後一行寫「【工作完成】」「【已暫停】」「【額度不足】」或「【需要升級】」。
 """
 
 
@@ -1383,7 +1385,7 @@ def _cmd_resume_locked(ws: Workspace, args):
     if added_paths:
         print(f"已擴大允許修改範圍：{', '.join(added_paths)}（舊驗證結果已失效）")
     print(f"進度：{paths['progress']}")
-    print(f"查詢：{agora_cmd()} status {thread.name} --wait 900")
+    print(f"查詢：{agora_cmd()} status {thread.name} --wait 540")
 
 
 _REAL_WORKTREE_PREPARE = worktree.prepare
@@ -1554,7 +1556,7 @@ def _cmd_assign_locked(ws: Workspace, args):
     if baseline.get("error"):
         print(f"⚠️ 沒有記錄分派基準，無法用 changes 檢視變更：{baseline['error']}")
     print(f"進度：{paths['progress']}")
-    print(f"查詢：{agora_cmd()} status {thread.name} --wait 900")
+    print(f"查詢：{agora_cmd()} status {thread.name} --wait 540")
 
 
 def finish_finalize(thread: Path, relay: dict, meta: dict, error=None):
@@ -1603,12 +1605,23 @@ def cmd_finalize(ws: Workspace, args):
                 relay = {**meta, **relay, **{k: meta.get(k) for k in worktree.FIELDS}}
                 relay.setdefault("finalize_id", "committed-" + meta["commit_sha"])
             else:
-                verify_recovery_inactive(state, relay, latest, meta)
+                try:
+                    verify_recovery_inactive(state, relay, latest, meta)
+                except worktree.WorktreeError as exc:
+                    pids = dict.fromkeys(str(record["pid"]) for record in (relay, latest, state.get("finalizer") or {})
+                                         if record.get("pid"))
+                    pid_note = f"（紀錄中的 PID：{', '.join(pids)}）" if pids else ""
+                    raise worktree.WorktreeError(
+                        f"{exc}{pid_note}。若程序仍在執行，請等待：`{agora_cmd()} watch`，"
+                        f"或用 `{agora_cmd()} recall {thread.name} --wait 540` 請它停止並等待"
+                    ) from exc
                 if not meta.get("commit_sha"):
                     worktree.validate(meta)
                     message = Path(meta["commit_message"])
                     if not message.is_file() or not message.read_text(encoding="utf-8").strip():
-                        raise worktree.WorktreeError("缺少非空的 commit-message.md；請先寫明任務目的與測試範圍")
+                        raise worktree.WorktreeError(
+                            f"缺少非空的提交說明：{message}。主持方可補寫任務目的與測試範圍後重跑 finalize"
+                        )
                 clear_stop_for_recovery(thread, meta, "finalize")
                 relay = {**relay, "finalize_id": uuid.uuid4().hex, "status": "checking",
                          "finalize_previous_pid": relay.get("pid"),
@@ -1977,9 +1990,15 @@ def cmd_work(ws: Workspace, args):
                    agora=agora_cmd())
         cfg = task["commands"] if task else ws.config()
         has_build = bool(cfg.get("build"))
-        fmt.update(build_cmd=f"`{fmt['agora']} build`（建置專案）、" if has_build else "",
-                   finish_cmds=(f"`{fmt['agora']} build` 與 `{fmt['agora']} check`" if has_build
-                                else f"`{fmt['agora']} check`"))
+        agora = fmt["agora"]
+        fmt["build_cmd"] = f"`{agora} build`（建置專案）、" if has_build else ""
+        if task:
+            fmt.update(checkpoint_note=f"成果可交付時就先用檔案工具把提交說明寫到 {task['commit_message']}。",
+                       finish_instruction="先寫好 `commit-message.md`（任務目的與測試範圍）",
+                       check_note=f"Agora 收尾時會執行完整的 `{agora} check`，非必要不手動跑。\n")
+        else:
+            finish_cmds = f"`{agora} build` 與 `{agora} check`" if has_build else f"`{agora} check`"
+            fmt.update(checkpoint_note="", finish_instruction=f"執行 {finish_cmds}", check_note="")
         if relay.get("session_id"):
             prompt = CONTINUE_PROMPT.format(**fmt) + denial_note
             if relay["rounds"] == 0:
@@ -2003,8 +2022,7 @@ def cmd_work(ws: Workspace, args):
         if task:
             prompt += (f"\n\n分派 ID：{task['dispatch_id']}；branch：{task['branch']}；base SHA：{task['base_sha']}。"
                        f"\n只可修改：{', '.join(task['allowed_paths'])}。控制設定維持在 {task['control_root']}/.agora。"
-                       f"\n宣告完成前，用檔案工具把提交說明（任務目的與測試範圍）寫到 {task['commit_message']}。"
-                       "\n請停止所有子工作後再宣告完成；Agora 會執行 check，成功後代為 commit；失敗保留成果且不提交。")
+                       "\n請停止所有子工作後再宣告完成；驗證成功後 Agora 代為 commit，失敗則保留成果。")
         if relay.get("subagents") is True:
             prompt += ("\n能獨立進行的子工作（大量搜尋、讀檔、互不重疊的修改）用子代理並行，小工作自己做。"
                        "寫入子工作須分配互不重疊的檔案，由父代理整合驗證；子代理共用此 worktree，這不是強制隔離。")
@@ -2238,6 +2256,7 @@ def cmd_status(ws: Workspace, args):
         return
     blocks = progress_blocks(thread)
     code = relay_exit_code(relay, alive)
+    timeout_message = f"等待逾時（{args.wait} 秒），任務仍在 {relay['status']}" if timed_out else None
     req_scope = (requested_scope(thread, relay.get("allowed_paths"))
                  if not alive and relay.get("dispatch_id") and relay.get("status") != "done"
                  and relay.get("commit_status") != "committed" and not relay.get("commit_sha") else [])
@@ -2254,7 +2273,7 @@ def cmd_status(ws: Workspace, args):
             environment_hint = f"{agora_cmd()} assign {thread.name} --resume {relay['dispatch_id']} --from {sender}"
     if args.json:
         print(json.dumps({"status": relay.get("status"), "worker": relay.get("worker"), "alive": alive,
-                          "rounds": relay.get("rounds", 0), "timed_out": timed_out,
+                          "rounds": relay.get("rounds", 0), "timed_out": timed_out, "timeout_message": timeout_message,
                           "waiting_until": relay.get("waiting_until"), "updated": relay.get("updated"),
                           "started": relay.get("started"), "error": relay.get("error"),
                           "blocked_reason": relay.get("blocked_reason"),
@@ -2266,8 +2285,8 @@ def cmd_status(ws: Workspace, args):
                           "failure_summary": failure_baseline.describe({**relay, "thread": str(thread)}),
                           **relay_model_fields(relay), "exit_code": code}, ensure_ascii=False, indent=2))
     else:
-        if timed_out:
-            print(f"⏳ 等待 {args.wait} 秒逾時，接手方仍在進行（狀態：{relay['status']}）")
+        if timeout_message:
+            print(timeout_message)
         waiting = f"，等到 {quota.fmt_time(relay['waiting_until'])}" if relay.get("waiting_until") else ""
         resumed = f"｜續跑第 {relay['resume_count']} 次" if relay.get("resume_count") else ""
         print(f"接手方：{NAMES[relay['worker']]}｜狀態：{relay['status']}{waiting}｜已跑 {relay.get('rounds', 0)} 輪{resumed}｜"
@@ -2330,7 +2349,7 @@ def cmd_recall(ws: Workspace, args):
     add_system_note(thread, f"🔁 已要求停止接手：{eta}。")
     print(f"已要求停止接手：{eta}。")
     if args.wait is None:
-        print(f"用 {agora_cmd()} recall {thread.name} --wait 或 status {thread.name} --wait 600 等它停下。")
+        print(f"用 {agora_cmd()} recall {thread.name} --wait 540 或 {agora_cmd()} status {thread.name} --wait 540 等它停下。")
         return
     relay, alive, timed_out = wait_relay(thread, args.wait)
     if timed_out:

@@ -32,7 +32,7 @@ description: 額度快用完時把工作交接給還有額度的 AI（Antigravit
 ## C. 喚醒後收回
 
 1. `python D:/github/agora/agora.py recall <thread>`
-2. `python D:/github/agora/agora.py status <thread> --wait 900`（Bash timeout 設 960000），等接手方停在檢查點。
+2. `python D:/github/agora/agora.py status <thread> --wait 540`（Bash timeout 設 600000），等接手方停在檢查點。
 3. 讀 `.agora/threads/<thread>/progress.md` 和 `git diff`（比對 base SHA...branch，只含已 commit 的成果）；提前收回時接手方可能還沒 commit，另外在任務 worktree 執行 `git status` 與 `git diff` 查看未提交與未追蹤的修改，**逐項查證**接手方的改動：
    - 有沒有超出交接範圍
    - 測試是否通過
