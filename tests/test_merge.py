@@ -22,11 +22,14 @@ except ImportError:
 
 
 class MergeTestBase(unittest.TestCase):
-    setUp = fixtures.WorktreeTests.setUp
     task = fixtures.WorktreeTests.task
     message = fixtures.WorktreeTests.message
     modify = fixtures.WorktreeTests.modify
     venv = fixtures.WorktreeTests.venv
+
+    def setUp(self):
+        fixtures.WorktreeTests.setUp(self)
+        os.environ.pop(cli.NESTED_ENV, None)
 
     def configure_parties(self):
         config.save(self.root, {
@@ -212,6 +215,7 @@ class TestBranchNamingAndOwnership(MergeTestBase):
                 patch.object(cli, "party_usage", return_value={"remaining_pct": 80, "updated_at": time.time()}), \
                 patch.object(cli.quota, "blocked", return_value=None), \
                 patch.object(cli.models, "CACHE", self.root / "models.json"), \
+                patch.object(cli, "missing_agy_commands", return_value=()), \
                 patch.object(cli.jobs, "spawn", return_value=88888888), \
                 patch.object(cli.jobs, "pid_started", return_value=456.0):
             cli.cmd_assign(ws, good_resume)

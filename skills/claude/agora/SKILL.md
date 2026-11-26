@@ -97,6 +97,8 @@ python D:/github/agora/agora.py watch                          # 同時有分派
 - **零權重 AI 實作覆寫**：若被指定的接手方分配比例為 0，另需加上 `--user-override`（僅在使用者明確指定時才使用；例如 `--to claude --reason "使用者指定" --user-override`）。
 
 ### 分支與 Worktree 隔離流程
+
+- **Antigravity 權限**：升級後請重新執行 `agora install` 補上新增的指令權限。派工與續跑缺少 `quota`、`check` 或專案設定的 `build` 權限時會拒絕分派。缺少 `test` 權限時會警告，工作說明會省略局部測試指令，完整驗證由 Agora 收尾執行。
 - **獨立 Branch 與 Worktree**：每次新分派會建立獨立 `<ai>/<slug>-<7 碼分派 ID>` branch（前綴 `claude/`、`codex/`、`agy/`，slug 預設取討論串標題並可用 `assign --name <slug>` 覆寫；改派續跑不改名；舊分派 `agora/<分派 ID>` 原樣相容）與獨立 git worktree（位於 `.agora/worktrees/<完整分派 ID>`；同 AI 多任務各一份）。接手 CLI 的工作目錄設為該 worktree，進度檔、control.json 與 `.agora/` 設定維持在主工作區。
 - **獨立環境與建置**：每個 worktree 各建 `.venv` 並安裝依賴與可解析的 `dev`／`test`／`tests` extras，建置輸出留在該 worktree。依賴宣告變更時，下次 `agora check` 會先重裝並驗證環境。暫時性 pip 重試記於分派的 `environment.log`。環境失敗時依 `status` 提示續跑，先結束手動啟動且仍使用該環境的程序，`assign --resume` 會在鎖內重建及驗證。
 - **由 Agora 代做 Commit**：隔離分派的接手方在開發中可用不帶參數的 `agora test` 跑相關測試（目標寫在分派控制目錄的 `test-targets.txt`，沒寫時依變更自動挑；僅局部驗證、不作為提交依據，絕不退回完整測試），成果可交付時先寫好 `commit-message.md`（任務目的、測試範圍），再宣告完成。Agora 核對分派、branch 與檔案範圍後執行完整的 `agora check`，附上真實結果後代為 commit。接手方非必要不手動跑完整驗證，也不要自行 git commit。非隔離分派由接手方在宣告完成前執行 `agora check`，若設定了建置指令也要執行 `agora build`。分派與收尾不自動 push / merge。

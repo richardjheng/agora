@@ -30,6 +30,7 @@ def _process_resume_worker(root, thread_name, dispatch_id, result_file):
         with patch.dict(os.environ, {cli.NESTED_ENV: ""}), patch("sys.stdout", io.StringIO()), \
                 patch.object(cli.sandbox, "network_restricted", return_value=False), \
                 patch.object(cli.sandbox, "is_codex_sandbox", return_value=False), \
+                patch.object(cli, "missing_agy_commands", return_value=()), \
                 patch.object(cli, "party_usage", return_value={"remaining_pct": 80, "updated_at": time.time()}), \
                 patch.object(cli.quota, "blocked", return_value=None), \
                 patch.object(cli.models, "CACHE", Path(root) / "models.json"), \
@@ -42,11 +43,16 @@ def _process_resume_worker(root, thread_name, dispatch_id, result_file):
 
 
 class ResumeTests(unittest.TestCase):
-    setUp = fixtures.WorktreeTests.setUp
     task = fixtures.WorktreeTests.task
     message = fixtures.WorktreeTests.message
     modify = fixtures.WorktreeTests.modify
     venv = fixtures.WorktreeTests.venv
+
+    def setUp(self):
+        fixtures.WorktreeTests.setUp(self)
+        permissions = patch.object(cli, "missing_agy_commands", return_value=())
+        permissions.start()
+        self.addCleanup(permissions.stop)
 
     def configure(self):
         config.save(self.root, {

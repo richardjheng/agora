@@ -846,6 +846,29 @@ def relay_paths(thread: Path) -> dict:
     return {"progress": thread / "progress.md", "control": thread / "control.json", "log": thread / "worker.log"}
 
 
+def agy_work_permissions(worker: str, agora: str, has_build: bool) -> Tuple[Optional[str], Optional[str]]:
+    """回傳工作所需的權限錯誤與局部測試警告。"""
+    if worker != "antigravity":
+        return None, None
+    missing = missing_agy_commands(agora)
+    required = {"quota", "check", "build"} if has_build else {"quota", "check"}
+    blocked = [f"`{agora} {sub}`" for sub in missing if sub in required]
+    if blocked:
+        return f"Antigravity 缺少必要指令權限（{'、'.join(blocked)}）。請執行 `agora install` 補上。", None
+    if "test" in missing:
+        return None, (f"Antigravity 缺少 `{agora} test` 權限，這次工作說明會省略局部測試指令。"
+                      "請執行 `agora install` 補上。")
+    return None, None
+
+
+def guard_agy_assignment(worker: str, commands: dict):
+    error, warning = agy_work_permissions(worker, agora_cmd(), bool(commands.get("build")))
+    if error:
+        sys.exit(error)
+    if warning:
+        print(f"⚠️ {warning}")
+
+
 def update_relay(thread: Path, **fields) -> dict:
     with thread_lock(thread, wait=WORKER_LOCK_WAIT):
         state = load_state(thread)
@@ -1246,6 +1269,7 @@ def _cmd_resume_locked(ws: Workspace, args):
                     f"此分派已提交（commit {meta.get('commit_sha') or '已存在'}），無法續跑；請改開新分派。")
             worktree.validate(meta)
             control = read_control_for_recovery(thread)
+            guard_agy_assignment(worker, meta.get("commands") or {})
             if allow_arg:
                 added_paths = worktree.extend_scope(meta, allow_arg, reason, owner, at=now_str())
             else:
@@ -1466,6 +1490,9 @@ def _cmd_assign_locked(ws: Workspace, args):
         print(f"指定接手方：{describe_candidate(worker, decision['candidates'][worker])}")
     else:
         worker, plan, decision = pick_worker(ws, owner, ws.enabled(), state, tier, model_arg, effort_arg)
+    cfg = ws.config()
+    commands = {k: cfg.get(k) for k in LOCKED_KEYS}
+    guard_agy_assignment(worker, commands)
     subagents_arg = getattr(args, "subagents", None)
     subagents = subagents_arg == "on"
     mark = quota.blocked(worker)
@@ -1477,11 +1504,11 @@ def _cmd_assign_locked(ws: Workspace, args):
         task = _prepare_worktree(
             ws.root, dispatch_id, getattr(args, "allow", None), thread,
             worker=worker, title=state.get("topic"), name=getattr(args, "name", None),
-            build_outputs=ws.config().get("build_outputs"),
+            build_outputs=cfg.get("build_outputs"),
         )
     except (worktree.WorktreeError, OSError, subprocess.SubprocessError) as exc:
         sys.exit(f"無法建立隔離分派：{exc}；已建立的資源保留，不自動覆蓋或刪除。")
-    task["commands"] = {k: ws.config().get(k) for k in LOCKED_KEYS}
+    task["commands"] = commands
     task.update(worker=worker, started=now_str())
     worktree.save(task)
     if task["source_dirty"]:
@@ -1956,6 +1983,7 @@ def cmd_work(ws: Workspace, args):
 
     # 輪數上限只算真正跑完的輪；等額度、被拒重試不算（等待有時間間隔，被拒重試另有上限，不會空轉）
     denial_retries, quota_retries, denial_note = 0, 0, ""
+    test_warning_recorded = False
     run_rounds = 0 if relay.get("resume_count") else relay.get("rounds", 0)
     while run_rounds < MAX_WORK_ROUNDS:
         if stop_requested(thread):
@@ -1966,6 +1994,16 @@ def cmd_work(ws: Workspace, args):
         if config.shares(ws.control_root)[worker] == 0 and not (relay.get("user_override") and relay.get("reason")):
             update_relay(thread, status="stopped", error="零權重實作未取得使用者明確覆寫。")
             append_progress(thread, "零權重接手已停止", routing.ZERO_SHARE_ROLE)
+            return
+
+        cfg = task["commands"] if task else ws.config()
+        has_build = bool(cfg.get("build"))
+        agora = agora_cmd()
+        permission_error, test_warning = agy_work_permissions(worker, agora, has_build)
+        if permission_error:
+            update_relay(thread, status="blocked", waiting_until=None, error=permission_error,
+                         blocked_reason="缺少必要指令權限")
+            append_progress(thread, "Antigravity 接手已停止", permission_error)
             return
 
         usage = party_usage(worker, relay.get("model"))
@@ -1983,32 +2021,37 @@ def cmd_work(ws: Workspace, args):
             quota.refresh(force=True)
             continue
 
+        if test_warning and not test_warning_recorded:
+            append_progress(thread, "Antigravity 局部測試權限提醒", test_warning)
+            test_warning_recorded = True
         relay = update_relay(thread, status="running", waiting_until=None, round_started=time.time())
         fmt = dict(me=NAMES[worker], owner=NAMES[owner], human=NAMES[HUMAN], workspace=work_root, file_rule=FILE_RULES.get(worker, FILE_RULE),
                    tier_line=(f"{config.TIER_LABELS.get(relay.get('tier'), '未指定')}（{relay.get('model') or 'CLI 預設模型'}）"
                               if relay.get("frozen") else "未指定"),
                    progress=paths["progress"], control=paths["control"], threshold=quota.THRESHOLD_PCT,
-                   agora=agora_cmd())
-        cfg = task["commands"] if task else ws.config()
-        has_build = bool(cfg.get("build"))
-        agora = fmt["agora"]
+                   agora=agora)
         fmt["build_cmd"] = f"`{agora} build`（建置專案）、" if has_build else ""
         if task:
-            targets_file = targeted.targets_file_path(task)
             fmt.update(
-                test_cmd=f"`{agora} test`（跑相關測試）、",
+                test_cmd="",
                 checkpoint_note=f"成果可交付時就先用檔案工具把提交說明寫到 {task['commit_message']}。",
                 finish_instruction="先寫好 `commit-message.md`（任務目的與測試範圍）",
-                check_note=(
-                    f"開發中用 `{agora} test` 跑相關測試，目標寫在 {targets_file}，沒寫時依變更自動挑；完整驗證交給 Agora 收尾。\n"
-                    f"Agora 收尾時會執行完整的 `{agora} check`，非必要不手動跑。\n"
-                ),
+                check_note=f"Agora 收尾時會執行完整的 `{agora} check`，非必要不手動跑。\n",
             )
+            if not test_warning:
+                targets_file = targeted.targets_file_path(task)
+                fmt["test_cmd"] = f"`{agora} test`（跑相關測試）、"
+                fmt["check_note"] = (
+                    f"開發中用 `{agora} test` 跑相關測試，目標寫在 {targets_file}，沒寫時依變更自動挑；完整驗證交給 Agora 收尾。\n"
+                    + fmt["check_note"]
+                )
         else:
             finish_cmds = f"`{agora} build` 與 `{agora} check`" if has_build else f"`{agora} check`"
             fmt.update(test_cmd="", checkpoint_note="", finish_instruction=f"執行 {finish_cmds}", check_note="")
         if relay.get("session_id"):
             prompt = CONTINUE_PROMPT.format(**fmt) + denial_note
+            if test_warning:
+                prompt += "\n本輪缺少局部測試指令的權限，請略過該指令。\n"
             if relay["rounds"] == 0:
                 prompt += f"\n\n{NAMES[owner]} 的工作單：\n{relay.get('handoff') or ''}"
         else:
@@ -2869,6 +2912,20 @@ def command_python(spec) -> Optional[str]:
 
 
 AGENT_COMMANDS = ("quota", "check", "test", "build")   # 接手方可以執行的 Agora 子指令（不帶參數）
+
+
+def missing_agy_commands(agora: str) -> Tuple[str, ...]:
+    """依工作說明或安裝計畫的指令形式，完整比對 Antigravity 的全域權限。"""
+    try:
+        path = Path.home() / ".gemini" / "antigravity-cli" / "settings.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, RuntimeError):
+        return AGENT_COMMANDS
+    permissions = data.get("permissions") if isinstance(data, dict) else None
+    allow = permissions.get("allow") if isinstance(permissions, dict) else None
+    if not isinstance(allow, list) or not all(isinstance(rule, str) for rule in allow):
+        return AGENT_COMMANDS
+    return tuple(sub for sub in AGENT_COMMANDS if f"command({agora} {sub})" not in allow)
 
 
 def run_configured_command(spec, cwd: Path, *, pytest_without_cache=False) -> subprocess.CompletedProcess:
@@ -3792,9 +3849,7 @@ def install_status(ws: Workspace) -> dict:
     else:
         check("Hook 啟動器（.agora/hook.py）", False, lambda pl: False)
     if agy_cmds:   # 指令權限是全域設定，不能用來判斷這個專案有沒有裝；裝過才比對是否缺了新的指令
-        allow = _hook_commands(Path.home() / ".gemini" / "antigravity-cli" / "settings.json",
-                               lambda d: (d.get("permissions") or {}).get("allow") or [])
-        check("Antigravity 指令權限", True, lambda pl: all(f"command({pl['cmd']} {sub})" in allow for sub in AGENT_COMMANDS))
+        check("Antigravity 指令權限", True, lambda pl: not missing_agy_commands(pl["cmd"]))
     present = len(checked) - len(missing)
     state = ("installed" if not missing and not outdated else "outdated" if not missing
              else "partial" if present else "missing")
