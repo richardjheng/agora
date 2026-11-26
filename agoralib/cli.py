@@ -36,7 +36,7 @@ try:
 except ImportError:  # Python 3.9 and 3.10
     tomllib = None
 
-from agoralib import __version__, checkqueue, completions, config, jobs, merge, models, prune, quota, routing, sandbox, shares, snapshot, worktree
+from agoralib import __version__, checkqueue, completions, config, jobs, merge, models, prune, quota, routing, sandbox, shares, snapshot, targeted, worktree
 from agoralib import baseline as failure_baseline
 from agoralib.parties import (AGORA_ROOT as AGORA_ROOT_DIR, AI_PARTIES, CALLERS, HUMAN, NAMES,
                               LOCKED_ENV, NESTED_ENV, CallError, Live, agora_cmd, canonical,
@@ -80,7 +80,7 @@ WORK_PREAMBLE = """\
 - 不要執行會影響外部系統的動作（下單、發訊息、部署）。
 
 終端指令只能用以下幾個，而且必須一字不差、不能加任何參數（部分 CLI 的權限是完整比對）：
-`{agora} quota`（查額度）、{build_cmd}`{agora} check`（工作區的驗證，例如語法檢查與測試）、`git status`、`git diff`、`git log`。
+`{agora} quota`（查額度）、{build_cmd}{test_cmd}`{agora} check`（工作區的驗證，例如語法檢查與測試）、`git status`、`git diff`、`git log`。
 {file_rule}
 
 工作方式：每完成一個小步驟（約 10~20 分鐘的工作量）就做以下三件事：
@@ -1994,12 +1994,19 @@ def cmd_work(ws: Workspace, args):
         agora = fmt["agora"]
         fmt["build_cmd"] = f"`{agora} build`（建置專案）、" if has_build else ""
         if task:
-            fmt.update(checkpoint_note=f"成果可交付時就先用檔案工具把提交說明寫到 {task['commit_message']}。",
-                       finish_instruction="先寫好 `commit-message.md`（任務目的與測試範圍）",
-                       check_note=f"Agora 收尾時會執行完整的 `{agora} check`，非必要不手動跑。\n")
+            targets_file = targeted.targets_file_path(task)
+            fmt.update(
+                test_cmd=f"`{agora} test`（跑相關測試）、",
+                checkpoint_note=f"成果可交付時就先用檔案工具把提交說明寫到 {task['commit_message']}。",
+                finish_instruction="先寫好 `commit-message.md`（任務目的與測試範圍）",
+                check_note=(
+                    f"開發中用 `{agora} test` 跑相關測試，目標寫在 {targets_file}，沒寫時依變更自動挑；完整驗證交給 Agora 收尾。\n"
+                    f"Agora 收尾時會執行完整的 `{agora} check`，非必要不手動跑。\n"
+                ),
+            )
         else:
             finish_cmds = f"`{agora} build` 與 `{agora} check`" if has_build else f"`{agora} check`"
-            fmt.update(checkpoint_note="", finish_instruction=f"執行 {finish_cmds}", check_note="")
+            fmt.update(test_cmd="", checkpoint_note="", finish_instruction=f"執行 {finish_cmds}", check_note="")
         if relay.get("session_id"):
             prompt = CONTINUE_PROMPT.format(**fmt) + denial_note
             if relay["rounds"] == 0:
@@ -2055,7 +2062,9 @@ def cmd_work(ws: Workspace, args):
             opts["env"][LOCKED_ENV] = json.dumps({k: cfg.get(k) for k in LOCKED_KEYS}, ensure_ascii=False)
             slots = checkqueue.slots_dir(task["control_root"])
             slots.mkdir(parents=True, exist_ok=True)
-            opts["add_dirs"] = [str(thread), str(slots)]
+            test_slots = checkqueue.slots_dir(task["control_root"], dirname=checkqueue.TEST_SLOTS_DIRNAME)
+            test_slots.mkdir(parents=True, exist_ok=True)
+            opts["add_dirs"] = [str(thread), str(slots), str(test_slots)]
             opts["control_dir"] = str(thread)
         # 呼叫前固定本輪請求；結束時與回報一起保存，執行中仍顯示上一輪完整的請求／回報。
         requested = {"model": opts.get("model") or None, "effort": opts.get("effort") or None}
@@ -2859,7 +2868,7 @@ def command_python(spec) -> Optional[str]:
     return os.path.abspath(first) if Path(first).is_absolute() else (shutil.which(first) or first)
 
 
-AGENT_COMMANDS = ("quota", "check", "build")   # 接手方可以執行的 Agora 子指令（不帶參數）
+AGENT_COMMANDS = ("quota", "check", "test", "build")   # 接手方可以執行的 Agora 子指令（不帶參數）
 
 
 def run_configured_command(spec, cwd: Path, *, pytest_without_cache=False) -> subprocess.CompletedProcess:
@@ -2998,6 +3007,11 @@ def check_slot_context(ws: Workspace) -> Tuple[Path, Optional[Path], str]:
         except (OSError, ValueError, KeyError):
             pass
     return ws.control_root.resolve(), None, ws.root.name
+
+
+def cmd_test(ws: Workspace, args):
+    """隔離分派的局部相關測試（讀 test-targets.txt 或依變更自動挑選；不作為提交依據）"""
+    return targeted.cmd_test(ws, args)
 
 
 def cmd_check(ws: Workspace, args):
@@ -4208,6 +4222,9 @@ def main(argv=None):
     p.add_argument("--task", metavar="討論串",
                    help="審查用：在該分派的 worktree 以它自己的 .venv 與分派時凍結的測試指令驗證（與 Agora 代做 commit 時相同）")
     p.set_defaults(func=cmd_check)
+
+    p = sub.add_parser("test", help="隔離分派內執行相關測試（讀 test-targets.txt 或依變更自動挑選；不作為提交依據）")
+    p.set_defaults(func=cmd_test)
 
     p = sub.add_parser("quota", help="三方剩餘額度")
     p.add_argument("--refresh", action="store_true", help="忽略快取重新查詢")

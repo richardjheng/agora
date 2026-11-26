@@ -20,6 +20,7 @@ from typing import Callable, List, Optional, Tuple
 from agoralib import config, jobs
 
 SLOTS_DIRNAME = "check-slots"
+TEST_SLOTS_DIRNAME = "test-slots"
 DEFAULT_POLL_INTERVAL = 0.25
 DEFAULT_REPORT_INTERVAL = 15.0
 
@@ -28,8 +29,8 @@ class CheckStopped(Exception):
     """等待驗證槽位期間收到 stop_requested，取消驗證（非測試失敗）。"""
 
 
-def slots_dir(control_root: Path) -> Path:
-    return Path(control_root) / ".agora" / SLOTS_DIRNAME
+def slots_dir(control_root: Path, dirname: str = SLOTS_DIRNAME) -> Path:
+    return Path(control_root) / ".agora" / dirname
 
 
 @contextmanager
@@ -166,10 +167,11 @@ def acquire_slot(
     poll_interval: float = DEFAULT_POLL_INTERVAL,
     report_interval: float = DEFAULT_REPORT_INTERVAL,
     output: Optional[Callable[[str], None]] = None,
+    dirname: str = SLOTS_DIRNAME,
 ):
-    """取得跨分派 check 驗證槽位（嚴格 FIFO），離開（含例外／KeyboardInterrupt／SystemExit）時必釋放。"""
+    """取得跨分派驗證槽位（嚴格 FIFO），離開（含例外／KeyboardInterrupt／SystemExit）時必釋放。"""
     control_root = Path(control_root).resolve()
-    directory = slots_dir(control_root)
+    directory = slots_dir(control_root, dirname=dirname)
     effective_limit = _normalize_limit(control_root, limit)
     emit = output or (lambda msg: print(msg, flush=True))
 

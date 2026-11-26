@@ -2753,9 +2753,10 @@ class TestBuildAndSandbox(unittest.TestCase):
     def test_work_preamble_mentions_build_only_when_configured(self):
         fmt = dict(me="Codex", owner="Claude", human="Richard", workspace="W", progress="P", control="C",
                    threshold=5, agora="agora")
-        text = cli.WORK_PREAMBLE.format(**fmt, build_cmd="", checkpoint_note="", check_note="",
+        text = cli.WORK_PREAMBLE.format(**fmt, build_cmd="", test_cmd="", checkpoint_note="", check_note="",
                                         finish_instruction="執行 `agora check`", file_rule=cli.FILE_RULE, tier_line="未指定")
         self.assertNotIn("agora build", text)
+        self.assertNotIn("agora test", text)
 
 
 class TestCoreInfo(unittest.TestCase):

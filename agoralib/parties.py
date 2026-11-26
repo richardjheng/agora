@@ -844,7 +844,8 @@ def call_claude(prompt: str, session_id: Optional[str], opts: dict, work: bool, 
         # 可改檔；Bash 只開放 Agora 的固定指令與唯讀 git，其餘在非互動模式下會被拒絕
         cmd += ["--permission-mode", "acceptEdits",
                 "--allowedTools", f"Bash({agora_cmd()} quota*)", f"Bash({agora_cmd()} check*)",
-                f"Bash({agora_cmd()} build*)", "Bash(git status*)", "Bash(git diff*)", "Bash(git log*)",
+                f"Bash({agora_cmd()} test*)", f"Bash({agora_cmd()} build*)",
+                "Bash(git status*)", "Bash(git diff*)", "Bash(git log*)",
                 "--disallowedTools", "Read(./.env)", "Edit(./.env)", "Edit(./.agora/config.json)",
                 # hook 與自動執行的設定：改了等於能執行任意指令（另見 cli.guard_files，事後一律還原）
                 "Edit(./.claude/**)", "Edit(./.agents/**)", "Edit(./.codex/**)", "Edit(./.git/**)",
