@@ -3057,10 +3057,14 @@ def check_workspace(ws: Workspace):
         sys.exit(1 if errors or os.getenv(worktree.MANIFEST_ENV) else 0)
     control_root, task_thread, slot_label = check_slot_context(ws)
     stop_check = (lambda: stop_requested(task_thread)) if task_thread else None
+    wait_start = time.monotonic()
     try:
         with checkqueue.acquire_slot(control_root, label=slot_label, stop_check=stop_check):
+            run_start = time.monotonic()
+            wait_seconds = round(max(0.0, run_start - wait_start), 3)
             proc = (run_configured_command(check, ws.root, pytest_without_cache=True)
                     if isolated else run_configured_command(check, ws.root))
+            run_seconds = round(max(0.0, time.monotonic() - run_start), 3)
     except checkqueue.CheckStopped as e:
         sys.exit(str(e))
     except PermissionError as e:
@@ -3068,9 +3072,33 @@ def check_workspace(ws: Workspace):
     except ValueError as e:
         sys.exit(str(e))
     if os.getenv(failure_baseline.RECORD_ENV):
+        import locale
+        from agoralib.parties import redact
+        env_keys = (
+            "PYTHONPATH",
+            "PYTHONUTF8",
+            "PYTHONIOENCODING",
+            "VIRTUAL_ENV",
+            "PYTHONNOUSERSITE",
+            "PYTHONHOME",
+        )
+        env_summary = redact({
+            "agora_version": __version__,
+            "python": command_python(check) or sys.executable,
+            "agora_python": sys.executable,
+            "command": check,
+            "cwd": str(ws.root),
+            "stdout_encoding": getattr(sys.stdout, "encoding", None) or "<未知>",
+            "locale_encoding": locale.getpreferredencoding(False) or "<未知>",
+            "env": {k: (os.environ[k] if k in os.environ else "<未設定>") for k in env_keys},
+        })
         completions.atomic_write(Path(os.environ[failure_baseline.RECORD_ENV]), {
             "complete": True, "syntax_errors": len(errors), "exit_code": proc.returncode,
-            "check_command": check, "output": proc.stdout + proc.stderr})
+            "check_command": check, "output": proc.stdout + proc.stderr,
+            "wait_seconds": wait_seconds, "run_seconds": run_seconds,
+            "timing": {"wait_seconds": wait_seconds, "run_seconds": run_seconds},
+            "environment": env_summary,
+        })
     keep, in_failure = [], False
     for line in proc.stderr.splitlines() + proc.stdout.splitlines():
         if line.startswith(("ERROR:", "FAIL:")):

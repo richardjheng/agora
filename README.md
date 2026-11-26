@@ -492,6 +492,17 @@ pip 使用 UTF-8，遇到暫時性錯誤最多重試三次。重試間隔預設�
 驗證紀錄與凍結指令由 Agora 的父程序管理。check／build 的專案指令會沿用 `PATH`、`VIRTUAL_ENV` 等執行環境，控制檔、分派識別與凍結指令的環境變數會在啟動專案程序前移除。
 
 - 偵測不到正確環境時（例如虛擬環境在別處、要用 tox 或 nox），請明確設定 `check`。
+- **主工作區以 `.venv` 執行 `agora merge` 整合檢查**：若主工作區需要獨立虛擬環境跑整合驗證，先在主工作區建立 `.venv` 並安裝專案依賴，再把 `.agora/config.json` 的 `check` 設成該 `.venv` 的 Python：
+  ```bash
+  python -m venv .venv
+  .venv/Scripts/python.exe -m pip install -r requirements.txt   # macOS／Linux 為 .venv/bin/python
+  ```
+  ```json
+  {
+    "check": [".venv\\Scripts\\python.exe", "-m", "pytest", "-q"]
+  }
+  ```
+  （macOS／Linux 請改用 `".venv/bin/python"`；純 `unittest` 專案可將 `"-m", "pytest", "-q"` 改為 `"-m", "unittest", "discover", "-s", "tests"`。）
 - `install` 偵測到 `.venv`／`venv` 但沒有設定 `check`，或 `check` 用的是舊版 install 寫入的 Agora 自己的 Python 時，會印出建議的設定。新的 install 不再把 `check` 寫進設定檔。
 - `build` 不會自動偵測；專案需要建置（例如產生檔案、編譯韌體）時請設定 `build`，接手方完成工作前會執行它。
 - `check` 會執行專案的測試程式碼，接手方改了測試就等於改了 `check` 執行的內容；白名單限制的是「能執行哪些指令」，不是測試內容，請照常審查接手方的變更。

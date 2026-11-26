@@ -10,17 +10,30 @@ rebuildable artifacts (virtualenv, Python caches, egg-info, and manifest-recorde
 from __future__ import annotations
 
 import json
+import locale
 import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
-from agoralib import completions, config, jobs, parties, quota, shares, worktree
+from agoralib import __version__, baseline, completions, config, jobs, parties, quota, shares, worktree
+
+FAILED_TESTS_PREVIEW_LIMIT = 20
+ENV_SUMMARY_KEYS = (
+    "PYTHONPATH",
+    "PYTHONUTF8",
+    "PYTHONIOENCODING",
+    "VIRTUAL_ENV",
+    "PYTHONNOUSERSITE",
+    "PYTHONHOME",
+)
 
 IN_PROGRESS_FILES = (
     ("MERGE_HEAD", "merge"),
@@ -516,7 +529,87 @@ def build_merge_message(topic: str, worker: Optional[str], thread_name: str, met
     return header + "\n\n" + "\n".join(body_lines) + "\n\n" + "\n".join(trailers) + "\n"
 
 
-def _main_check_environment(root: Path) -> Tuple[str, dict]:
+def _collect_environment_summary(python: str, command, cwd: Path, env: dict) -> dict:
+    return parties.redact({
+        "agora_version": __version__,
+        "python": python,
+        "command": command,
+        "cwd": str(cwd),
+        "stdout_encoding": getattr(sys.stdout, "encoding", None) or "<未知>",
+        "locale_encoding": locale.getpreferredencoding(False) or "<未知>",
+        "env": {
+            key: (env[key] if key in env else "<未設定>")
+            for key in ENV_SUMMARY_KEYS
+        },
+    })
+
+
+def _extract_failed_tests(output: str, check_command, exit_code: Optional[int]) -> Tuple[List[str], bool, Optional[str]]:
+    if not output:
+        return [], False, None
+    code = 1 if exit_code is None else exit_code
+    frameworks: List[str] = []
+    if check_command:
+        try:
+            selected = baseline.plan(check_command)
+            frameworks.append(selected["framework"])
+        except ValueError:
+            label = check_command if isinstance(check_command, str) else " ".join(str(x) for x in check_command)
+            if "pytest" in label.lower():
+                frameworks.append("pytest")
+            if "unittest" in label.lower():
+                frameworks.append("unittest")
+    for fw in ("unittest", "pytest"):
+        if fw not in frameworks:
+            frameworks.append(fw)
+    best: Tuple[List[str], bool, Optional[str]] = ([], False, None)
+    for fw in frameworks:
+        parsed = baseline.parse(output, fw, code)
+        if parsed["complete"]:
+            return parsed["ids"], True, fw
+        if parsed["ids"] and not best[0]:
+            best = (parsed["ids"], False, fw)
+    return best
+
+
+def _format_check_evidence(check_result: dict) -> List[str]:
+    lines: List[str] = []
+    failed = check_result.get("failed_tests") or []
+    if failed:
+        total = len(failed)
+        shown = failed[:FAILED_TESTS_PREVIEW_LIMIT]
+        if total > FAILED_TESTS_PREVIEW_LIMIT:
+            lines.append(f"失敗／錯誤測試（共 {total} 項，列出前 {FAILED_TESTS_PREVIEW_LIMIT} 項）：")
+        else:
+            lines.append(f"失敗／錯誤測試（共 {total} 項）：")
+        for test_id in shown:
+            lines.append(f"  - {test_id}")
+        if total > FAILED_TESTS_PREVIEW_LIMIT:
+            log_path = check_result.get("test_log") or check_result.get("log") or ""
+            suffix = f"：{log_path}" if log_path else ""
+            lines.append(f"  …其餘 {total - FAILED_TESTS_PREVIEW_LIMIT} 項請見完整紀錄{suffix}")
+    log_path = check_result.get("log")
+    test_log_path = check_result.get("test_log")
+    if log_path and test_log_path:
+        lines.append(f"完整紀錄：{log_path}｜測試輸出：{test_log_path}")
+    elif log_path:
+        lines.append(f"完整紀錄：{log_path}")
+    elif test_log_path:
+        lines.append(f"測試輸出：{test_log_path}")
+    timing = check_result.get("timing") or {}
+    if timing.get("wait_seconds") is not None or timing.get("run_seconds") is not None:
+        parts = []
+        if timing.get("wait_seconds") is not None:
+            parts.append(f"等待槽位 {timing['wait_seconds']:.2f}s")
+        if timing.get("run_seconds") is not None:
+            parts.append(f"實際執行 {timing['run_seconds']:.2f}s")
+        if timing.get("total_seconds") is not None:
+            parts.append(f"總計 {timing['total_seconds']:.2f}s")
+        lines.append("驗證耗時：" + "，".join(parts))
+    return lines
+
+
+def _main_check_environment(root: Path, record_path: Optional[Path] = None) -> Tuple[str, dict]:
     env = dict(os.environ)
 
     def in_dispatch(path: str) -> bool:
@@ -541,18 +634,29 @@ def _main_check_environment(root: Path) -> Tuple[str, dict]:
         worktree.MANIFEST_ENV,
         parties.LOCKED_ENV,
         parties.NESTED_ENV,
-        "AGORA_CHECK_RECORD",
+        baseline.RECORD_ENV,
     ):
         env.pop(key, None)
     env["AGORA_WORKSPACE"] = str(root)
     env[worktree.INTEGRATION_CHECK_ENV] = "1"
+    if record_path is not None:
+        env[baseline.RECORD_ENV] = str(record_path)
     return python, env
 
 
-def run_main_check(root: Path) -> dict:
+def run_main_check(root: Path, record_dir: Optional[Path] = None) -> dict:
     """Run `agora check` once in the main workspace as post-merge integration verification."""
-    python, env = _main_check_environment(root)
+    target_dir = Path(record_dir) if record_dir is not None else (root / ".agora" / "integration-checks")
+    target_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    stem = f"integration-check-{stamp}-{uuid.uuid4().hex[:8]}"
+    record = target_dir / f"{stem}.json"
+    log = target_dir / f"{stem}.log"
+    test_log = target_dir / f"{stem}.tests.log"
+
+    python, env = _main_check_environment(root, record_path=record)
     command = [python, str(parties.AGORA_ROOT / "agora.py"), "--workspace", str(root), "check"]
+    outer_start = time.monotonic()
     proc = subprocess.run(
         command,
         cwd=root,
@@ -563,12 +667,47 @@ def run_main_check(root: Path) -> dict:
         errors="replace",
         **quota.NO_WINDOW,
     )
+    total_seconds = round(max(0.0, time.monotonic() - outer_start), 3)
     output = proc.stdout + proc.stderr
+    evidence = completions.read_object(record)
+    raw = evidence.get("output", output)
+    log.write_text(output, encoding="utf-8")
+    test_log.write_text(raw, encoding="utf-8")
+
+    check_command = evidence.get("check_command")
+    test_exit_code = evidence.get("exit_code")
+    failed_tests, failed_complete, failed_framework = _extract_failed_tests(
+        raw, check_command, test_exit_code if test_exit_code is not None else proc.returncode
+    )
+
+    env_summary = evidence.get("environment")
+    if not isinstance(env_summary, dict):
+        env_summary = _collect_environment_summary(python, check_command or command, root, env)
+    else:
+        env_summary = parties.redact(env_summary)
+
+    timing = {
+        "wait_seconds": evidence.get("wait_seconds"),
+        "run_seconds": evidence.get("run_seconds"),
+        "total_seconds": total_seconds,
+    }
     return {
         "exit_code": proc.returncode,
-        "command": command,
+        "command": parties.redact(command),
+        "check_command": parties.redact(check_command) if check_command is not None else None,
         "time": _now_str(),
+        "log": str(log),
+        "test_log": str(test_log),
+        "record": str(record) if record.is_file() else None,
         "output_tail": output[-3000:],
+        "complete": evidence.get("complete", False),
+        "syntax_errors": evidence.get("syntax_errors"),
+        "test_exit_code": test_exit_code,
+        "failed_tests": failed_tests,
+        "failed_tests_complete": failed_complete,
+        "failed_tests_framework": failed_framework,
+        "environment": env_summary,
+        "timing": timing,
     }
 
 
@@ -650,7 +789,6 @@ def merge_dispatch(
     if os.getenv(worktree.WORK_ENV) or ws.root.resolve() != ws.control_root.resolve():
         raise MergeError("agora merge 必須在主工作區執行，不能在分派 worktree 內執行")
     root = ws.control_root.resolve()
-    check_runner = run_check or run_main_check
 
     with shares.dispatch_lock(root), cli.thread_lock(thread, wait=cli.WORKER_LOCK_WAIT):
         state = cli.load_state(thread)
@@ -807,8 +945,9 @@ def merge_dispatch(
     check_passed = prior_merge.get("check_passed") is True
     if need_check:
         integration_sha = merge_sha or worktree.git(root, "rev-parse", "HEAD")
+        dispatch_dir = Path(meta["manifest"]).parent
         try:
-            check_result = check_runner(root)
+            check_result = run_check(root) if run_check is not None else run_main_check(root, record_dir=dispatch_dir)
         except (OSError, subprocess.SubprocessError) as exc:
             check_result = {"exit_code": 1, "output_tail": f"無法執行整合檢查：{exc}"}
         check_passed = check_result.get("exit_code") == 0
@@ -822,6 +961,7 @@ def merge_dispatch(
         if not check_passed:
             note_lines.insert(0, f"合併已完成（SHA：{integration_sha}），只有整合檢查失敗。")
             note_lines.append("不回滾合併，保留 worktree 與分支，請修正後再處理。")
+        note_lines.extend(_format_check_evidence(check_result))
         tail = (check_result.get("output_tail") or "").strip()
         if tail:
             note_lines.append("\n".join(tail.splitlines()[-10:]))
@@ -843,6 +983,7 @@ def merge_dispatch(
                 "already_merged": already_merged,
                 "check_result": check_result,
                 "check_passed": False,
+                "check_ran": True,
                 "preflight_warnings": preflight_warnings,
                 "cleanup": {"status": "skipped_check_failed", "reason": "整合驗證失敗，不回滾合併且不清理"},
             }
@@ -889,6 +1030,7 @@ def merge_dispatch(
         "already_merged": already_merged,
         "check_result": check_result,
         "check_passed": check_passed,
+        "check_ran": need_check,
         "preflight_warnings": preflight_warnings,
         "cleanup": cleanup_rec,
     }
@@ -1114,12 +1256,15 @@ def cmd_merge(ws, args) -> None:
     if not result.get("ok"):
         for warning in result.get("preflight_warnings") or []:
             print(f"⚠️ {warning}")
+        cr = result.get("check_result") or {}
         print(
             f"⚠️ 合併已完成（SHA：{result['integration_sha']}），只有整合檢查失敗"
-            f"（exit={(result.get('check_result') or {}).get('exit_code')}）。"
+            f"（exit={cr.get('exit_code')}）。"
         )
         print("已保留 worktree 與分支。")
-        tail = ((result.get("check_result") or {}).get("output_tail") or "").strip()
+        for line in _format_check_evidence(cr):
+            print(line)
+        tail = (cr.get("output_tail") or "").strip()
         if tail:
             print(tail)
         sys.exit(1)
@@ -1130,8 +1275,20 @@ def cmd_merge(ws, args) -> None:
         print(f"分支 {result['branch']} 已是 {result['source_branch']} 的祖先，略過建立合併節點。")
     else:
         print(f"已以 --no-ff 合併：{result['branch']} → {result['source_branch']}（merge SHA：{result['merge_sha']}）")
-        if result.get("check_result") is not None:
-            print(f"整合驗證通過（exit={result['check_result'].get('exit_code')}）。")
+    if result.get("check_result") is not None and (result.get("check_ran") or not result["already_merged"]):
+        cr = result["check_result"]
+        timing = cr.get("timing") or {}
+        timing_str = ""
+        if timing.get("wait_seconds") is not None or timing.get("run_seconds") is not None:
+            parts = []
+            if timing.get("wait_seconds") is not None:
+                parts.append(f"等待槽位 {timing['wait_seconds']:.2f}s")
+            if timing.get("run_seconds") is not None:
+                parts.append(f"實際執行 {timing['run_seconds']:.2f}s")
+            timing_str = f"（{'，'.join(parts)}）"
+        print(f"整合驗證通過（exit={cr.get('exit_code')}）{timing_str}。")
+        if cr.get("log"):
+            print(f"完整紀錄：{cr['log']}")
 
     cleanup = result.get("cleanup") or {}
     c_status = cleanup.get("status")
@@ -1194,7 +1351,7 @@ def cmd_prune_merged(ws, args) -> None:
         print("\n確認後加上 --yes 清理以上分派資源。")
     for e in result["errors"]:
         print(f"⚠️ {e}")
-    if kept and getattr(args, "verbose", False):
+    if kept and (not getattr(args, "yes", False) or getattr(args, "verbose", False)):
         print("\n保留（不清理）：")
         for info in kept:
             print(f"  • {info['thread']} / {info['dispatch_id']}｜branch：{info['branch']}｜{info['reason']}")
