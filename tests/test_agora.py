@@ -1980,11 +1980,12 @@ class TestRelayStatus(unittest.TestCase):
                              waiting_until=None)
             code, out = self.status(ws, wait=1)
             self.assertEqual(code, 2)
-            self.assertTrue(out.startswith("⏳ 等待 1 秒逾時，接手方仍在進行（狀態：running）"))
+            self.assertEqual(out.splitlines()[0], "等待逾時（1 秒），任務仍在 running")
 
             code, out = self.status(ws, wait=1, as_json=True)
             data = json.loads(out)
             self.assertEqual(code, 2)
+            self.assertEqual(data["timeout_message"], "等待逾時（1 秒），任務仍在 running")
             self.assertEqual({k: data[k] for k in ("status", "alive", "rounds", "timed_out", "waiting_until", "exit_code")},
                              {"status": "running", "alive": True, "rounds": 3, "timed_out": True,
                               "waiting_until": None, "exit_code": 2})
@@ -2748,8 +2749,8 @@ class TestBuildAndSandbox(unittest.TestCase):
     def test_work_preamble_mentions_build_only_when_configured(self):
         fmt = dict(me="Codex", owner="Claude", human="Richard", workspace="W", progress="P", control="C",
                    threshold=5, agora="agora")
-        text = cli.WORK_PREAMBLE.format(**fmt, build_cmd="", finish_cmds="`agora check`", file_rule=cli.FILE_RULE,
-                                        tier_line="未指定")
+        text = cli.WORK_PREAMBLE.format(**fmt, build_cmd="", checkpoint_note="", check_note="",
+                                        finish_instruction="執行 `agora check`", file_rule=cli.FILE_RULE, tier_line="未指定")
         self.assertNotIn("agora build", text)
 
 

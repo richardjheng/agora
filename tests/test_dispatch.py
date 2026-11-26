@@ -426,6 +426,7 @@ class TestDispatch(unittest.TestCase):
         def fake_run(cmd, workspace, prompt, timeout, on_event, env=None):
             captured["cmd"] = list(cmd)
             captured["slots_existed"] = slots.is_dir()
+            captured["prompt"] = prompt
             return ([{"type": "thread.started", "thread_id": "t-1"},
                      {"type": "item.completed", "item": {"type": "agent_message", "text": "已暫停\n【已暫停】"}}], "")
 
@@ -442,6 +443,11 @@ class TestDispatch(unittest.TestCase):
             cli.cmd_work(ws, argparse.Namespace(thread="codex-isolated", dispatch_id=relay["dispatch_id"]))
 
         self.assertTrue(captured.get("slots_existed"))
+        prompt = captured["prompt"]
+        self.assertIn(f"成果可交付時就先用檔案工具把提交說明寫到 {task['commit_message']}", prompt)
+        self.assertIn("全部完成時，先寫好 `commit-message.md`", prompt)
+        self.assertIn(f"Agora 收尾時會執行完整的 `{cli.agora_cmd()} check`，非必要不手動跑", prompt)
+        self.assertNotIn("全部完成時，執行", prompt)
         cmd = captured["cmd"]
         add_dirs = [cmd[i + 1] for i in range(len(cmd) - 1) if cmd[i] == "--add-dir"]
         self.assertIn(str(slots), add_dirs)
@@ -459,6 +465,7 @@ class TestDispatch(unittest.TestCase):
 
         def fake_run(cmd, workspace, prompt, timeout, on_event, env=None):
             captured["cmd"] = list(cmd)
+            captured["prompt"] = prompt
             return ([{"type": "thread.started", "thread_id": "t-2"},
                      {"type": "item.completed", "item": {"type": "agent_message", "text": "完成\n【工作完成】"}}], "")
 
@@ -473,3 +480,5 @@ class TestDispatch(unittest.TestCase):
         add_dirs = [cmd[i + 1] for i in range(len(cmd) - 1) if cmd[i] == "--add-dir"]
         self.assertNotIn(str(slots), add_dirs)
         self.assertFalse(slots.exists())
+        self.assertIn(f"全部完成時，執行 `{cli.agora_cmd()} check`", captured["prompt"])
+        self.assertNotIn("commit-message.md", captured["prompt"])

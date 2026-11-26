@@ -4,6 +4,8 @@ import argparse
 import io
 import json
 import os
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -88,7 +90,17 @@ class FinalizeTests(unittest.TestCase):
         meta = self.retained()
         self.control(True)
         cli.update_relay(self.thread, pid=os.getpid(), pid_started=cli.jobs.pid_started(os.getpid()))
-        self.refused("仍在執行")
+        entry = Path(__file__).resolve().parent.parent / "agora.py"
+        result = subprocess.run(
+            [sys.executable, str(entry), "--workspace", str(self.root), "finalize", self.thread.name],
+            env={**os.environ, cli.NESTED_ENV: ""}, capture_output=True, encoding="utf-8", timeout=30,
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("仍在執行", result.stderr)
+        self.assertIn(f"PID：{os.getpid()}", result.stderr)
+        self.assertIn("watch`", result.stderr)
+        self.assertIn(f"recall {self.thread.name} --wait 540", result.stderr)
         self.assertTrue(cli.stop_requested(self.thread))
         self.assertNotIn("stop_clearances", self.read_meta(meta))
         self.assertIsNone(self.read_meta(meta)["commit_sha"])
@@ -158,7 +170,10 @@ class FinalizeTests(unittest.TestCase):
             else:
                 Path(meta["commit_message"]).write_text(value, encoding="utf-8")
             with patch.object(worktree, "finalize") as finalize:
-                self.refused("commit-message.md")
+                with self.assertRaises(SystemExit) as caught:
+                    self.finalize()
+                self.assertIn(meta["commit_message"], str(caught.exception))
+                self.assertIn("主持方可補寫任務目的與測試範圍後重跑 finalize", str(caught.exception))
             finalize.assert_not_called()
             self.assertTrue(cli.stop_requested(self.thread))
 

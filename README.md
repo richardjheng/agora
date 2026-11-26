@@ -93,7 +93,7 @@ $A assign <id> --from claude [--tier standard] [--to codex --reason "指定理�
 $A assign <id> --resume <分派ID> --from claude [--allow "新路徑" --reason "理由"] [--to <AI>] [--message "補充"]  # 沿用原 branch/worktree 續跑未提交的分派
 $A summarize <id> --by claude                       # 用新對話讀完整逐字稿，產出共識、取捨、異議與工作單（summary.md）
 $A assign <id> --from human --from-summary --allow "src/**" [--yes]  # 用總結的工作單分派；總結過期時要 --yes 確認
-$A status <id> [--wait 900] [--json]                # 分派狀態與最新進度（見下方 exit code）
+$A status <id> [--wait 540] [--json]                # 分派狀態與最新進度（見下方 exit code）
 $A changes <id> [--json]                            # 分派期間的變更（相對於分派當下的工作區快照）
 $A finalize <id> [--dispatch-id <分派ID>]             # 程序結束後，完整驗證保留成果並提交
 $A merge <id> [--dispatch-id <分派ID>] [--keep | --delete-branch]  # 使用者同意後，以 --no-ff 合併分支、整合驗證並預設清 worktree、保留分支
@@ -103,7 +103,7 @@ $A build                                            # 專案建置（.agora/conf
 $A quota [--refresh] [--json]                       # 三方剩餘額度
 $A quota --unblock codex                            # 清除「無法使用」標記（帳務或權限問題處理好之後）
 $A activity                                         # 所有進行中的討論與分派（誰正在回覆）
-$A watch [--timeout 900]                            # 等到任一分派或討論結束就返回，列出尚未回報的結果與下一步
+$A watch [--timeout 540]                            # 等到任一分派或討論結束就返回，列出尚未回報的結果與下一步
 $A route --me claude [--json]                       # 依勾選分工：對話框所在的 AI 該怎麼處理使用者的訊息
 $A wait <id>                                        # 接上背景進行中的討論，顯示回覆直到結束
 $A stop <id>                                        # 停止進行中的討論
@@ -127,15 +127,14 @@ $A keep <id> [--off]                                # 標記保留，prune 不�
 |---|---|
 | 0 | 已結束，而且完成（`done`） |
 | 1 | 已結束，但沒有完成（`failed`、`blocked`、`interrupted`、`stopped`、`max_rounds`），或沒有分派紀錄 |
-| 2 | 等待逾時，接手方仍在進行；輸出第一行是「⏳ 等待 N 秒逾時，接手方仍在進行（狀態：running）」 |
+| 2 | 等待逾時，任務仍在進行。文字輸出第一行顯示「等待逾時（N 秒），任務仍在 running」（使用當下狀態） |
 
-沒加 `--wait` 時只報告狀態，exit code 一律是 0。`--json` 輸出
-`{status, worker, alive, rounds, branch, worktree, commit, timed_out, waiting_until, updated, started, error, denied, denied_summary, warning, last_progress, exit_code}`。
+沒加 `--wait` 時，正常查詢只報告狀態並返回 0。`--json` 將逾時訊息放在 `timeout_message`，並保留 `timed_out` 與 `exit_code` 狀態欄位。若沒有分派紀錄，JSON 回傳 `{"status": null}`。
 VSCode 面板分派狀態與終端皆會顯示獨立 branch、worktree 位置與 commit 結果。
 
 停止、暫停或驗證失敗後，若成果仍保留在隔離 worktree，主持方可在主工作區執行
 `agora finalize <討論串> [--dispatch-id <分派ID>]`（預設最近一次）。接手程序必須已結束，
-且分派目錄的 `commit-message.md` 必須寫明任務目的與測試範圍。finalize 一定重跑完整驗證，
+且分派目錄的 `commit-message.md` 必須寫明任務目的與測試範圍。缺少提交說明時，主持方可依 stderr 顯示的完整路徑補寫後重跑。finalize 一定重跑完整驗證，
 不提供跳過驗證；範圍不符、新失敗或新停止要求都不提交，也不刪除或搬移成果。
 舊停止要求會在確認程序結束後解除並記入 manifest；執行中仍可用 `recall` 再次停止。
 已提交的分派再次 finalize 只回報既有 SHA。這是主持方的收尾指令，不加入接手方的指令白名單。
@@ -164,7 +163,7 @@ manifest 保存兩份診斷結果、時間、log 及核准理由；commit 記錄
 - 剛 `assign` 的工作在背景程序記下 PID 前（狀態 `starting` 未滿 60 秒）一律視為進行中，`status`、`activity` 與其他同時執行的指令不會把它判成中斷。
   assign 必須先寫入狀態再啟動背景程序（背景程序一啟動就讀取它），所以用這段緩衝，而不是先啟動再寫入。
 - `recall` 依當時狀態說明多久會停：等待額度時約 1 分鐘內（每分鐘檢查一次）；正在執行某一輪時，要等這一輪結束（會顯示第幾輪、已執行多久）。
-  `recall --wait [秒數]` 等到真的停止：停止或完成時 exit code 0，以其他狀態結束為 1，逾時為 2。
+  可用 `agora recall <討論串> --wait 540` 等到真的停止。停止或完成時 exit code 0，以其他狀態結束為 1，逾時為 2。
 - 不提供強制中止（`--now`）：每一輪結束時，Agora 會還原接手方改動的 hook、自動執行的設定與 `.agora/config.json`（見[權限與安全](#權限與安全)）。
   中途終止會跳過這一步，等於讓接手方繞過指令白名單；被中斷的 CLI 對話狀態也無法預期。
   真的必須立刻停止時，從工作管理員結束接手程序，再用 `agora changes <id>` 與 `git status` 檢查工作區，並手動確認 `.claude/`、`.agents/`、`.codex/`、git hooks 沒有被改動。
@@ -415,7 +414,7 @@ Agora 在建立訊息、背景 job 或派工 worktree 前立即回報 sandbox �
   - 各 worktree 建立獨立 `.venv` 並安裝依賴，偵測 editable install 與 `PYTHONPATH` 是否指回主目錄，確認 `agora check` 載入的是該 worktree 的程式碼。
 - **由 Agora 代為 Commit，並以 `agora merge` 受控合併與清理**：
   - 接手方的書面界線：只改工作單範圍、不自行 commit/push/merge、不碰 `.env`、不做影響外部系統的動作。
-  - 接手方把 commit 訊息（任務目的、測試範圍）寫成檔案；宣告完成後由 Agora 核對分派、branch、檔案範圍，執行實際 `agora check`，附上真實結果後代為 commit。
+  - 隔離分派的接手方在成果可交付時先寫好 `commit-message.md`（任務目的、測試範圍），再宣告完成。Agora 核對分派、branch、檔案範圍後執行完整的 `agora check`，附上真實結果後代為 commit。接手方非必要不手動跑完整驗證。非隔離分派由接手方在宣告完成前執行 `agora check`，若設定了建置指令也要執行 `agora build`。
   - 分派與收尾不自動 push / merge；僅在使用者明確要求時，由主持方於主工作區執行 `agora merge <討論串> [--dispatch-id <ID>] [--keep | --delete-branch]`：檢查程序已停止、`commit_status=committed` 且分支 SHA 吻合、主工作區位於 `source_branch`、無未提交的已追蹤變更與進行中 Git 操作；以 `git merge --no-ff` 合併（衝突即 `merge --abort` 並回報，不清理）並在主工作區執行一次 `agora check` 整合驗證（失敗不回滾合併且不清理）；驗證通過後預設只移除 worktree、保留分支（`--keep` 兩者都保留、`--delete-branch` 才於移除 worktree 後以 `git branch -d` 刪分支），僅自動刪除可重建產物，遇未知檔阻擋、遇 Windows 鎖定（EPERM）記為待重試可重試，控制紀錄含 SHA 完整保留。
   - 合併前會依主工作區的驗證指令檢查環境：除了驗證指令與 pytest，也會透過 `git merge-tree --write-tree` 預覽合併後的 `requirements.txt`、`requirements-dev.txt`、`requirements-test.txt` 與 `pyproject.toml`（`[project].dependencies` 及 `dev`／`test`／`tests` extras），以整合檢查實際使用的 Python 離線執行 `pip --isolated install --dry-run --no-index --no-deps --report -` 預檢專案依賴。若缺少依賴或 pytest，先依提示準備環境再合併；純標準庫 unittest 專案可直接使用 Agora 的 Python。若無法預檢（例如沒有 pip、pip 版本低於 22.2、報告解析失敗、git 不支援 `merge-tree --write-tree` 或自訂 `check` 未直接指定 Python 直譯器），會印出「未預檢依賴：原因」並照常合併。若合併已完成但尚無整合驗證通過紀錄，再執行 `agora merge` 會重新驗證。
 - **固定基準審查**：`agora changes` 與審查比對基準改為固定 `base SHA...branch`，避免基準漂移。
