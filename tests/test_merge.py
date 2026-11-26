@@ -387,7 +387,7 @@ class TestAgoraMerge(MergeTestBase):
 
         with patch.object(merge, "run_main_check", return_value={"exit_code": 0}) as check:
             result = merge.merge_dispatch(ws, self.thread)
-        check.assert_called_once_with(self.root)
+        check.assert_called_once_with(self.root, record_dir=Path(meta["manifest"]).parent)
         self.assertTrue(result["ok"])
         self.assertTrue(result["already_merged"])
         self.assertEqual(worktree.git(self.root, "rev-parse", "HEAD"), head_before)
@@ -398,14 +398,14 @@ class TestAgoraMerge(MergeTestBase):
 
     def test_interrupted_merge_without_passed_check_runs_it_again(self):
         ws = cli.Workspace(self.root)
-        self.make_committed_dispatch()
+        meta = self.make_committed_dispatch()
         with patch.object(merge, "run_main_check", side_effect=KeyboardInterrupt):
             with self.assertRaises(KeyboardInterrupt):
                 merge.merge_dispatch(ws, self.thread, keep=True)
         head = worktree.git(self.root, "rev-parse", "HEAD")
         with patch.object(merge, "run_main_check", return_value={"exit_code": 0}) as check:
             result = merge.merge_dispatch(ws, self.thread, keep=True)
-        check.assert_called_once_with(self.root)
+        check.assert_called_once_with(self.root, record_dir=Path(meta["manifest"]).parent)
         self.assertTrue(result["already_merged"])
         self.assertTrue(result["check_passed"])
         self.assertEqual(result["merge_sha"], head)
@@ -1063,6 +1063,238 @@ class TestMergeDependencyPreflight(MergeTestBase):
                 merge.merge_dispatch(ws, self.thread)
         integration.assert_not_called()
         self.assertEqual(worktree.git(self.root, "rev-parse", "HEAD"), head)
+
+
+class TestIntegrationCheckEvidence(MergeTestBase):
+    def test_failed_integration_check_saves_full_logs_failed_ids_and_two_merges_do_not_overwrite(self):
+        ws = cli.Workspace(self.root)
+        (self.root / "tests").mkdir()
+        test_lines = [
+            "import unittest",
+            "class EvidenceTest(unittest.TestCase):",
+        ]
+        for i in range(22):
+            test_lines.append(f"    def test_fail_{i:02d}(self):")
+            test_lines.append(f"        self.fail('MARKER_FAIL_{i:02d}_' + 'x' * 200)")
+        for i in range(3):
+            test_lines.append(f"    def test_err_{i:02d}(self):")
+            test_lines.append(f"        raise RuntimeError('MARKER_ERR_{i:02d}_' + 'y' * 200)")
+        (self.root / "tests" / "test_evidence.py").write_text("\n".join(test_lines) + "\n", encoding="utf-8")
+        worktree.git(self.root, "add", "tests/test_evidence.py")
+        worktree.git(self.root, "commit", "-m", "add failing tests")
+
+        meta = self.make_committed_dispatch()
+        dispatch_dir = Path(meta["manifest"]).parent
+
+        # First merge: performs --no-ff merge, runs real integration check, fails
+        res1 = merge.merge_dispatch(ws, self.thread)
+        self.assertFalse(res1["ok"])
+        self.assertFalse(res1["check_passed"])
+        cr1 = res1["check_result"]
+        log1 = Path(cr1["log"])
+        test_log1 = Path(cr1["test_log"])
+        rec1 = Path(cr1["record"])
+        self.assertTrue(log1.is_file())
+        self.assertTrue(test_log1.is_file())
+        self.assertTrue(rec1.is_file())
+        self.assertEqual(log1.parent.resolve(), dispatch_dir.resolve())
+        self.assertTrue(log1.name.startswith("integration-check-"))
+        self.assertTrue(test_log1.name.endswith(".tests.log"))
+
+        # Full test output is preserved in .tests.log even though stdout/output_tail is truncated
+        raw1 = test_log1.read_text(encoding="utf-8")
+        self.assertIn("MARKER_FAIL_00_", raw1)
+        self.assertIn("MARKER_ERR_02_", raw1)
+        self.assertGreater(len(raw1), 3000)
+
+        # All 25 failed/error test IDs parsed via baseline.py
+        self.assertEqual(len(cr1["failed_tests"]), 25)
+        self.assertTrue(cr1["failed_tests_complete"])
+        self.assertEqual(cr1["failed_tests_framework"], "unittest")
+        self.assertIn("test_evidence.EvidenceTest.test_fail_00", cr1["failed_tests"])
+        self.assertIn("test_evidence.EvidenceTest.test_err_02", cr1["failed_tests"])
+
+        # System note and progress.md list preview + total + log path
+        transcript = (self.thread / "transcript.md").read_text(encoding="utf-8")
+        self.assertIn("失敗／錯誤測試（共 25 項，列出前 20 項）", transcript)
+        self.assertIn("test_evidence.EvidenceTest.test_fail_00", transcript)
+        self.assertIn(str(test_log1), transcript)
+
+        # cmd_merge output lists failed IDs and log path
+        out = io.StringIO()
+        with patch.object(merge, "merge_dispatch", return_value=res1), patch("sys.stdout", out):
+            with self.assertRaises(SystemExit):
+                merge.cmd_merge(ws, argparse.Namespace(thread=self.thread.name, json=False))
+        rendered = out.getvalue()
+        self.assertIn("失敗／錯誤測試（共 25 項，列出前 20 項）", rendered)
+        self.assertIn("test_evidence.EvidenceTest.test_fail_00", rendered)
+        self.assertIn(str(test_log1), rendered)
+
+        # Second merge on the same dispatch: creates new log files without overwriting the first
+        res2 = merge.merge_dispatch(ws, self.thread)
+        self.assertFalse(res2["ok"])
+        self.assertTrue(res2["already_merged"])
+        cr2 = res2["check_result"]
+        log2 = Path(cr2["log"])
+        test_log2 = Path(cr2["test_log"])
+        rec2 = Path(cr2["record"])
+        self.assertNotEqual(log1, log2)
+        self.assertNotEqual(test_log1, test_log2)
+        self.assertNotEqual(rec1, rec2)
+        self.assertTrue(log1.is_file() and log2.is_file())
+        self.assertTrue(test_log1.is_file() and test_log2.is_file())
+        self.assertTrue(rec1.is_file() and rec2.is_file())
+
+    def test_environment_summary_fields_unset_markers_and_redaction(self):
+        from agoralib import __version__
+        (self.root / "tests").mkdir()
+        (self.root / "tests" / "test_ok.py").write_text(
+            "import unittest\nclass T(unittest.TestCase):\n def test_ok(self):\n  self.assertTrue(True)\n",
+            encoding="utf-8",
+        )
+        record_dir = self.root / ".agora" / "test-env-records"
+        clean_env = {k: v for k, v in os.environ.items() if k not in merge.ENV_SUMMARY_KEYS}
+        clean_env["PYTHONPATH"] = "C:/demo/token=my_super_secret_123"
+
+        with patch.dict(os.environ, clean_env, clear=True):
+            # Verify _main_check_environment does not inject PYTHONUTF8 / PYTHONIOENCODING / PYTHONNOUSERSITE
+            _, main_env = merge._main_check_environment(self.root)
+            self.assertNotIn("PYTHONUTF8", main_env)
+            self.assertNotIn("PYTHONIOENCODING", main_env)
+            self.assertNotIn("PYTHONNOUSERSITE", main_env)
+
+            cr = merge.run_main_check(self.root, record_dir=record_dir)
+
+        self.assertEqual(cr["exit_code"], 0, cr)
+        env_info = cr["environment"]
+        self.assertEqual(env_info["agora_version"], __version__)
+        self.assertTrue(env_info["python"])
+        self.assertTrue(env_info["command"])
+        self.assertEqual(Path(env_info["cwd"]).resolve(), self.root.resolve())
+        self.assertTrue(env_info["stdout_encoding"])
+        self.assertTrue(env_info["locale_encoding"])
+
+        env_vars = env_info["env"]
+        self.assertIn("[REDACTED]", env_vars["PYTHONPATH"])
+        self.assertNotIn("my_super_secret_123", env_vars["PYTHONPATH"])
+        for unset_key in ("PYTHONUTF8", "PYTHONIOENCODING", "VIRTUAL_ENV", "PYTHONNOUSERSITE", "PYTHONHOME"):
+            self.assertEqual(env_vars[unset_key], "<未設定>")
+
+    def test_timing_records_wait_and_run_seconds_separately(self):
+        import threading
+        from agoralib import checkqueue
+
+        (self.root / "tests").mkdir()
+        (self.root / "tests" / "test_slow.py").write_text(
+            "import time, unittest\n"
+            "class T(unittest.TestCase):\n"
+            " def test_sleep(self):\n"
+            "  time.sleep(0.15)\n",
+            encoding="utf-8",
+        )
+        record_dir = self.root / ".agora" / "test-timing-records"
+        slots_path = checkqueue.slots_dir(self.root)
+        acquired = threading.Event()
+        stop_holder = threading.Event()
+
+        def hold_slot():
+            with checkqueue.acquire_slot(self.root, label="blocker", poll_interval=0.05):
+                acquired.set()
+                deadline = time.monotonic() + 30.0
+                while not stop_holder.is_set() and time.monotonic() < deadline:
+                    if list(slots_path.glob("wait-*.json")):
+                        time.sleep(0.3)
+                        break
+                    time.sleep(0.02)
+
+        holder = threading.Thread(target=hold_slot, daemon=True)
+        holder.start()
+        self.assertTrue(acquired.wait(timeout=5.0))
+        try:
+            cr = merge.run_main_check(self.root, record_dir=record_dir)
+        finally:
+            stop_holder.set()
+            holder.join(timeout=5.0)
+
+        self.assertEqual(cr["exit_code"], 0, cr)
+        timing = cr["timing"]
+        self.assertIsNotNone(timing["wait_seconds"])
+        self.assertIsNotNone(timing["run_seconds"])
+        self.assertGreaterEqual(timing["wait_seconds"], 0.2)
+        self.assertGreaterEqual(timing["run_seconds"], 0.1)
+        record_data = json.loads(Path(cr["record"]).read_text(encoding="utf-8"))
+        self.assertEqual(record_data["wait_seconds"], timing["wait_seconds"])
+        self.assertEqual(record_data["run_seconds"], timing["run_seconds"])
+
+    def test_already_merged_rerun_prints_verification_result(self):
+        ws = cli.Workspace(self.root)
+        meta = self.make_committed_dispatch()
+        worktree.git(self.root, "merge", "--no-ff", "-m", "manual merge", meta["branch"])
+
+        fake_check = {
+            "exit_code": 0,
+            "log": str(Path(meta["manifest"]).parent / "integration-check-test.log"),
+            "timing": {"wait_seconds": 0.12, "run_seconds": 1.34, "total_seconds": 1.50},
+        }
+        out1 = io.StringIO()
+        with patch.dict(os.environ, {cli.NESTED_ENV: ""}), \
+                patch.object(merge, "run_main_check", return_value=fake_check) as mock_check, \
+                patch("sys.stdout", out1):
+            merge.cmd_merge(ws, argparse.Namespace(
+                thread=self.thread.name, dispatch_id=None, keep=True, delete_branch=False, json=False,
+            ))
+        mock_check.assert_called_once()
+        text1 = out1.getvalue()
+        self.assertIn("略過建立合併節點", text1)
+        self.assertIn("整合驗證通過（exit=0）", text1)
+        self.assertIn("等待槽位 0.12s", text1)
+        self.assertIn("實際執行 1.34s", text1)
+        self.assertIn("integration-check-test.log", text1)
+
+        # Second rerun after check already passed: does not re-run check or print pass banner again
+        out2 = io.StringIO()
+        with patch.dict(os.environ, {cli.NESTED_ENV: ""}), \
+                patch.object(merge, "run_main_check", side_effect=AssertionError("should not re-run")), \
+                patch("sys.stdout", out2):
+            merge.cmd_merge(ws, argparse.Namespace(
+                thread=self.thread.name, dispatch_id=None, keep=True, delete_branch=False, json=False,
+            ))
+        text2 = out2.getvalue()
+        self.assertIn("略過建立合併節點", text2)
+        self.assertNotIn("整合驗證通過", text2)
+
+    def test_prune_merged_preview_prints_kept_reasons_without_verbose(self):
+        ws = cli.Workspace(self.root)
+        m1 = self.make_committed_dispatch(dispatch_id="aaa1111aaaaaaa1111111", worker="codex", title="已合併")
+        merge.merge_dispatch(ws, self.thread, dispatch_id=m1["dispatch_id"], keep=True, run_check=lambda r: {"exit_code": 0})
+        # Add an unknown untracked file to m1 so it is kept with a blocking reason
+        (Path(m1["worktree"]) / "unknown-note.txt").write_text("keep", encoding="utf-8")
+
+        self.make_committed_dispatch(
+            dispatch_id="bbb2222bbbbbbb2222222", worker="antigravity", title="未合併",
+            allowed=["other.py"], edit_file="other.py", edit_text="VALUE = 10\n",
+        )
+
+        out = io.StringIO()
+        with patch.dict(os.environ, {cli.NESTED_ENV: ""}), patch("sys.stdout", out):
+            cli.cmd_prune(ws, argparse.Namespace(
+                thread=None, days=30, yes=False, keep_sessions=False, verbose=False, json=False, merged=True, delete_branch=False,
+            ))
+        preview = out.getvalue()
+        self.assertIn("保留（不清理）", preview)
+        self.assertIn("尚未合併到 main", preview)
+        self.assertIn("unknown-note.txt", preview)
+
+    def test_extract_failed_tests_supports_pytest_output(self):
+        sample = (
+            "FAILED tests/test_a.py::test_one - AssertionError: boom\n"
+            "ERROR tests/test_b.py::test_two - RuntimeError: setup\n"
+            "=================== 1 failed, 2 passed, 1 error in 0.12s ===================\n"
+        )
+        ids, complete, fw = merge._extract_failed_tests(sample, ["python", "-m", "pytest", "-q"], 1)
+        self.assertEqual(ids, ["tests/test_a.py::test_one", "tests/test_b.py::test_two"])
+        self.assertTrue(complete)
+        self.assertEqual(fw, "pytest")
 
 
 if __name__ == "__main__":
