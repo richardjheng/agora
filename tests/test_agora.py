@@ -775,7 +775,11 @@ class TestAntigravityStreamInterrupted(unittest.TestCase):
         self.assertIn("2 輪 CLI 回報串流中斷", text)
         both = cli.unverified_warning({"status": "done", "interrupted_rounds": 1, "denied": [{"action": "read_url"}]})
         self.assertIn("工具被拒", both)
+        self.assertIn("被拒目標不明，仍需查證", both)
         self.assertIn("串流中斷", both)
+        known = cli.unverified_warning({"status": "done", "denied": [{"action": "read_file", "target": "guide.md"}]})
+        self.assertIn("被拒的來源可能沒有真的讀到", known)
+        self.assertNotIn("目標不明", known)
 
 
 class TestCodexQuota(unittest.TestCase):
