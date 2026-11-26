@@ -99,6 +99,7 @@ $A finalize <id> [--dispatch-id <分派ID>]             # 程序結束後，完�
 $A merge <id> [--dispatch-id <分派ID>] [--keep | --delete-branch]  # 使用者同意後，以 --no-ff 合併分支、整合驗證並預設清 worktree、保留分支
 $A recall <id> [--wait [秒數]]                       # 請接手方停止；--wait 等到真的停止（預設最多 600 秒）
 $A check                                            # 工作區驗證（語法檢查＋測試）
+$A test                                             # 隔離分派內跑相關測試（讀 test-targets.txt 或依變更自動挑選；不作為提交依據）
 $A build                                            # 專案建置（.agora/config.json 的 build 指令）
 $A quota [--refresh] [--json]                       # 三方剩餘額度
 $A quota --unblock codex                            # 清除「無法使用」標記（帳務或權限問題處理好之後）
@@ -401,7 +402,7 @@ Agora 在建立訊息、背景 job 或派工 worktree 前立即回報 sandbox �
 
 | | 討論 | 接手工作 |
 |---|---|---|
-| Claude Code | 禁用 Edit/Write | `acceptEdits`；Bash 只允許 `agora.py quota/check/build` 與唯讀 git；不能改 `.agora/config.json` |
+| Claude Code | 禁用 Edit/Write | `acceptEdits`；Bash 只允許 `agora.py quota/check/test/build` 與唯讀 git；不能改 `.agora/config.json` |
 | Antigravity | 沒有寫檔權限 | `--mode accept-edits`（只能寫工作區）；指令依 `~/.gemini/antigravity-cli/settings.json` 的 `permissions.allow`（完整比對） |
 | Codex | `-s read-only`（不受沙箱設定影響） | `-s workspace-write`（預設，`add_dirs` 的目錄另外可寫）；可用 `agora parties --sandbox codex=danger-full-access` 改為完整存取 |
 
@@ -422,7 +423,7 @@ Agora 在建立訊息、背景 job 或派工 worktree 前立即回報 sandbox �
 - hook 與會自動執行指令的設定（`.claude/settings*.json`、`.agents/hooks.json`、`.codex/config.toml`、`.codex/hooks.json`、`.vscode/tasks.json`、git hooks）改了等於繞過指令白名單：Claude 接手時直接禁止編輯 `.claude/`、`.agents/`、`.codex/`、`.git/` 與 `.vscode/tasks.json`；每輪結束時這些檔案被新增、修改或刪除都會還原，並記在逐字稿。
 - `.agora/config.json` 的 `build`、`check`、`add_dirs` 與沙箱設定決定接手方能執行的指令與能寫的範圍：接手方執行的 `agora build`／`check` 用該輪開始時的指令（以環境變數 `AGORA_LOCKED_COMMANDS` 帶入），中途改設定檔也不會被執行；被改動的設定在該輪結束時還原，並記在逐字稿。
 - 被 Agora 呼叫的 CLI 帶 `AGORA_INVOKED=1`，無法再呼叫 Agora，避免互相無限呼叫。
-- Antigravity 的指令權限是**完整比對**，所以接手方只被允許執行固定、不帶參數的指令：`agora.py quota`、`agora.py check`、`agora.py build`、`git status/diff/log`。權限是全域設定，升級後新增的指令要重新 `install` 才會加入（安裝狀態會顯示為需要更新）。
+- Antigravity 的指令權限是**完整比對**，所以接手方只被允許執行固定、不帶參數的指令：`agora.py quota`、`agora.py check`、`agora.py test`、`agora.py build`、`git status/diff/log`。權限是全域設定，升級後新增的指令要重新 `install` 才會加入（安裝狀態會顯示為需要更新）。
 
 ### 工具被拒
 
@@ -473,8 +474,14 @@ Agora 在建立訊息、背景 job 或派工 worktree 前立即回報 sandbox �
 
 ### 接手方的驗證環境
 
-接手方受指令白名單限制，只能執行不帶參數的 `agora check` 與 `agora build`，不能自己改跑 `.venv\Scripts\python -m pytest`。
+接手方受指令白名單限制，只能執行不帶參數的 `agora check`、`agora test`（僅隔離分派）與 `agora build`，不能自己改跑 `.venv\Scripts\python -m pytest`。
 所以測試在哪個 Python、用什麼工具跑，完全由 `.agora/config.json` 的 `check`／`build` 決定；接手當輪用的是該輪開始時的設定，接手方改了也不會生效。
+
+隔離分派開發中可用不帶參數的 `agora test` 快速跑相關測試：
+- 優先讀取分派控制目錄下的 `test-targets.txt`（`<討論串>/dispatches/<分派ID>/test-targets.txt`，與 `commit-message.md` 同層，一行一個目標，忽略空行與 `#` 註解）；沒有或為空時，依 `git diff <base_sha>` 與未追蹤 `.py` 自動挑選變更的測試檔與對應 `tests/test_<name>.py`。
+- 挑不到目標時以非 0 結束並提示目標檔路徑，**絕不退回跑完整測試**；所有目標須位於 `tests/` 下且通過整批安全驗證（上限 20 個，拒絕選項、空白、萬用字元、`..`、絕對路徑與越界連結）。
+- 使用獨立的 `.agora/test-slots/`（全域並行上限 2），不與完整驗證的 `check-slots` 搶位置；同一分派同時只能執行一次，單次硬逾時 300 秒。
+- 完整輸出寫入分派控制目錄的 `test-<時間>.log`，不寫入 `meta.check_result`，僅供局部驗證，**不作為提交依據**（正式提交仍由 Agora 收尾時執行完整 `agora check`）。
 
 Agora 建立分派的 `.venv` 時，會安裝專案根目錄的 `requirements*.txt`，並以 editable 模式安裝 Python 專案及已宣告的 `dev`、`test`、`tests` extras。Python 3.9／3.10 缺少 `tomllib` 時會安裝基本專案，並留下紀錄。
 
@@ -513,6 +520,7 @@ pip 使用 UTF-8，遇到暫時性錯誤最多重試三次。重試間隔預設�
 agora.py               進入點
 pyproject.toml         pip 套件設定（agora 指令）
 agoralib/cli.py        討論、分派、狀態、驗證
+agoralib/targeted.py   隔離分派的局部相關測試（agora test）
 agoralib/worktree.py   隔離分派分支命名、worktree 與代為提交
 agoralib/merge.py      受控 --no-ff 合併、整合驗證與合併後清理
 agoralib/config.py     工作區設定（參與的 AI、模型、推理強度、分配比例）

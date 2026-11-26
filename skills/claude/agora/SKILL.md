@@ -13,7 +13,7 @@ description: 透過 Agora 與 Antigravity（Gemini）、Codex 進行多輪技術
 
 ## 依勾選分工
 
-Codex 執行會呼叫其他 AI 的 `send`／`reply`／`auto`／`assign`（含 `--resume`）／`summarize`／`relay` 時，須要求在沙箱外執行（`sandbox_permissions="require_escalated"` 或等效核准）。若 `approval_policy=never` 無法提權，請回報使用者改由 Claude Code、一般終端或 VSCode 面板發起，不要要求 Codex 在沙箱內重試；若提權被 Codex 審查器（`auto_review`）以先前已取消為由拒絕，亦不要重試或繞過，請使用者在對話中明確確認重新加入該 AI，或改由 Claude Code、VSCode 面板或一般終端發起。本機 `quota` 快取讀取、`check`、`build`、`status`、`list` 與沒有回覆目標的 `send --to none` 不需提權。
+Codex 執行會呼叫其他 AI 的 `send`／`reply`／`auto`／`assign`（含 `--resume`）／`summarize`／`relay` 時，須要求在沙箱外執行（`sandbox_permissions="require_escalated"` 或等效核准）。若 `approval_policy=never` 無法提權，請回報使用者改由 Claude Code、一般終端或 VSCode 面板發起，不要要求 Codex 在沙箱內重試；若提權被 Codex 審查器（`auto_review`）以先前已取消為由拒絕，亦不要重試或繞過，請使用者在對話中明確確認重新加入該 AI，或改由 Claude Code、VSCode 面板或一般終端發起。本機 `quota` 快取讀取、`check`、`test`、`build`、`status`、`list` 與沒有回覆目標的 `send --to none` 不需提權。
 
 使用者在 VSCode 面板勾選的 AI 決定誰來處理，不需要使用者說特定提示詞。每則使用者訊息都附有 hook 注入的「【Agora 勾選】」指示；
 沒看到時執行 `python D:/github/agora/agora.py route --me claude` 取得。指示說「只勾選你」時直接自己處理，不用 Agora。
@@ -99,7 +99,7 @@ python D:/github/agora/agora.py watch                          # 同時有分派
 ### 分支與 Worktree 隔離流程
 - **獨立 Branch 與 Worktree**：每次新分派會建立獨立 `<ai>/<slug>-<7 碼分派 ID>` branch（前綴 `claude/`、`codex/`、`agy/`，slug 預設取討論串標題並可用 `assign --name <slug>` 覆寫；改派續跑不改名；舊分派 `agora/<分派 ID>` 原樣相容）與獨立 git worktree（位於 `.agora/worktrees/<完整分派 ID>`；同 AI 多任務各一份）。接手 CLI 的工作目錄設為該 worktree，進度檔、control.json 與 `.agora/` 設定維持在主工作區。
 - **獨立環境與建置**：每個 worktree 各建 `.venv` 並安裝依賴與可解析的 `dev`／`test`／`tests` extras，建置輸出留在該 worktree。依賴宣告變更時，下次 `agora check` 會先重裝並驗證環境。暫時性 pip 重試記於分派的 `environment.log`。環境失敗時依 `status` 提示續跑，先結束手動啟動且仍使用該環境的程序，`assign --resume` 會在鎖內重建及驗證。
-- **由 Agora 代做 Commit**：隔離分派的接手方在成果可交付時先寫好 `commit-message.md`（任務目的、測試範圍），再宣告完成。Agora 核對分派、branch 與檔案範圍後執行完整的 `agora check`，附上真實結果後代為 commit。接手方非必要不手動跑完整驗證，也不要自行 git commit。非隔離分派由接手方在宣告完成前執行 `agora check`，若設定了建置指令也要執行 `agora build`。分派與收尾不自動 push / merge。
+- **由 Agora 代做 Commit**：隔離分派的接手方在開發中可用不帶參數的 `agora test` 跑相關測試（目標寫在分派控制目錄的 `test-targets.txt`，沒寫時依變更自動挑；僅局部驗證、不作為提交依據，絕不退回完整測試），成果可交付時先寫好 `commit-message.md`（任務目的、測試範圍），再宣告完成。Agora 核對分派、branch 與檔案範圍後執行完整的 `agora check`，附上真實結果後代為 commit。接手方非必要不手動跑完整驗證，也不要自行 git commit。非隔離分派由接手方在宣告完成前執行 `agora check`，若設定了建置指令也要執行 `agora build`。分派與收尾不自動 push / merge。
 - **受控合併與清理（主持方，需使用者同意）**：僅在**使用者明確要求或同意**後，由主持方於主工作區執行 `python D:/github/agora/agora.py merge <討論串> [--dispatch-id <分派ID>] [--keep | --delete-branch]`（`--no-ff` 保留線圖分岔、寫入追蹤 trailer、衝突即 `merge --abort` 並回報），合併後於主工作區執行整合 `agora check`；驗證通過後預設只移除 worktree、保留分支（`--keep` 兩者都保留、`--delete-branch` 才於移除 worktree 後以 `git branch -d` 刪分支），僅自動刪可重建產物，未知檔案會阻擋清理、Windows 鎖定記待重試，控制紀錄含 SHA 保留。已合併未清資源亦可用 `python D:/github/agora/agora.py prune --merged [--delete-branch] --yes` 清理（預設保留分支、不刪討論串）。不自動 push。
 - **驗證排隊與不要中斷**：`agora check` 跨分派依控制根目錄 `.agora/config.json` 的 `check_concurrency`（預設 1）FIFO 排隊，可能排隊等待或執行耗時很長；排隊或執行中不要中斷，也不要因為耗時久就改判失敗。
 - **保留成果收尾（主持方）**：停止、暫停或驗證失敗後，確認接手程序已結束、`commit-message.md` 已寫好，可在主工作區用 `python D:/github/agora/agora.py finalize <討論串> [--dispatch-id <分派ID>]` 收尾（預設最近一次）。一定重跑完整驗證，不提供跳過驗證；未核准的失敗保留檔案、不提交。舊停止要求解除時會記錄，執行中新的 `recall` 仍有效；已 committed 只回報既有 SHA。這不是 resume，也不擴大範圍，接手方不可自行執行。
