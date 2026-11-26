@@ -5,6 +5,7 @@ The manifest lives in the controller, independently of a thread's latest relay.
 Checks fail closed; failed checks leave the branch and worktree for review.
 """
 
+import copy
 import fnmatch
 import hashlib
 import json
@@ -606,7 +607,9 @@ def rebase_command(spec, meta):
         return re.sub("|".join(re.escape(s) for s in sources), lambda _: meta["worktree"], text)
 
     if isinstance(spec, dict):
-        return {k: rebase_command(v, meta) for k, v in spec.items()}
+        if "output" in spec and "rerun" in spec:
+            return copy.deepcopy(spec)
+        return {k: (copy.deepcopy(v) if k == "check_framework" else rebase_command(v, meta)) for k, v in spec.items()}
     if isinstance(spec, list):
         result = [map_path(x) if isinstance(x, str) else rebase_command(x, meta) for x in spec]
         if result and isinstance(result[0], str):

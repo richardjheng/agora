@@ -141,8 +141,8 @@ VSCode 面板分派狀態與終端皆會顯示獨立 branch、worktree 位置與
 已提交的分派再次 finalize 只回報既有 SHA。這是主持方的收尾指令，不加入接手方的指令白名單。
 
 驗證失敗時才做基準比較：支援一般 `python -m unittest discover -s tests`、`python -m pytest -q`
-（或 `pytest -q`）指令，在分派起點的 detached worktree 與分派工作區各只重跑失敗項目一次，使用分派 `.venv` 並經驗證排隊。
-首次失敗完整保留，分類為「新失敗」「既有失敗」「不穩定」「無法比對」；收集／匯入失敗、截斷輸出、複合 shell 或不支援的測試選項均不可核准。
+（或 `pytest -q`）指令，以及透過 `.agora/config.json` 的 `check_framework` 宣告的自訂測試入口；在分派起點的 detached worktree 與分派工作區各只重跑失敗項目一次，使用分派 `.venv` 並經驗證排隊。
+首次失敗完整保留，分類為「新失敗」「既有失敗」「不穩定」「無法比對」；收集／匯入失敗、截斷輸出、複合 shell 或不支援的測試選項均不可核准。無法比對或發生錯誤時不印空的「新失敗：無」分類，改明確標示「無法比對失敗項目（不代表沒有新失敗）：<原因>」（未知框架時並提示宣告 `check_framework`）。
 **只有全部為既有失敗**時，主持方審查後可執行
 `agora finalize <討論串> [--dispatch-id <分派ID>] --accept-preexisting --reason "已核對起點；修復安排" [--from claude]`。
 這仍重跑完整驗證；不穩定或未知失敗不能當成通過。核准綁定 tree、凍結指令與失敗 ID，程式碼再改動須重新驗證與核准。
@@ -421,7 +421,7 @@ Agora 在建立訊息、背景 job 或派工 worktree 前立即回報 sandbox �
 - **固定基準審查**：`agora changes` 與審查比對基準改為固定 `base SHA...branch`，避免基準漂移。
 - **確認程序結束才可清理**：未 merge 的成果、branch 與 worktree 均妥善保留，停止或中斷時不會提前清理。
 - hook 與會自動執行指令的設定（`.claude/settings*.json`、`.agents/hooks.json`、`.codex/config.toml`、`.codex/hooks.json`、`.vscode/tasks.json`、git hooks）改了等於繞過指令白名單：Claude 接手時直接禁止編輯 `.claude/`、`.agents/`、`.codex/`、`.git/` 與 `.vscode/tasks.json`；每輪結束時這些檔案被新增、修改或刪除都會還原，並記在逐字稿。
-- `.agora/config.json` 的 `build`、`check`、`add_dirs` 與沙箱設定決定接手方能執行的指令與能寫的範圍：接手方執行的 `agora build`／`check` 用該輪開始時的指令（以環境變數 `AGORA_LOCKED_COMMANDS` 帶入），中途改設定檔也不會被執行；被改動的設定在該輪結束時還原，並記在逐字稿。
+- `.agora/config.json` 的 `build`、`check`、`check_framework`、`add_dirs` 與沙箱設定決定接手方能執行的指令與能寫的範圍：接手方執行的 `agora build`／`check`／`test` 用該輪開始時的指令（以環境變數 `AGORA_LOCKED_COMMANDS` 帶入），中途改設定檔也不會被執行；被改動的設定在該輪結束時還原，並記在逐字稿。
 - 被 Agora 呼叫的 CLI 帶 `AGORA_INVOKED=1`，無法再呼叫 Agora，避免互相無限呼叫。
 - Antigravity 的指令權限是**完整比對**，使用工作說明中的指令形式（`agora` 或 `python <路徑>/agora.py`），只允許固定、不帶參數的子指令與 `git status`、`git diff`、`git log`。權限是全域設定，升級後請重新執行 `agora install` 補上新增的指令。派工與續跑會在缺少 `quota`、`check` 或專案設定的 `build` 時拒絕分派。若只有局部測試權限缺少，會警告並從工作說明省略局部測試指令，Agora 收尾時仍會執行完整驗證。
 
@@ -467,6 +467,7 @@ Agora 在建立訊息、背景 job 或派工 worktree 前立即回報 sandbox �
 - `summarizer`：`summarize` 沒給 `--by` 時的總結方，例如 `"claude"`。
 - `build`：`agora build` 執行的建置指令，例如 `"west build"`。有設定時，接手方完成工作前也會執行。
 - `check`：`agora check` 在語法檢查後執行的驗證指令，例如 `[".venv\\Scripts\\python.exe", "-m", "pytest", "-q"]`；沒設定時自動偵測（見[接手方的驗證環境](#接手方的驗證環境)）。`check` 不包含建置。
+- `check_framework`：可選，當 `check` 使用自訂測試入口（不是標準 `python -m unittest|pytest`）時，宣告輸出格式、單項重跑範本、環境變數與選測格式，讓既有失敗比對、`agora test` 與整合驗證失敗解析能正常運作（見下方[自訂測試入口（`check_framework`）](#自訂測試入口check_framework)）。
 - `add_dirs`：Codex 接手工作（workspace-write）時額外可寫的目錄，相對路徑以工作區為準，不存在的略過。
 
 `build`、`check` 寫成字串時交給 shell 執行；寫成字串清單時直接執行、不經 shell；寫成清單的清單時依序執行，遇到失敗就停。
@@ -513,6 +514,36 @@ pip 使用 UTF-8，遇到暫時性錯誤最多重試三次。重試間隔預設�
 - `install` 偵測到 `.venv`／`venv` 但沒有設定 `check`，或 `check` 用的是舊版 install 寫入的 Agora 自己的 Python 時，會印出建議的設定。新的 install 不再把 `check` 寫進設定檔。
 - `build` 不會自動偵測；專案需要建置（例如產生檔案、編譯韌體）時請設定 `build`，接手方完成工作前會執行它。
 - `check` 會執行專案的測試程式碼，接手方改了測試就等於改了 `check` 執行的內容；白名單限制的是「能執行哪些指令」，不是測試內容，請照常審查接手方的變更。
+
+#### 自訂測試入口（`check_framework`）
+
+如果專案的 `check` 是透過自訂 Python 入口腳本跑測試（例如 `python -c "...runpy.run_path('ops/run_tests.py')..."`），Agora 無法從 `check` 指令推導標準測試框架，收尾比對會標為「無法比對失敗項目（不代表沒有新失敗）」，`agora test` 也會無法推導框架。此時可在 `.agora/config.json` 宣告 `check_framework`：
+
+```json
+{
+  "check": [".venv/Scripts/python.exe", "-c", "import os,runpy,sys;os.environ['TAIXU_TEST_DATA_DIFF']='1';sys.argv=['ops/run_tests.py'];runpy.run_path('ops/run_tests.py',run_name='__main__')"],
+  "check_framework": {
+    "output": "unittest",
+    "rerun": ["ops/run_tests.py", "{ids}"],
+    "env": {"TAIXU_TEST_DATA_DIFF": "1"},
+    "target_format": "module"
+  }
+}
+```
+
+欄位說明與安全限制：
+
+- **`output`**（必填）：只能是 `"unittest"` 或 `"pytest"`，決定解析 `check` 輸出、基準重跑輸出與 `agora merge` 整合驗證失敗清單所用的解析器。
+- **`rerun`**（必填）：字串清單（一律以 argv、`shell=False` 執行，不支援 shell 字串）：
+  - 第一個元素必須是工作區內存在、且實際路徑未越界的相對 `.py` 腳本路徑；拒絕絕對路徑、`..` 與以 `-` 開頭。Agora 會自動使用分派環境的 Python 執行該腳本，範本內不需寫 `python`。
+  - 清單中必須恰好有一個獨立元素等於 `"{ids}"`；其餘固定參數不得包含 `{` 或 `}`。
+  - 既有失敗比對時，每個失敗 ID 各重跑一次（`{ids}` 展開成該單一 ID，沿用 `count == 1` 與 ID 白名單規則），並在 base worktree 透過 `runpy.run_path` 保留 import 邊界檢查，避免誤載入分派原始碼。
+- **`env`**（可選）：字串對字串的額外環境變數，於重跑與 `agora test` 時加入子程序環境。鍵名必須符合 `^[A-Z][A-Z0-9_]*$`，且不得覆蓋 `PATH`、`VIRTUAL_ENV`、`PYTHON*` 或 `AGORA_*` 控制變數。
+- **`target_format`**（可選）：僅供 `agora test` 使用，決定如何將目標傳入 `rerun` 的 `{ids}`（一次展開全部目標執行）：
+  - `"path"`：直接傳遞驗證過的檔案路徑（例如 `tests/test_x.py`；`output` 為 `"pytest"` 時亦支援 `tests/test_x.py::test_a`）。
+  - `"module"`：轉成相對 `tests/` 的點分模組名（例如 `tests/sub/test_x.py` → `sub.test_x`），與 `unittest` 失敗 ID 命名一致；不接受 `::` 目標。
+  - 省略 `target_format` 時：`agora test` 會明確提示未宣告 `target_format` 並以非 0 結束，接手方的工作說明亦不提及 `agora test`（收尾完整驗證與既有失敗比對仍照常運作）。
+- **凍結與驗證**：`check_framework` 納入受保護與凍結設定（`GUARDED_KEYS`、`LOCKED_KEYS`）並進入基準比對的快取鍵與核准綁定。設定不合法時，`agora assign` 會在建立 worktree 前直接拒絕並說明錯誤；比對階段若遇到無效設定則標為無法比對並附上原因。
 
 ## 專案結構
 

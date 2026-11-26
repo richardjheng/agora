@@ -544,10 +544,17 @@ def _collect_environment_summary(python: str, command, cwd: Path, env: dict) -> 
     })
 
 
-def _extract_failed_tests(output: str, check_command, exit_code: Optional[int]) -> Tuple[List[str], bool, Optional[str]]:
+def _extract_failed_tests(output: str, check_command, exit_code: Optional[int], check_framework=None) -> Tuple[List[str], bool, Optional[str]]:
     if not output:
         return [], False, None
     code = 1 if exit_code is None else exit_code
+    if check_framework is not None:
+        if isinstance(check_framework, dict) and check_framework.get("output") in config.CHECK_FRAMEWORK_OUTPUTS:
+            fw = check_framework["output"]
+            parsed = baseline.parse(output, fw, code)
+            ids = parsed["ids"] if parsed["complete"] else [t for t in parsed["ids"] if baseline.valid_test_id(t, fw)]
+            return ids, parsed["complete"], (fw if parsed["complete"] or ids else None)
+        return [], False, None
     frameworks: List[str] = []
     if check_command:
         try:
@@ -675,9 +682,13 @@ def run_main_check(root: Path, record_dir: Optional[Path] = None) -> dict:
     test_log.write_text(raw, encoding="utf-8")
 
     check_command = evidence.get("check_command")
+    check_framework = evidence.get("check_framework")
+    if check_framework is None:
+        check_framework = config.load(root).get("check_framework")
     test_exit_code = evidence.get("exit_code")
     failed_tests, failed_complete, failed_framework = _extract_failed_tests(
-        raw, check_command, test_exit_code if test_exit_code is not None else proc.returncode
+        raw, check_command, test_exit_code if test_exit_code is not None else proc.returncode,
+        check_framework=check_framework,
     )
 
     env_summary = evidence.get("environment")

@@ -30,6 +30,8 @@ build、check、add_dirs、sandbox 會影響接手方能執行的指令與能寫
 import errno
 import json
 import os
+import posixpath
+import re
 import tempfile
 import time
 from contextlib import contextmanager
@@ -44,6 +46,10 @@ TIER_LEVELS = ("light", "standard", "heavy")
 TIER_LABELS = {"light": "輕量", "standard": "標準", "heavy": "重度"}
 SANDBOX_MODES = ("workspace-write", "danger-full-access", "read-only")
 SANDBOX_PARTIES = ("codex",)
+CHECK_FRAMEWORK_OUTPUTS = ("unittest", "pytest")
+CHECK_FRAMEWORK_TARGET_FORMATS = ("path", "module")
+_ENV_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+_DRIVE_RE = re.compile(r"^[A-Za-z]:")
 
 
 def config_path(root: Path) -> Path:
@@ -258,6 +264,94 @@ def check_concurrency(root: Path, data: Optional[dict] = None) -> int:
     if isinstance(raw, bool) or not isinstance(raw, int) or raw < 1:
         return 1
     return raw
+
+
+def validate_check_framework(spec, root: Optional[Path] = None) -> Optional[dict]:
+    """驗證 .agora/config.json 的 check_framework 設定；未設定（None）時回傳 None。"""
+    if spec is None:
+        return None
+    if not isinstance(spec, dict):
+        raise ValueError("check_framework 必須是 JSON 物件（dict）")
+
+    output = spec.get("output")
+    if not isinstance(output, str) or output not in CHECK_FRAMEWORK_OUTPUTS:
+        raise ValueError("check_framework.output 必填，且只能是 'unittest' 或 'pytest'")
+
+    rerun = spec.get("rerun")
+    if not isinstance(rerun, list) or not rerun or not all(isinstance(x, str) for x in rerun):
+        raise ValueError("check_framework.rerun 必填，且必須是非空的字串清單")
+
+    script = rerun[0]
+    if not script:
+        raise ValueError("check_framework.rerun 的第一個元素不能是空字串")
+    if script.startswith("-"):
+        raise ValueError(f"check_framework.rerun 的腳本路徑不可用 '-' 開頭：{script}")
+    if "{" in script or "}" in script:
+        raise ValueError(f"check_framework.rerun 的腳本路徑不可包含 '{{' 或 '}}'：{script}")
+    if script.startswith(("/", "\\")) or _DRIVE_RE.match(script) or ":" in script or Path(script).is_absolute():
+        raise ValueError(f"check_framework.rerun 的腳本路徑不可為絕對路徑：{script}")
+    norm = script.replace("\\", "/")
+    parts = norm.split("/")
+    if any(p == ".." for p in parts) or ".." in Path(script).parts:
+        raise ValueError(f"check_framework.rerun 的腳本路徑不可包含 '..'：{script}")
+    if not norm.endswith(".py"):
+        raise ValueError(
+            f"check_framework.rerun 的第一個元素必須是工作區內的 .py 腳本相對路徑（不需寫 python）：{script}"
+        )
+
+    normalized_script = posixpath.normpath(norm)
+    if normalized_script in ("", ".", "..") or normalized_script.startswith("../") or normalized_script.startswith("/"):
+        raise ValueError(f"check_framework.rerun 的腳本路徑無效：{script}")
+
+    if root is not None:
+        root_resolved = Path(root).resolve()
+        script_path = root_resolved / normalized_script
+        if not script_path.is_file():
+            raise ValueError(f"check_framework.rerun 腳本不存在：{script}")
+        try:
+            resolved = script_path.resolve()
+        except OSError as exc:
+            raise ValueError(f"check_framework.rerun 腳本路徑無法解析：{script}（{exc}）") from exc
+        if resolved == root_resolved or root_resolved not in resolved.parents:
+            raise ValueError(f"check_framework.rerun 腳本指向工作區外：{script}")
+
+    ids_indices = [i for i, item in enumerate(rerun) if item == "{ids}"]
+    if len(ids_indices) != 1:
+        raise ValueError("check_framework.rerun 必須恰好有一個元素等於 '{ids}'")
+    ids_index = ids_indices[0]
+    for i, item in enumerate(rerun):
+        if i == ids_index:
+            continue
+        if "{" in item or "}" in item:
+            raise ValueError(f"check_framework.rerun 固定參數不可包含 '{{' 或 '}}'：{item}")
+
+    raw_env = spec.get("env")
+    env: Dict[str, str] = {}
+    if raw_env is not None:
+        if not isinstance(raw_env, dict):
+            raise ValueError("check_framework.env 必須是字串對字串的物件（dict）")
+        for k, v in raw_env.items():
+            if not isinstance(k, str) or not isinstance(v, str):
+                raise ValueError("check_framework.env 的鍵與值都必須是字串")
+            if not _ENV_KEY_RE.fullmatch(k):
+                raise ValueError(f"check_framework.env 鍵名不合法：{k}（必須符合 ^[A-Z][A-Z0-9_]*$）")
+            if k in ("PATH", "VIRTUAL_ENV") or k.startswith(("PYTHON", "AGORA_")):
+                raise ValueError(f"check_framework.env 不得覆蓋受保護的環境變數：{k}")
+            env[k] = v
+
+    target_format = spec.get("target_format")
+    if target_format is not None:
+        if not isinstance(target_format, str) or target_format not in CHECK_FRAMEWORK_TARGET_FORMATS:
+            raise ValueError("check_framework.target_format 只能是 'path' 或 'module'")
+
+    return {
+        "output": output,
+        "rerun": list(rerun),
+        "script": normalized_script,
+        "ids_index": ids_index,
+        "env": env,
+        "target_format": target_format,
+    }
 
 
 def _same_path(a: Path, b: Path) -> bool:

@@ -1474,6 +1474,12 @@ def _cmd_assign_locked(ws: Workspace, args):
     old = state.get("relay") or {}
     if relay_alive(old) or jobs.alive(old):
         sys.exit(f"此討論串已有進行中的分派（{NAMES[old['worker']]}），請先 recall。")
+    cfg = ws.config()
+    if cfg.get("check_framework") is not None:
+        try:
+            config.validate_check_framework(cfg.get("check_framework"), root=ws.root)
+        except ValueError as exc:
+            sys.exit(f"無效的 check_framework 設定：{exc}")
     if args.to:
         worker = require_enabled(ws, canonical(args.to))
         if config.shares(ws.control_root)[worker] == 0 and not (override and reason):
@@ -1490,7 +1496,6 @@ def _cmd_assign_locked(ws: Workspace, args):
         print(f"指定接手方：{describe_candidate(worker, decision['candidates'][worker])}")
     else:
         worker, plan, decision = pick_worker(ws, owner, ws.enabled(), state, tier, model_arg, effort_arg)
-    cfg = ws.config()
     commands = {k: cfg.get(k) for k in LOCKED_KEYS}
     guard_agy_assignment(worker, commands)
     subagents_arg = getattr(args, "subagents", None)
@@ -1821,8 +1826,8 @@ def sleep_until(thread: Path, ts: float) -> bool:
     return True
 
 
-GUARDED_KEYS = ("build", "check", "add_dirs")
-LOCKED_KEYS = ("build", "check")   # 接手當輪以環境變數帶給 agora build / check
+GUARDED_KEYS = ("build", "check", "check_framework", "add_dirs")
+LOCKED_KEYS = ("build", "check", "check_framework")   # 接手當輪以環境變數帶給 agora build / check / test
 
 
 def guarded_settings(data: dict) -> dict:
@@ -1875,7 +1880,7 @@ def guard_config(root: Path, original: Optional[str], thread: Path, worker: str)
         for p, value in old_sandbox.items():
             after.setdefault("parties", {}).setdefault(p, {})["sandbox"] = value
         config.save(root, after)
-    add_system_note(thread, f"⚠️ {NAMES[worker]} 這輪改動了 .agora/config.json 的 build／check／add_dirs／沙箱設定，已還原。"
+    add_system_note(thread, f"⚠️ {NAMES[worker]} 這輪改動了 .agora/config.json 的 build／check／check_framework／add_dirs／沙箱設定，已還原。"
                             f"這些設定只能由 {NAMES[HUMAN]} 調整；若是 {NAMES[HUMAN]} 在這段期間自己改的，請再設定一次。")
     return True
 
@@ -2032,13 +2037,15 @@ def cmd_work(ws: Workspace, args):
                    agora=agora)
         fmt["build_cmd"] = f"`{agora} build`（建置專案）、" if has_build else ""
         if task:
+            cf = cfg.get("check_framework")
+            custom_without_target_format = cf is not None and not (isinstance(cf, dict) and cf.get("target_format"))
             fmt.update(
                 test_cmd="",
                 checkpoint_note=f"成果可交付時就先用檔案工具把提交說明寫到 {task['commit_message']}。",
                 finish_instruction="先寫好 `commit-message.md`（任務目的與測試範圍）",
                 check_note=f"Agora 收尾時會執行完整的 `{agora} check`，非必要不手動跑。\n",
             )
-            if not test_warning:
+            if not (test_warning or custom_without_target_format):
                 targets_file = targeted.targets_file_path(task)
                 fmt["test_cmd"] = f"`{agora} test`（跑相關測試）、"
                 fmt["check_note"] = (
@@ -3092,7 +3099,9 @@ def cmd_check(ws: Workspace, args):
 
 
 def check_workspace(ws: Workspace):
-    check = command_config(ws).get("check")
+    cmd_cfg = command_config(ws)
+    check = cmd_cfg.get("check")
+    check_framework = cmd_cfg.get("check_framework")
     source = ("分派當輪的設定" if os.getenv(LOCKED_ENV) is not None else ".agora/config.json") if check else None
     task = bool(os.getenv(worktree.MANIFEST_ENV))
     isolated = task or ws.root.resolve() != ws.control_root.resolve()
@@ -3165,7 +3174,7 @@ def check_workspace(ws: Workspace):
         })
         completions.atomic_write(Path(os.environ[failure_baseline.RECORD_ENV]), {
             "complete": True, "syntax_errors": len(errors), "exit_code": proc.returncode,
-            "check_command": check, "output": proc.stdout + proc.stderr,
+            "check_command": check, "check_framework": check_framework, "output": proc.stdout + proc.stderr,
             "wait_seconds": wait_seconds, "run_seconds": run_seconds,
             "timing": {"wait_seconds": wait_seconds, "run_seconds": run_seconds},
             "environment": env_summary,
